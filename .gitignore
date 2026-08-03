@@ -1,5 +1,10 @@
 /target
-*.sav
-*.gb
-*.gbc
 akebia-debug/
+
+# Cartridges and their saves stay out of the repository. The character
+# classes are not decoration: git matches these patterns case-sensitively,
+# so a plain *.gbc lets a file named .GBC straight through.
+/roms/
+*.[gG][bB]
+*.[gG][bB][cC]
+*.[sS][aA][vV]
