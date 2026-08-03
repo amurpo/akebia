@@ -91,6 +91,9 @@ fn load(path: &Path, args: &Args) -> Result<GameBoy, String> {
     }
     .map_err(|e| e.to_string())?;
     apply_palette(&mut gb, args);
+    // Here and not in the window's settings, so that `--dump --wav` writes the
+    // same audio that would have been played.
+    gb.set_speaker_filter(!args.raw_audio);
     Ok(gb)
 }
 

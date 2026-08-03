@@ -51,6 +51,9 @@ pub struct Args {
     pub force_model: Option<Model>,
     /// Run without opening the audio device.
     pub mute: bool,
+    /// Skip the low-pass that stands in for the speaker, leaving the DAC's
+    /// output as it comes: brighter, and harsher.
+    pub raw_audio: bool,
     /// With `--dump`, write the generated audio as WAV to this path.
     pub wav: Option<PathBuf>,
     /// Path to the `.sav`. By default, the ROM's with a different extension.
@@ -89,6 +92,7 @@ Options:
   --frames <N>          Stop after N frames
   --narrow              With --tui, draw at 80 columns instead of 160
   --mute                Run without sound
+  --raw-audio           Skip the speaker low-pass (brighter, harsher)
   --serial              Dump the serial port to stderr (Blargg tests)
   --debug               Dump the PPU registers per line (D = capture)
   -h, --help            Show this help
@@ -130,6 +134,7 @@ impl Args {
         let mut ppm = None;
         let mut force_model = None;
         let mut mute = false;
+        let mut raw_audio = false;
         let mut wav = None;
         let mut save = None;
         let mut no_save = false;
@@ -167,6 +172,7 @@ impl Args {
                 "--frames" => frames = Some(next_number(&mut it, "--frames")?),
                 "--narrow" => narrow = true,
                 "--mute" => mute = true,
+                "--raw-audio" => raw_audio = true,
                 "--wav" => {
                     wav = Some(PathBuf::from(it.next().ok_or("--wav needs a path")?));
                 }
@@ -220,6 +226,7 @@ impl Args {
             ppm,
             force_model,
             mute,
+            raw_audio,
             wav,
             save,
             no_save,
@@ -307,6 +314,17 @@ mod tests {
         let a = parse(&["game.gb"]).unwrap();
         assert!(!a.tui, "without --tui a window opens");
         assert_eq!(a.scale, DEFAULT_SCALE);
+    }
+
+    #[test]
+    fn the_speaker_filter_is_on_unless_told_otherwise() {
+        assert!(!parse(&["game.gb"]).unwrap().raw_audio, "the console sounds filtered by default");
+        assert!(parse(&["--raw-audio", "game.gb"]).unwrap().raw_audio);
+
+        // They are separate: muting says whether the card opens at all, and the
+        // filter says how what comes out of it sounds.
+        let a = parse(&["--raw-audio", "game.gb"]).unwrap();
+        assert!(!a.mute, "--raw-audio does not silence anything");
     }
 
     #[test]

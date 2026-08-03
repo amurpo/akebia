@@ -47,10 +47,11 @@ akebia --dump 900 --ppm f.ppm g.gb   # ...or as a colour image
 akebia --dump 900 --wav f.wav g.gb   # ...or the generated audio
 akebia --serial test.gb          # dump the serial port (Blargg tests)
 akebia --mute game.gb            # no sound
+akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 292 tests
+cargo test                   # 296 tests
 ```
 
 ### The game list
@@ -407,9 +408,11 @@ Working:
   HBlank one does go block by block, which is the right thing there.
 - **APU**: all four channels (two square waves with sweep and envelope, the wave
   table one and the noise one with its LFSR), the 512 Hz frame sequencer, stereo
-  mixing through `NR51`/`NR50` and a high-pass filter. Each channel tells a
-  disabled DAC —which contributes no voltage— from a connected DAC with sample 0,
-  which is the negative extreme; collapsing them saturated the output.
+  mixing through `NR51`/`NR50`, a high-pass filter and a low-pass one at 8 kHz
+  standing in for the amplifier and the speaker (`--raw-audio` skips it). Each
+  channel tells a disabled DAC —which contributes no voltage— from a connected
+  DAC with sample 0, which is the negative extreme; collapsing them saturated
+  the output.
 - **Native window with keyboard**, plus the terminal mode and the video-less
   commands.
 - **Game list** with a search box and the folder remembered between sessions.

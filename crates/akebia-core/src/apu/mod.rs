@@ -34,6 +34,12 @@
 //! without it, a silent channel with its DAC on leaves the signal offset from
 //! zero, and every time a channel turns on or off there is an audible click. The
 //! real hardware does it with a capacitor on the output.
+//!
+//! Last comes a low-pass filter, which the hardware does not apply on purpose
+//! either: it is what the amplifier and the speaker cannot reproduce. Four
+//! square waves with no treble rolled off sound harsher than the console ever
+//! did, and the box filter above leaves enough aliasing to be heard. See
+//! [`SPEAKER_CUTOFF_HZ`].
 
 pub mod components;
 mod noise;
@@ -57,6 +63,13 @@ const SEQUENCER_STEPS: u8 = 8;
 /// It is the DMG capacitor's. On a CGB the filter is more aggressive
 /// (0.999958), but the difference only shows up in a spectral analysis.
 const HIGH_PASS_FACTOR: f32 = 0.999_958;
+
+/// Cutoff of the low-pass that stands in for the amplifier and the speaker.
+///
+/// It is not measured off a console: it is the point where the output stops
+/// sounding harsh without going muffled. Lower values (4 kHz) do sound like the
+/// built-in speaker, but through headphones they come out dull.
+pub const SPEAKER_CUTOFF_HZ: f32 = 8_000.0;
 
 /// A stereo sample, normalised to `-1.0..=1.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -102,8 +115,25 @@ pub struct Apu {
     box_count: u32,
     /// High-pass filter state, one per stereo channel.
     capacitor: (f32, f32),
+    /// Low-pass filter state, one per stereo channel.
+    speaker: (f32, f32),
+    /// Weight of the new sample in the low-pass, derived from the sample rate.
+    /// `1.0` disables the filter by letting the input straight through.
+    speaker_alpha: f32,
+    /// Whether the low-pass is wanted at all, kept apart from `speaker_alpha` so
+    /// that changing the sample rate does not switch the filter back on.
+    speaker_enabled: bool,
     /// Samples ready for the frontend.
     output: Vec<StereoSample>,
+}
+
+/// Coefficient of a one-pole low-pass at `cutoff`, for a given sample rate.
+///
+/// It is the step response of an RC circuit: `1 - e^(-2π·fc/fs)`. Above Nyquist
+/// it would exceed 1 and the filter would ring, so it is clamped.
+fn low_pass_alpha(cutoff: f32, sample_rate: u32) -> f32 {
+    let fs = sample_rate.max(1) as f32;
+    (1.0 - (-2.0 * core::f32::consts::PI * cutoff / fs).exp()).clamp(0.0, 1.0)
 }
 
 impl Apu {
@@ -126,6 +156,9 @@ impl Apu {
             box_sum: (0.0, 0.0),
             box_count: 0,
             capacitor: (0.0, 0.0),
+            speaker: (0.0, 0.0),
+            speaker_alpha: low_pass_alpha(SPEAKER_CUTOFF_HZ, sample_rate),
+            speaker_enabled: true,
             output: Vec::new(),
         }
     }
@@ -136,6 +169,20 @@ impl Apu {
         self.sample_accumulator = 0;
         self.box_sum = (0.0, 0.0);
         self.box_count = 0;
+        // The cutoff is a frequency, so the coefficient has to be recomputed:
+        // reusing the old one would move the filter along with the rate.
+        self.speaker_alpha = low_pass_alpha(SPEAKER_CUTOFF_HZ, sample_rate);
+    }
+
+    /// Turns the speaker low-pass on or off.
+    ///
+    /// Off, the output is what the DAC produces: brighter, and closer to what
+    /// the other emulators sound like.
+    pub fn set_speaker_filter(&mut self, enabled: bool) {
+        self.speaker_enabled = enabled;
+        if !enabled {
+            self.speaker = (0.0, 0.0);
+        }
     }
 
     /// Empties and returns the samples generated since the last call.
@@ -256,6 +303,16 @@ impl Apu {
         let decay = HIGH_PASS_FACTOR.powi(self.cycles_per_sample as i32 >> 8);
         self.capacitor.0 = raw.0 - left * decay;
         self.capacitor.1 = raw.1 - right * decay;
+
+        // Low-pass, last: it has to see the signal that will actually be heard,
+        // and the high-pass above it only moves the DC, which is already gone.
+        let (left, right) = if self.speaker_enabled {
+            self.speaker.0 += self.speaker_alpha * (left - self.speaker.0);
+            self.speaker.1 += self.speaker_alpha * (right - self.speaker.1);
+            (self.speaker.0, self.speaker.1)
+        } else {
+            (left, right)
+        };
 
         self.output.push(StereoSample { left, right });
     }
@@ -600,6 +657,63 @@ mod tests {
             assert!((-1.0..=1.0).contains(&s.left), "sample out of range: {s:?}");
             assert!((-1.0..=1.0).contains(&s.right));
         }
+    }
+
+    /// Level of channel 1 on a steady note, with the filter on or off.
+    ///
+    /// `period` is what goes into the frequency registers: the note comes out at
+    /// `131072/(2048 - period)` Hz.
+    fn tone_level(period: u16, filtered: bool) -> f32 {
+        let mut a = apu();
+        a.set_speaker_filter(filtered);
+        a.write(0xFF11, 0x80); // 50% duty
+        a.write(0xFF12, 0xF0); // maximum volume, no envelope
+        a.write(0xFF13, (period & 0xFF) as u8);
+        a.write(0xFF14, 0x80 | (period >> 8) as u8); // trigger
+
+        for _ in 0..crate::CLOCK_HZ / 40 {
+            a.tick(4, false);
+        }
+        let samples = a.drain();
+        (samples.iter().map(|s| s.left * s.left).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn the_low_pass_cuts_the_treble_and_leaves_the_bass_alone() {
+        // A filter is defined by what it does at each frequency, so both ends
+        // are checked. Measuring only one would pass with a filter that simply
+        // turns the volume down.
+
+        // 1792 → 512 Hz, four octaves below the cutoff: it has to come through.
+        let bass = tone_level(1792, true) / tone_level(1792, false);
+        assert!(bass > 0.9, "the bass must survive almost untouched, it is at {bass}");
+
+        // 2040 → 16384 Hz, one octave above the cutoff. A one-pole filter drops
+        // 7 dB there, which is a factor of 0.45.
+        let treble = tone_level(2040, true) / tone_level(2040, false);
+        assert!(treble < 0.6, "an octave above the cutoff it must drop clearly, it is at {treble}");
+        assert!(treble > 0.2, "but a one-pole filter does not silence it either: {treble}");
+    }
+
+    #[test]
+    fn the_cutoff_follows_the_sample_rate() {
+        // The same cutoff in Hz is a different coefficient at each rate. If it
+        // were not recomputed, the filter would slide with the sample rate.
+        let fast = low_pass_alpha(SPEAKER_CUTOFF_HZ, 48_000);
+        let slow = low_pass_alpha(SPEAKER_CUTOFF_HZ, 22_050);
+        assert!(slow > fast, "at a lower rate each sample weighs more: {slow} vs {fast}");
+        assert!((0.0..=1.0).contains(&fast));
+
+        // Way below Nyquist the filter has to stay out of the way.
+        assert_eq!(low_pass_alpha(SPEAKER_CUTOFF_HZ, 1_000), 1.0, "it must not ring");
+    }
+
+    #[test]
+    fn set_sample_rate_keeps_the_filter_off_if_it_was_off() {
+        let mut a = apu();
+        a.set_speaker_filter(false);
+        a.set_sample_rate(44_100);
+        assert!(!a.speaker_enabled, "changing the rate must not turn it back on");
     }
 
     #[test]

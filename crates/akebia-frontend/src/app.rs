@@ -130,6 +130,10 @@ pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Settings {
     sound: bool,
+    /// The low-pass that stands in for the amplifier and the speaker. Off, the
+    /// treble comes through whole and the square waves sound harsher than the
+    /// console did.
+    speaker_filter: bool,
     /// Greys instead of the DMG greens. It only shows on a monochrome game: a
     /// Game Boy Color one supplies its own colours.
     grayscale: bool,
@@ -139,7 +143,12 @@ struct Settings {
 
 impl Settings {
     fn from_args(args: &Args) -> Self {
-        Self { sound: !args.mute, grayscale: args.grayscale, scale: args.scale }
+        Self {
+            sound: !args.mute,
+            speaker_filter: !args.raw_audio,
+            grayscale: args.grayscale,
+            scale: args.scale,
+        }
     }
 
     fn palette(&self) -> Palette {
@@ -307,6 +316,14 @@ impl App {
                 });
                 ui.menu_button("Audio", |ui| {
                     ui.checkbox(&mut settings.sound, "Sound");
+                    // Named after what it imitates and not after what it is:
+                    // "Speaker filter" says more than "8 kHz low-pass" to
+                    // somebody deciding whether they want it on.
+                    ui.add_enabled(
+                        settings.sound,
+                        egui::Checkbox::new(&mut settings.speaker_filter, "Speaker filter"),
+                    )
+                    .on_hover_text("Rolls off the treble the way the console's speaker did");
                 });
             });
         });
@@ -1082,6 +1099,7 @@ impl Session {
     /// Pushes the menu's settings into the running console.
     fn apply(&mut self, settings: &Settings) {
         self.gb.set_dmg_shades(settings.palette().shades);
+        self.gb.set_speaker_filter(settings.speaker_filter);
         match (settings.sound, self.audio.is_some()) {
             // Dropping the output stops the stream, and from then on the frame's
             // samples are discarded instead of piling up.

@@ -118,6 +118,11 @@ impl GameBoy {
         self.bus.apu.set_sample_rate(sample_rate);
     }
 
+    /// Turns the speaker low-pass on or off. See [`crate::apu::SPEAKER_CUTOFF_HZ`].
+    pub fn set_speaker_filter(&mut self, enabled: bool) {
+        self.bus.apu.set_speaker_filter(enabled);
+    }
+
     /// Bytes the game wrote to the serial port since the last call.
     ///
     /// It is where Blargg's test suites report their results.
