@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/akebia-core", "crates/akebia-frontend"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+akebia-core = { path = "crates/akebia-core" }
+
+# The core is built in release even during a debug `cargo run`:
+# an interpreted emulator is unusable without optimisations.
+[profile.dev.package.akebia-core]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

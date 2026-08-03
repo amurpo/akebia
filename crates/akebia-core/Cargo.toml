@@ -1,0 +1,17 @@
+[package]
+name = "akebia-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Game Boy / Game Boy Color emulation core, free of I/O"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# 8/16-bit arithmetic overflows constantly and that is intentional:
+# wrapping_* is used explicitly everywhere.
+arithmetic_side_effects = "allow"

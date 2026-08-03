@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Akebia
+GenericName=Game Boy emulator
+GenericName[es]=Emulador de Game Boy
+Comment=Game Boy and Game Boy Color emulator
+Comment[es]=Emulador de Game Boy y Game Boy Color
+Icon=akebia
+# %f and the MIME types are what make the file manager offer "Open with
+# Akebia". With no argument —when opened from the applications menu— Akebia
+# shows its own ROM list, so the entry works both ways.
+Exec=akebia %f
+MimeType=application/x-gameboy-rom;application/x-gameboy-color-rom;
+Terminal=false
+Categories=Game;Emulator;
+Keywords=gameboy;game boy;gbc;emulator;emulador;retro;

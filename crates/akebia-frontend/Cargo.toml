@@ -1,0 +1,30 @@
+[package]
+name = "akebia-frontend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop and terminal frontends for akebia-core"
+
+[[bin]]
+name = "akebia"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.18.1"
+akebia-core.workspace = true
+# Without the default features, which pull in `wgpu`. To stretch a 160×144
+# texture OpenGL is more than enough, and `glow` asks for less: fewer crates, a
+# smaller binary and no Vulkan/DX12 on the machine that runs it. `x11` and
+# `wayland` are both enabled because `winit` does negotiate client-side
+# decorations, so —unlike `minifb`— the native Wayland backend works with a
+# title bar.
+eframe = { version = "0.35.0", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
+
+[lints.rust]
+unsafe_code = "forbid"
