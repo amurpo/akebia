@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The whole application, and there is almost no more than this.
+
+  Everything Akebia is arrives in the shared object named below. The only Java
+  in the package is `AkebiaActivity`, and it exists for one reason: the system's
+  file picker answers through `onActivityResult`, and `NativeActivity` does not
+  pass that call on to native code.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.akebia">
+
+    <!-- 26 is not a preference: `libaaudio`, which is how the sound comes out,
+         appears in the NDK at that level and not before. -->
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+
+    <application android:label="Akebia" android:icon="@mipmap/ic_launcher">
+
+        <!-- `configChanges` lists what the activity survives. Without it Android
+             destroys and rebuilds it on every rotation, and rebuilding it means
+             running `android_main` again from scratch: the game would restart on
+             turning the telephone. The window is told about the change instead,
+             and the interface rearranges itself around the new shape.
+
+             The orientation is deliberately not fixed: upright the controls go
+             under the screen, turned they go on either side of it. -->
+        <activity
+            android:name=".AkebiaActivity"
+            android:label="Akebia"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|uiMode">
+
+            <!-- The library to load, without the `lib` prefix and without the
+                 `.so`: it is `libakebia_android.so`, the `cdylib` that
+                 `crates/akebia-android` produces. -->
+            <meta-data android:name="android.app.lib_name" android:value="akebia_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

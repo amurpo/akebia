@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      What the flower sits on. White, and not the application's own near-black,
+      for the same reason the logo is drawn on white everywhere else: at the size
+      a launcher shows an icon, red on white is legible across the room and red
+      on black is a dark smudge.
+    -->
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+</resources>
