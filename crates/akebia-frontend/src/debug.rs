@@ -71,6 +71,11 @@ pub struct LiveTrace {
 }
 
 impl LiveTrace {
+    // Clippy asks for a `Default` now that this is a library's public API and no
+    // longer a binary's own business. It is not going to get one: printing the
+    // legend is a side effect, and a `default()` that writes to stderr lies
+    // about what it does.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         eprint!("{LEGEND}");
         Self { previous: None, repeated: 0, silenced: ([0; 4], 0), frame: 0 }
