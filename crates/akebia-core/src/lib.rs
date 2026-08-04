@@ -53,6 +53,7 @@ pub mod cpu;
 pub mod debug;
 pub mod gameboy;
 pub mod joypad;
+pub mod link;
 pub mod model;
 pub mod ports;
 pub mod ppu;

@@ -126,7 +126,7 @@ impl SystemBus {
             apu: Apu::new(crate::apu::DEFAULT_SAMPLE_RATE),
             timer: Timer::new(),
             joypad: Joypad::new(),
-            serial: Serial::new(),
+            serial: Serial::new(model),
             wram: Box::new([0; WRAM_SIZE]),
             hram: Box::new([0; HRAM_SIZE]),
             interrupts: InterruptController::new(),
@@ -213,6 +213,21 @@ impl SystemBus {
         self.joypad.set_button(button, down, &mut self.interrupts);
     }
 
+    /// Hands the serial port the byte the other console was sending. See
+    /// [`Serial::complete`].
+    ///
+    /// It goes through the bus for the same reason the buttons do: the
+    /// interrupt controller is not the peripheral's to keep.
+    pub fn link_complete(&mut self, received: u8) {
+        self.serial.complete(received, &mut self.interrupts);
+    }
+
+    /// Clocks a byte in from the console driving the clock. See
+    /// [`Serial::clock_in`].
+    pub fn link_clock_in(&mut self, incoming: u8) -> u8 {
+        self.serial.clock_in(incoming, &mut self.interrupts)
+    }
+
     /// Advances every peripheral by one CPU M-cycle.
     ///
     /// # The two clock domains
@@ -231,6 +246,10 @@ impl SystemBus {
         self.ppu.tick(video_cycles, &mut self.interrupts);
         self.step_hdma();
         self.timer.tick(T, &mut self.interrupts);
+        // The serial shift clock is divided down from the same counter as the
+        // timer, so it gets the full four T-cycles as well: at double speed a
+        // transfer really does take half the real time.
+        self.serial.tick(T, &mut self.interrupts);
 
         // The APU sequencer is derived from the timer's counter, so this order
         // matters: the clock advances first, and only then is it queried.
@@ -381,7 +400,7 @@ impl SystemBus {
     fn write_io(&mut self, addr: u16, value: u8) {
         match addr {
             0xFF00 => self.joypad.write(value),
-            0xFF01 | 0xFF02 => self.serial.write(addr, value, &mut self.interrupts),
+            0xFF01 | 0xFF02 => self.serial.write(addr, value),
             0xFF04..=0xFF07 => self.timer.write(addr, value),
             0xFF0F => self.interrupts.write_flag(value),
             0xFF10..=0xFF3F => self.apu.write(addr, value),

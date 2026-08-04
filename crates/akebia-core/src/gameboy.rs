@@ -83,12 +83,33 @@ impl GameBoy {
         while self.bus.t_cycles() < limit {
             self.bus.set_current_pc(self.cpu.regs.pc);
             self.cpu.step(&mut self.bus)?;
-            if self.bus.ppu.take_frame_ready() {
-                video.present(self.bus.ppu.framebuffer());
+            if self.present_if_ready(video) {
                 return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Hands the port a finished frame if the PPU delivered one since the last
+    /// call, and says whether it did.
+    ///
+    /// [`GameBoy::run_frame`] is the usual way in. This one exists because two
+    /// linked consoles cannot use it: they have to advance one instruction at a
+    /// time so the cable can be resolved in between, and each of them reaches
+    /// the end of its frame at its own moment. See [`crate::link`].
+    pub fn present_if_ready(&mut self, video: &mut impl VideoOutput) -> bool {
+        if self.bus.ppu.take_frame_ready() {
+            video.present(self.bus.ppu.framebuffer());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// T-cycles elapsed since boot. Two linked consoles are kept in step by
+    /// comparing these.
+    pub fn t_cycles(&self) -> u64 {
+        self.bus.t_cycles()
     }
 
     pub fn set_button(&mut self, button: Button, down: bool) {
@@ -128,6 +149,48 @@ impl GameBoy {
     /// It is where Blargg's test suites report their results.
     pub fn take_serial_output(&mut self) -> Vec<u8> {
         self.bus.serial.take_output()
+    }
+
+    /// Plugs a link cable in or pulls it out.
+    ///
+    /// With nothing plugged in —the default— transfers still take the time the
+    /// hardware takes but always come back `0xFF`, which is a line with no one
+    /// on it. Plugged in, the console stops at the end of each byte and waits
+    /// for an answer, so **somebody has to be resolving
+    /// [`GameBoy::link_pending`]** or the game will hang there.
+    pub fn set_link_connected(&mut self, connected: bool) {
+        self.bus.serial.set_connected(connected);
+    }
+
+    pub fn link_connected(&self) -> bool {
+        self.bus.serial.is_connected()
+    }
+
+    /// The byte this console has finished clocking out and is holding until the
+    /// other end says what it was sending back. `None` while there is nothing
+    /// to resolve.
+    ///
+    /// These three methods are the whole surface a transport needs, and they are
+    /// deliberately the same whether the other end is another `GameBoy` in this
+    /// process, a socket or a Bluetooth link:
+    ///
+    /// - the console driving the clock offers a byte here and takes the answer
+    ///   through [`GameBoy::link_complete`];
+    /// - the one following takes the byte through [`GameBoy::link_clock_in`],
+    ///   which returns what has to travel back.
+    pub fn link_pending(&self) -> Option<u8> {
+        self.bus.serial.pending_out()
+    }
+
+    /// Hands over the byte the other end was sending, ending the transfer.
+    pub fn link_complete(&mut self, received: u8) {
+        self.bus.link_complete(received);
+    }
+
+    /// Clocks a byte in from the console that drives the clock, and returns what
+    /// this one was sending back on the same edges.
+    pub fn link_clock_in(&mut self, incoming: u8) -> u8 {
+        self.bus.link_clock_in(incoming)
     }
 
     pub fn header(&self) -> &Header {
