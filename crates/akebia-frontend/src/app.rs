@@ -37,11 +37,11 @@ use crate::args::Args;
 use crate::{audio, debug, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
-const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
+pub const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
 
 /// Application background, a very dark grey but not black: black is reserved for
 /// the screen's frame, and that keeps the two apart.
-const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x15, 0x18);
+pub const BACKGROUND: Color32 = Color32::from_rgb(0x15, 0x15, 0x18);
 
 /// The Game Boy Color brand violet, for the badge on the exclusives.
 const VIOLET: Color32 = Color32::from_rgb(0x6B, 0x4F, 0xC9);
@@ -84,6 +84,16 @@ const KEYS: [(Key, Button); 8] = [
 
 /// Opens the window and does not return until it is closed.
 pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
+    run_with(args, limit, eframe::NativeOptions::default())
+}
+
+/// The same, on top of options the platform has already filled in.
+///
+/// Android builds its event loop out of an `AndroidApp` handed to
+/// `android_main`, and that value cannot be manufactured here: it only exists
+/// inside that call. The Android entry point puts it in `base` and this is the
+/// only reason the seam exists; the desktop passes the defaults.
+pub fn run_with(args: Args, limit: Option<u64>, base: eframe::NativeOptions) -> Result<(), String> {
     let settings = Settings::from_args(&args);
 
     // A ROM given on the command line is loaded **before** opening anything: if
@@ -108,7 +118,7 @@ pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
             .with_inner_size(window_size(scale))
             .with_min_inner_size(window_size(2.0))
             .with_maximized(args.scale == 0),
-        ..Default::default()
+        ..base
     };
 
     eframe::run_native(
@@ -128,7 +138,7 @@ pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
 /// not turn it back on. The command line only seeds it; from then on the menu
 /// is what says how Akebia is set up.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Settings {
+pub struct Settings {
     sound: bool,
     /// The low-pass that stands in for the amplifier and the speaker. Off, the
     /// treble comes through whole and the square waves sound harsher than the
@@ -142,7 +152,7 @@ struct Settings {
 }
 
 impl Settings {
-    fn from_args(args: &Args) -> Self {
+    pub fn from_args(args: &Args) -> Self {
         Self {
             sound: !args.mute,
             speaker_filter: !args.raw_audio,
@@ -439,6 +449,18 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.back_to_list(ctx, None);
             return;
+        }
+
+        // The keyboard is read here and not inside the session because the
+        // session no longer knows what a keyboard is. Right before emulating, so
+        // that the buttons are set when the game reads the joypad.
+        ctx.input(|i| {
+            for (key, button) in KEYS {
+                session.press(button, i.key_down(key));
+            }
+        });
+        if ctx.input(|i| i.key_pressed(Key::D)) {
+            session.capture();
         }
 
         let result = session.advance(ctx, &mut self.texture);
@@ -1050,9 +1072,9 @@ impl Browser {
 // ---- The play session -------------------------------------------------------
 
 /// Everything that lasts as long as a play session does.
-struct Session {
+pub struct Session {
     gb: GameBoy,
-    title: String,
+    pub title: String,
     save: Option<save::SaveFile>,
     audio: Option<audio::AudioOutput>,
     /// The last frame, already converted to the colour the texture wants.
@@ -1066,7 +1088,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(mut gb: GameBoy, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
+    pub fn new(mut gb: GameBoy, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
         gb.set_trace_enabled(args.debug);
         gb.set_write_log_enabled(args.debug);
 
@@ -1097,7 +1119,7 @@ impl Session {
     }
 
     /// Pushes the menu's settings into the running console.
-    fn apply(&mut self, settings: &Settings) {
+    pub fn apply(&mut self, settings: &Settings) {
         self.gb.set_dmg_shades(settings.palette().shades);
         self.gb.set_speaker_filter(settings.speaker_filter);
         match (settings.sound, self.audio.is_some()) {
@@ -1111,22 +1133,29 @@ impl Session {
 
     /// Stops the clock while a dialog is up, so that closing it does not leave
     /// the session owing every frame the user spent reading.
-    fn pause(&mut self) {
+    pub fn pause(&mut self) {
         self.next = Instant::now();
     }
 
+    /// Presses or releases a joypad button.
+    ///
+    /// It is the caller that says which ones are down, and this is not a detail:
+    /// it is the whole difference between the two frontends. On the desktop a
+    /// keyboard answers, on a telephone eight painted circles do, and the
+    /// console is not to know which. Whoever calls this must do so **before**
+    /// [`Session::advance`], so the buttons are already set when the game reads
+    /// 0xFF00 during VBlank.
+    pub fn press(&mut self, button: Button, down: bool) {
+        self.gb.set_button(button, down);
+    }
+
     /// Emulates whatever is due and uploads the result to the texture.
-    fn advance(&mut self, ctx: &egui::Context, texture: &mut TextureHandle) -> Result<(), String> {
+    pub fn advance(
+        &mut self,
+        ctx: &egui::Context,
+        texture: &mut TextureHandle,
+    ) -> Result<(), String> {
         let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
-
-        // The keyboard is polled before emulating so that the buttons are set
-        // when the game reads 0xFF00 during VBlank.
-        ctx.input(|i| {
-            for (key, button) in KEYS {
-                self.gb.set_button(button, i.key_down(key));
-            }
-        });
-
         let now = Instant::now();
         let mut emulated = 0;
         let mut failure = None;
@@ -1149,9 +1178,6 @@ impl Session {
                 ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], self.pixels.clone()),
                 TextureOptions::NEAREST,
             );
-        }
-        if ctx.input(|i| i.key_pressed(Key::D)) {
-            self.capture();
         }
 
         // Without this the interface would only repaint when the mouse moves:
@@ -1198,14 +1224,14 @@ impl Session {
 
     /// Writes the saved game. Called on leaving for the list and on closing the
     /// window.
-    fn close(&mut self) {
+    pub fn close(&mut self) {
         if let Some(save) = self.save.as_mut() {
             save.flush_final(&self.gb);
         }
     }
 
     /// The screen, centred and with integer scaling.
-    fn ui(&self, ui: &mut egui::Ui, texture: &TextureHandle) {
+    pub fn ui(&self, ui: &mut egui::Ui, texture: &TextureHandle) {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
 
