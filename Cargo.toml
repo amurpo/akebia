@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/akebia-core", "crates/akebia-frontend"]
+members = ["crates/akebia-android", "crates/akebia-core", "crates/akebia-frontend"]
 
 [workspace.package]
 edition = "2024"

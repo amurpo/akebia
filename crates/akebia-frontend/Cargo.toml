@@ -26,5 +26,13 @@ eframe = { version = "0.35.0", default-features = false, features = [
     "x11",
 ] }
 
+# Android reaches `winit`'s event loop through a different door: there is no
+# `main`, only the `android_main` that `NativeActivity` calls, and this feature
+# is what wires the two together. The alternative, `android-game-activity`, asks
+# for an AndroidX AAR in exchange for a text input and a gamepad API that an
+# emulator with eight buttons has no use for.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["android-native-activity"] }
+
 [lints.rust]
 unsafe_code = "forbid"

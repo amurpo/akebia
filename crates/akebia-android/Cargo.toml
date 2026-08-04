@@ -1,0 +1,46 @@
+[package]
+name = "akebia-android"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Android entry point: the shared object the APK loads"
+
+[lib]
+# Android runs no binary. The APK carries a shared object and `NativeActivity`
+# loads it and calls `android_main` inside it, so this is the shape the whole
+# emulator has to take to reach a telephone.
+crate-type = ["cdylib"]
+
+# Where the controls end up is arithmetic, and arithmetic can be checked without
+# a telephone: `pad` is built everywhere so that `cargo test` has something to
+# run. These two are what it needs, and the desktop frontend already builds both.
+[dependencies]
+# For the eight buttons and the screen's measurements. Not a line of emulation
+# happens here; the core is only named.
+akebia-core.workspace = true
+# `egui` and not `eframe`: the geometry needs rectangles and a painter, not a
+# window. It is the same `egui` that `eframe` carries, so the types are the very
+# same ones and not merely alike.
+egui = "0.35.0"
+
+# The rest only exists on the telephone, and pulling it in for a desktop build
+# would cost compile time on the machine that never runs it.
+[target.'cfg(target_os = "android")'.dependencies]
+akebia-frontend = { path = "../akebia-frontend" }
+eframe = { version = "0.35.0", default-features = false }
+# `NativeOptions::android_app` is typed by `winit`, and the type has to be the
+# same instance `eframe` was compiled against —not merely an equal one—, so the
+# version is the one `eframe` already resolves to and it is stated here only to
+# be able to name the type.
+winit = "0.30.13"
+# To reach `AkebiaActivity`. It is not a new dependency in the tree: `cpal`
+# already brings it in to open the sound card.
+jni = "0.22"
+# `eframe`, `winit` and `android-activity` report what they are doing through
+# `log`, and with nobody listening those records go nowhere —they are exactly the
+# ones that explain a screen that stays black. Panics and `eprintln!` do come out
+# on their own: `android-activity` forwards stdout and stderr to logcat under the
+# `RustStdoutStderr` tag.
+log = "0.4"
+android_logger = { version = "0.15.1", default-features = false }
