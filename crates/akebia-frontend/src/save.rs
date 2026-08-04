@@ -24,6 +24,21 @@ pub fn default_path(rom: &Path) -> PathBuf {
     rom.with_extension("sav")
 }
 
+/// Where the second console of a linked pair saves when it is running the very
+/// same file as the first.
+///
+/// Two consoles are two players, and two players do not share one saved game.
+/// Left alone they would both autosave over the same `.sav` a second apart, and
+/// what survived would be whichever wrote last — over a real saved game, with
+/// the trade that was just made in it.
+///
+/// The second console still *starts* from the first one's file, because that is
+/// what makes a trade testable at all: a blank game has nothing to trade. From
+/// the first write on, the two go their own ways.
+pub fn linked_path(rom: &Path) -> PathBuf {
+    rom.with_extension("link.sav")
+}
+
 pub struct SaveFile {
     path: PathBuf,
     /// Copy of the last thing written, so as not to rewrite an unchanged file.
@@ -94,6 +109,22 @@ impl SaveFile {
     }
 
     /// Advances one frame and saves every so often.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Sends the autosave to another file from now on, leaving the one it was
+    /// writing to exactly as it is.
+    ///
+    /// What was last written is forgotten along with the old path: measured
+    /// against the new file nothing has been saved yet, and without clearing it
+    /// the first flush would compare the SRAM against the *other* file's
+    /// contents, find them equal and write nothing at all.
+    pub fn redirect(&mut self, path: PathBuf) {
+        self.path = path;
+        self.written.clear();
+    }
+
     pub fn tick(&mut self, gb: &GameBoy) {
         self.frames += 1;
         if self.frames % AUTOSAVE_EVERY == 0 {

@@ -96,11 +96,12 @@ terminal to read an error in.
 
 ### The menu
 
-`File`, `Video` and `Audio` sit above both screens. It is where everything that
-is neither "pick a game" nor "play" belongs: the ROM folder, the window size, the
-palette monochrome games get and the sound. The command line only **seeds** those
-settings; from there on the menu is what says how Akebia is set up, and a setting
-survives leaving a game for the list and starting another one.
+`File`, `Video`, `Audio` and `Link` sit above both screens. It is where
+everything that is neither "pick a game" nor "play" belongs: the ROM folder, the
+window size, the palette monochrome games get, the sound and the link cable. The
+command line only **seeds** those settings; from there on the menu is what says
+how Akebia is set up, and a setting survives leaving a game for the list and
+starting another one.
 
 That is the point of having a menu at all with so few entries in it. Anything
 added later —filters, forcing a console model, remapping the keys— is one more
@@ -189,6 +190,29 @@ on loading, the seconds elapsed since the save are added to it. A halted clock
 does not advance, and a timestamp from the future —a system clock running behind,
 or a `.sav` brought from another machine— is ignored instead of subtracting time.
 
+### The link cable
+
+`Link` → `Second console…` sets the running game aside and goes back to the list
+so a second one can be picked. From then on both consoles are on screen side by
+side, joined by a cable, and the keyboard drives the one in the red frame; `Tab`
+hands it to the other. `Escape` over the list calls the whole thing off and the
+first console comes back on its own, having lost nothing.
+
+The cable is emulated, not faked. The serial port shifts a bit every 512
+T-cycles —a byte takes about a millisecond, exactly what the hardware takes— and
+the two registers **swap** their contents rather than one sending and the other
+receiving. The two consoles advance one instruction at a time, always whichever
+is behind, so neither can get so much as a single bit ahead of the other. That
+costs about a fifth of the machine's speed: a pair runs at some four times real
+time where one console alone runs at twenty.
+
+Both consoles are in the same process, which is why there is no protocol here and
+nothing can arrive late. A cable between two *machines* —over a network, over
+Bluetooth— is a different problem: a byte lasts a millisecond and no link answers
+that fast, so the emulation has to stall until the other end catches up. None of
+that exists yet. What does exist is the part that has to be right first, because
+over a wire the same bug would look like a network fault.
+
 ### Controls
 
 | Key | Button |
@@ -197,6 +221,7 @@ or a `.sav` brought from another machine— is ignored instead of subtracting ti
 | `Z` / `X` | A / B |
 | `Enter` / `Backspace` | Start / Select |
 | `Escape` | Back to the list |
+| `Tab` | Swap consoles (with the cable plugged in) |
 | `D` | Debug capture (with `--debug` only) |
 
 In the list, the arrows move the cursor, `Home` and `End` go to the ends, and
@@ -362,7 +387,8 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `ppu/color.rs` | RGB555 and the palette RAM |
 | `ppu/render.rs` | scanline rendering: background, window and sprites |
 | `timer.rs` | 16-bit counter and edge detection |
-| `joypad.rs`, `serial.rs` | input and link port |
+| `joypad.rs`, `serial.rs` | input and the serial shift register |
+| `link.rs` | two consoles on one cable, advanced in lockstep |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
 
@@ -418,10 +444,17 @@ Working:
 - **Game list** with a search box and the folder remembered between sessions.
   Without it, opening Akebia from the desktop launcher demanded a path there is
   no way to type there.
-- **Menu bar** with the ROM folder, the window size, the palette and the sound.
-  Guessing the folder was wrong often enough, and an empty list was a dead end:
-  with no game to open, there was nothing for Akebia to learn the folder from.
+- **Menu bar** with the ROM folder, the window size, the palette, the sound and
+  the link cable. Guessing the folder was wrong often enough, and an empty list
+  was a dead end: with no game to open, there was nothing for Akebia to learn the
+  folder from.
 - **Saved games** in `.sav`, with autosave and atomic writing.
+- **Link cable between two consoles in the same window**: the serial port shifts
+  its bits at the rate the hardware does —512 T-cycles each— in both master and
+  slave roles, and the two shift registers swap rather than one sending. The pair
+  advances in lockstep, always the console that is behind, so the exchange stays
+  simultaneous. Over a network it would not be: that is the next problem, not
+  this one.
 
 The cartridges boot, reach their title screen and respond to the keyboard, both
 Game Boy and Game Boy Color ones. With no limiter, the emulation runs at about 17
@@ -449,7 +482,13 @@ Pending, in the recommended order:
    means rewriting `render`. The variable mode 3 duration is already there; what
    is missing is validating both against `dmg-acid2` and `mooneye-gb`, which have
    to be downloaded.
-2. **Keyboard in `--tui`**: the terminal mode draws but does not read input.
+2. **The cable over a network.** The port and the lockstep are done; what is
+   missing is the transport. A byte lasts a millisecond and no link answers that
+   fast —a LAN takes several, Bluetooth tens— so it cannot be a matter of sending
+   and hoping: each end has to send its cycle count along with the byte and stall
+   until the other catches up. Speaking BGB's link protocol rather than inventing
+   one would also mean being able to trade against other emulators.
+3. **Keyboard in `--tui`**: the terminal mode draws but does not read input.
 
 ## Reference tests
 

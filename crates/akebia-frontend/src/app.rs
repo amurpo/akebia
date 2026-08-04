@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use akebia_core::cartridge::CgbSupport;
 use akebia_core::gameboy::FRAMES_PER_SECOND;
+use akebia_core::link::{self, LinkFault, Side};
 use akebia_core::ports::{Palette, VideoOutput};
 use akebia_core::{Button, FrameBuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
 use eframe::egui::{
@@ -182,6 +183,11 @@ fn title(session: Option<&Session>) -> String {
     }
 }
 
+/// The window's name while two consoles are joined by a cable.
+fn linked_title(pair: &Pair) -> String {
+    format!("Akebia — {} ↔ {}", pair.consoles[0].title, pair.consoles[1].title)
+}
+
 /// Colours and spacing. The dark theme is fixed instead of following the system:
 /// around a stretched 160×144 screen, a light background is blinding.
 fn theme(ctx: &egui::Context) {
@@ -219,8 +225,14 @@ struct App {
     /// dialog and not a screen of its own so that it can be opened from the menu
     /// in the middle of a game without throwing the game away.
     dialog: Option<Box<Browser>>,
-    /// The console's screen, uploaded to the GPU once per emulated frame.
-    texture: TextureHandle,
+    /// The consoles' screens, uploaded to the GPU once per emulated frame. The
+    /// second one is only painted while a cable is plugged in, but it costs
+    /// 160×144 pixels to keep and saves creating a texture mid-game.
+    textures: [TextureHandle; 2],
+    /// A console set aside while its player picks the game for the other end of
+    /// the cable. It is paused, not closed: its saved game is still open and
+    /// cancelling puts it straight back on screen.
+    pending_link: Option<Box<Session>>,
 }
 
 enum Screen {
@@ -228,6 +240,8 @@ enum Screen {
     /// Boxed because a `Session` holds the whole console inside, and without the
     /// box the enum would take up that much while sitting in the list.
     Playing(Box<Session>),
+    /// Two consoles joined by a link cable.
+    Linked(Box<Pair>),
 }
 
 impl App {
@@ -240,16 +254,19 @@ impl App {
     ) -> Self {
         theme(&cc.egui_ctx);
 
-        let texture = cc.egui_ctx.load_texture(
-            "screen",
-            ColorImage::new(
-                [SCREEN_WIDTH, SCREEN_HEIGHT],
-                vec![Color32::BLACK; SCREEN_WIDTH * SCREEN_HEIGHT],
-            ),
-            // Nearest neighbour: a Game Boy pixel has to come out as an exact
-            // square, not as an interpolated smudge.
-            TextureOptions::NEAREST,
-        );
+        let screen_texture = |name: &str| {
+            cc.egui_ctx.load_texture(
+                name,
+                ColorImage::new(
+                    [SCREEN_WIDTH, SCREEN_HEIGHT],
+                    vec![Color32::BLACK; SCREEN_WIDTH * SCREEN_HEIGHT],
+                ),
+                // Nearest neighbour: a Game Boy pixel has to come out as an exact
+                // square, not as an interpolated smudge.
+                TextureOptions::NEAREST,
+            )
+        };
+        let textures = [screen_texture("screen"), screen_texture("screen-linked")];
 
         let folder = roms::initial_dir(args.roms_dir.as_deref(), roms::state_path().as_deref());
         let screen = match initial {
@@ -257,7 +274,16 @@ impl App {
             None => Screen::List(List::new(folder.clone())),
         };
 
-        Self { args, limit, folder, settings, screen, dialog: None, texture }
+        Self {
+            args,
+            limit,
+            folder,
+            settings,
+            screen,
+            dialog: None,
+            textures,
+            pending_link: None,
+        }
     }
 
     /// Loads the chosen ROM and starts playing, or leaves the warning in the
@@ -270,8 +296,19 @@ impl App {
                     self.folder = dir.to_owned();
                 }
                 let session = Session::new(gb, path, &self.args, &self.settings);
-                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
-                self.screen = Screen::Playing(Box::new(session));
+                // A console was left waiting for a partner: this is the partner,
+                // and picking it is what plugs the cable in.
+                self.screen = match self.pending_link.take() {
+                    Some(first) => {
+                        let pair = Pair::new(*first, session, &self.settings);
+                        ctx.send_viewport_cmd(ViewportCommand::Title(linked_title(&pair)));
+                        Screen::Linked(Box::new(pair))
+                    }
+                    None => {
+                        ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                        Screen::Playing(Box::new(session))
+                    }
+                };
             }
             // Loading can fail because of a mapper not implemented yet or a file
             // that is not a ROM. It is shown in the list and not on stderr:
@@ -294,8 +331,12 @@ impl App {
     /// menu, not new buttons wedged into a list.
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let playing = matches!(self.screen, Screen::Playing(_));
+        let linked = matches!(self.screen, Screen::Linked(_));
         let mut open_dialog = false;
         let mut back_to_list = false;
+        let mut connect = false;
+        let mut swap = false;
+        let mut unplug = false;
         let mut settings = self.settings.clone();
 
         egui::Panel::top("menu").show(ui, |ui| {
@@ -335,6 +376,21 @@ impl App {
                     )
                     .on_hover_text("Rolls off the treble the way the console's speaker did");
                 });
+                ui.menu_button("Link", |ui| {
+                    connect = ui
+                        .add_enabled(playing, egui::Button::new("Second console…"))
+                        .on_hover_text("Pick another game and join the two with a link cable")
+                        .clicked();
+                    swap = ui
+                        .add_enabled(linked, egui::Button::new("Swap keyboard\tTab"))
+                        .on_hover_text("Hand the keyboard to the other console")
+                        .clicked();
+                    ui.separator();
+                    unplug = ui
+                        .add_enabled(linked, egui::Button::new("Unplug the cable"))
+                        .on_hover_text("Keep playing on the console that has the keyboard")
+                        .clicked();
+                });
             });
         });
 
@@ -346,6 +402,59 @@ impl App {
         }
         if back_to_list {
             self.back_to_list(ctx, None);
+        }
+        if connect {
+            self.begin_link();
+        }
+        if swap {
+            if let Screen::Linked(pair) = &mut self.screen {
+                pair.swap_keyboard(&self.settings);
+            }
+        }
+        if unplug {
+            self.unplug(ctx);
+        }
+    }
+
+    /// Sets the running game aside and shows the list so its partner can be
+    /// picked. The console is paused, not closed: its saved game stays open, and
+    /// Escape puts it back on screen with nothing lost.
+    fn begin_link(&mut self) {
+        if !matches!(self.screen, Screen::Playing(_)) {
+            return;
+        }
+        let mut list = List::new(self.folder.clone());
+        // The list's one line of prose is the warning slot, and an instruction is
+        // what belongs there now: without it, coming back to the list right after
+        // asking for a second console looks like the menu did nothing.
+        list.warning = Some("Pick the game for the second console".to_owned());
+
+        if let Screen::Playing(session) = std::mem::replace(&mut self.screen, Screen::List(list)) {
+            self.pending_link = Some(session);
+        }
+    }
+
+    /// Calls off a link that was never made and resumes the console that was
+    /// waiting for it.
+    fn cancel_link(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.pending_link.take() else {
+            return;
+        };
+        ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+        self.screen = Screen::Playing(session);
+    }
+
+    /// Pulls the cable out, keeping whichever console has the keyboard and
+    /// saving the other one on its way out.
+    fn unplug(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Linked(_)) {
+            return;
+        }
+        let list = Screen::List(List::new(self.folder.clone()));
+        if let Screen::Linked(pair) = std::mem::replace(&mut self.screen, list) {
+            let session = pair.split(&self.settings);
+            ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+            self.screen = Screen::Playing(Box::new(session));
         }
     }
 
@@ -362,8 +471,15 @@ impl App {
             }
         }
         self.settings = settings.clone();
-        if let Screen::Playing(session) = &mut self.screen {
-            session.apply(&self.settings);
+        match &mut self.screen {
+            Screen::Playing(session) => session.apply(&self.settings),
+            Screen::Linked(pair) => pair.apply(&self.settings),
+            Screen::List(_) => {}
+        }
+        // The console waiting for a partner has to take the change too, or it
+        // would come back with the palette and the sound it was set aside with.
+        if let Some(pending) = self.pending_link.as_mut() {
+            pending.apply(&self.settings);
         }
     }
 
@@ -412,8 +528,13 @@ impl App {
 
     /// Saves the game and goes back to the list.
     fn back_to_list(&mut self, ctx: &egui::Context, warning: Option<String>) {
-        if let Screen::Playing(session) = &mut self.screen {
-            session.close();
+        match &mut self.screen {
+            Screen::Playing(session) => session.close(),
+            Screen::Linked(pair) => pair.close(),
+            Screen::List(_) => {}
+        }
+        if let Some(mut pending) = self.pending_link.take() {
+            pending.close();
         }
         let mut list = List::new(self.folder.clone());
         list.warning = warning;
@@ -431,16 +552,26 @@ impl eframe::App for App {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dialog = self.dialog.is_some();
-        let Screen::Playing(session) = &mut self.screen else {
+
+        if matches!(self.screen, Screen::List(_)) {
+            // Escape over the list, with a console set aside waiting for its
+            // partner, calls the link off instead of doing nothing.
+            if !dialog && self.pending_link.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.cancel_link(ctx);
+            }
             return;
-        };
+        }
 
         // With the folder chooser open the game is paused. It has to happen
         // before anything else is read: `logic` runs before `ui`, so without
         // this the Escape that closes the dialog would first be taken here as
         // "back to the list", and the path being typed would drive the joypad.
         if dialog {
-            session.pause();
+            match &mut self.screen {
+                Screen::Playing(session) => session.pause(),
+                Screen::Linked(pair) => pair.pause(),
+                Screen::List(_) => {}
+            }
             return;
         }
 
@@ -454,17 +585,46 @@ impl eframe::App for App {
         // The keyboard is read here and not inside the session because the
         // session no longer knows what a keyboard is. Right before emulating, so
         // that the buttons are set when the game reads the joypad.
-        ctx.input(|i| {
-            for (key, button) in KEYS {
-                session.press(button, i.key_down(key));
+        let (result, frames) = match &mut self.screen {
+            Screen::Playing(session) => {
+                ctx.input(|i| {
+                    for (key, button) in KEYS {
+                        session.press(button, i.key_down(key));
+                    }
+                });
+                if ctx.input(|i| i.key_pressed(Key::D)) {
+                    session.capture();
+                }
+                (session.advance(ctx, &mut self.textures[0]), session.frames)
             }
-        });
-        if ctx.input(|i| i.key_pressed(Key::D)) {
-            session.capture();
-        }
-
-        let result = session.advance(ctx, &mut self.texture);
-        let frames = session.frames;
+            Screen::Linked(pair) => {
+                if ctx.input(|i| i.key_pressed(Key::Tab)) {
+                    pair.swap_keyboard(&self.settings);
+                }
+                // egui reads Tab as "move to the next widget" before this runs,
+                // and it cannot be talked out of it: by the time `logic` is
+                // called the direction is already set. Left alone, one Tab would
+                // land the focus on a menu button and the next Enter —which is
+                // the console's Start— would open that menu instead of pressing
+                // Start. Nothing on this screen has any business holding the
+                // keyboard, so the focus is handed back every frame.
+                ctx.memory_mut(|memory| {
+                    if let Some(id) = memory.focused() {
+                        memory.surrender_focus(id);
+                    }
+                });
+                // Only the console holding the keyboard is told about the keys.
+                // The other one is not merely ignored, it is told nothing is
+                // pressed, which is not the same thing: see `swap_keyboard`.
+                ctx.input(|i| {
+                    for (key, button) in KEYS {
+                        pair.active().press(button, i.key_down(key));
+                    }
+                });
+                (pair.advance(ctx, &mut self.textures), pair.frames())
+            }
+            Screen::List(_) => return,
+        };
 
         if let Err(failure) = result {
             self.back_to_list(ctx, Some(first_line(&failure)));
@@ -485,7 +645,11 @@ impl eframe::App for App {
         let request = match &mut self.screen {
             Screen::List(list) => list.ui(ui),
             Screen::Playing(session) => {
-                session.ui(ui, &self.texture);
+                session.ui(ui, &self.textures[0]);
+                None
+            }
+            Screen::Linked(pair) => {
+                pair.ui(ui, &self.textures);
                 None
             }
         };
@@ -498,8 +662,13 @@ impl eframe::App for App {
 
     /// Closing the window has to save the game just like leaving for the menu.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Screen::Playing(session) = &mut self.screen {
-            session.close();
+        match &mut self.screen {
+            Screen::Playing(session) => session.close(),
+            Screen::Linked(pair) => pair.close(),
+            Screen::List(_) => {}
+        }
+        if let Some(pending) = self.pending_link.as_mut() {
+            pending.close();
         }
     }
 }
@@ -1075,6 +1244,9 @@ impl Browser {
 pub struct Session {
     gb: GameBoy,
     pub title: String,
+    /// The file this console was loaded from. Kept because the saved game's name
+    /// is derived from it, and a linked pair may have to derive a second one.
+    rom: PathBuf,
     save: Option<save::SaveFile>,
     audio: Option<audio::AudioOutput>,
     /// The last frame, already converted to the colour the texture wants.
@@ -1085,6 +1257,15 @@ pub struct Session {
     trace: Option<debug::LiveTrace>,
     captures: u32,
     serial: bool,
+    /// Silenced whatever the sound setting says, because something else has the
+    /// speakers.
+    ///
+    /// Only a linked pair sets it. Two consoles running the same game a few
+    /// frames apart do not sound twice as loud: they sound like one console
+    /// through a flanger, because every note arrives twice a few milliseconds
+    /// apart. It is worse than either of them alone, so only the console holding
+    /// the keyboard is heard.
+    muted: bool,
 }
 
 impl Session {
@@ -1103,6 +1284,7 @@ impl Session {
         let mut session = Self {
             gb,
             title,
+            rom,
             save,
             audio: None,
             pixels: vec![Color32::BLACK; SCREEN_WIDTH * SCREEN_HEIGHT],
@@ -1111,6 +1293,7 @@ impl Session {
             trace: args.debug.then(debug::LiveTrace::new),
             captures: 0,
             serial: args.serial,
+            muted: false,
         };
         // The settings and not the arguments: a game started after the menu was
         // touched has to come up the way the menu left things.
@@ -1118,11 +1301,44 @@ impl Session {
         session
     }
 
+    /// Makes sure this console is not autosaving over the same file as `other`.
+    ///
+    /// It happens the moment somebody links a game to itself, which is the
+    /// obvious thing to try first: both consoles derive their `.sav` from the
+    /// same ROM path, and from then on two autosaves a second apart take turns
+    /// overwriting one real saved game. This one moves aside; see
+    /// [`save::linked_path`].
+    fn unshare_save_with(&mut self, other: &Self) {
+        let (Some(mine), Some(theirs)) = (self.save.as_ref(), other.save.as_ref()) else {
+            return;
+        };
+        if mine.path() != theirs.path() {
+            return;
+        }
+        let moved = save::linked_path(&self.rom);
+        eprintln!("the second console saves to {} so as not to share one file", moved.display());
+        if let Some(save) = self.save.as_mut() {
+            save.redirect(moved);
+        }
+    }
+
+    /// Silences this console, or gives it the speakers back.
+    ///
+    /// The stream is genuinely closed and reopened rather than fed silence: an
+    /// open output device that nobody is listening to still costs a callback
+    /// every few milliseconds.
+    pub fn set_muted(&mut self, muted: bool, settings: &Settings) {
+        if self.muted != muted {
+            self.muted = muted;
+            self.apply(settings);
+        }
+    }
+
     /// Pushes the menu's settings into the running console.
     pub fn apply(&mut self, settings: &Settings) {
         self.gb.set_dmg_shades(settings.palette().shades);
         self.gb.set_speaker_filter(settings.speaker_filter);
-        match (settings.sound, self.audio.is_some()) {
+        match (settings.sound && !self.muted, self.audio.is_some()) {
             // Dropping the output stops the stream, and from then on the frame's
             // samples are discarded instead of piling up.
             (false, true) => self.audio = None,
@@ -1194,7 +1410,40 @@ impl Session {
         // `gb` and `pixels` are distinct fields, so both borrows coexist; the
         // sink only exists during this call.
         let result = self.gb.run_frame(&mut FrameSink { pixels: &mut self.pixels });
+        self.after_frame();
+        result.map_err(crate::describe_fault)
+    }
 
+    /// One frame of a linked pair.
+    ///
+    /// There is a single call for both consoles because there is no other way to
+    /// do it: with a cable in between, each one's next instruction can depend on
+    /// what the other did on its last, so they cannot be advanced one after the
+    /// other. [`link::run_frame`] interleaves them instruction by instruction.
+    fn linked_frame(a: &mut Self, b: &mut Self) -> Result<(), String> {
+        let result = link::run_frame(
+            &mut a.gb,
+            &mut FrameSink { pixels: &mut a.pixels },
+            &mut b.gb,
+            &mut FrameSink { pixels: &mut b.pixels },
+        );
+        a.after_frame();
+        b.after_frame();
+
+        result.map_err(|LinkFault { side, fault }| {
+            // Which of the two stopped matters: the other one is fine, and the
+            // message is all the player has to tell them apart.
+            let which = match side {
+                Side::A => "left",
+                Side::B => "right",
+            };
+            format!("{which} console: {}", crate::describe_fault(fault))
+        })
+    }
+
+    /// The housekeeping an emulated frame owes, however it was emulated: audio
+    /// out, serial out, autosave and trace.
+    fn after_frame(&mut self) {
         crate::drain_audio(&mut self.gb, self.audio.as_ref());
         crate::drain_serial(&mut self.gb, self.serial);
         if let Some(save) = self.save.as_mut() {
@@ -1206,7 +1455,6 @@ impl Session {
             trace.frame(self.gb.take_frame_trace());
         }
         self.frames += 1;
-        result.map_err(crate::describe_fault)
     }
 
     /// Dumps the frame and the VRAM as images, with `--debug`.
@@ -1233,6 +1481,15 @@ impl Session {
     /// The screen, centred and with integer scaling.
     pub fn ui(&self, ui: &mut egui::Ui, texture: &TextureHandle) {
         let area = ui.available_rect_before_wrap();
+        self.paint(ui, texture, area);
+    }
+
+    /// Draws the screen inside `area` and returns the rectangle the picture
+    /// actually landed in, which is smaller than `area` whenever the scaling
+    /// left a border. A caller that wants to draw *around* the screen —a frame
+    /// marking which console the keyboard is on— needs that rectangle and not
+    /// the area it offered.
+    fn paint(&self, ui: &mut egui::Ui, texture: &TextureHandle, area: egui::Rect) -> egui::Rect {
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
 
         // The factor is rounded down so that a Game Boy pixel is an exact N×N
@@ -1243,13 +1500,190 @@ impl Session {
             .floor()
             .max(1.0);
         let size = Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale);
+        let picture = egui::Rect::from_center_size(area.center(), size);
 
         ui.painter().image(
             texture.id(),
-            egui::Rect::from_center_size(area.center(), size),
+            picture,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             Color32::WHITE,
         );
+        picture
+    }
+}
+
+// ---- Two consoles on one cable ----------------------------------------------
+
+/// Two consoles joined by a link cable, side by side in the same window.
+///
+/// It is the shortest cable there is —both consoles are in this process, and a
+/// byte reaches the other end before either has moved on— and it exists so that
+/// a trade can be tried at all without a second machine, a network or a protocol
+/// in the middle. What works here is the emulated hardware working; what breaks
+/// once a socket is involved will be the transport's fault and not this. See
+/// [`akebia_core::link`].
+pub struct Pair {
+    consoles: [Session; 2],
+    /// Which of the two the keyboard is driving.
+    ///
+    /// One player with one keyboard has to walk both games to the counter, and
+    /// swapping between them is cheaper than learning a second set of eight keys.
+    focus: usize,
+    /// When the next frame is due. It is the pair's and not each console's: they
+    /// advance together or not at all, so there is one clock for both.
+    next: Instant,
+}
+
+impl Pair {
+    fn new(mut a: Session, mut b: Session, settings: &Settings) -> Self {
+        link::connect(&mut a.gb, &mut b.gb);
+        // Only one console is heard; see `Session::muted`.
+        b.set_muted(true, settings);
+        b.unshare_save_with(&a);
+        Self { consoles: [a, b], focus: 0, next: Instant::now() }
+    }
+
+    /// The console the keyboard is driving.
+    fn active(&mut self) -> &mut Session {
+        &mut self.consoles[self.focus]
+    }
+
+    fn frames(&self) -> u64 {
+        self.consoles[0].frames
+    }
+
+    /// Hands the keyboard to the other console.
+    ///
+    /// The one losing it is first told every button is up. Skipping that would
+    /// leave whatever was held down pressed forever —a direction is the usual
+    /// one— and the abandoned game would spend the rest of the session walking
+    /// into a wall.
+    fn swap_keyboard(&mut self, settings: &Settings) {
+        for (_, button) in KEYS {
+            self.consoles[self.focus].press(button, false);
+        }
+        self.focus ^= 1;
+        // The sound follows the keyboard: whoever is being played is the one
+        // worth hearing.
+        self.mute_all_but_the_active(settings);
+    }
+
+    fn mute_all_but_the_active(&mut self, settings: &Settings) {
+        let focus = self.focus;
+        for (index, console) in self.consoles.iter_mut().enumerate() {
+            console.set_muted(index != focus, settings);
+        }
+    }
+
+    fn pause(&mut self) {
+        self.next = Instant::now();
+    }
+
+    fn apply(&mut self, settings: &Settings) {
+        for console in &mut self.consoles {
+            console.apply(settings);
+        }
+        // `apply` alone would hand the speakers back to both of them: it reads
+        // the sound setting, which says nothing about which console is being
+        // played.
+        self.mute_all_but_the_active(settings);
+    }
+
+    fn close(&mut self) {
+        for console in &mut self.consoles {
+            console.close();
+        }
+    }
+
+    /// Pulls the cable out and gives back the console that had the keyboard,
+    /// saving the other one as it goes.
+    fn split(self, settings: &Settings) -> Session {
+        let focus = self.focus;
+        let [a, b] = self.consoles;
+        let (mut kept, mut left) = if focus == 0 { (a, b) } else { (b, a) };
+
+        left.close();
+        // Without this the console kept would sit waiting for an answer from an
+        // end that no longer exists the next time its game tried to transfer.
+        kept.gb.set_link_connected(false);
+        // On its own again there is nobody left to share the speakers with.
+        kept.set_muted(false, settings);
+        kept
+    }
+
+    /// Emulates whatever both consoles are due and uploads the two screens.
+    fn advance(
+        &mut self,
+        ctx: &egui::Context,
+        textures: &mut [TextureHandle; 2],
+    ) -> Result<(), String> {
+        let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
+        let now = Instant::now();
+        let mut emulated = 0;
+        let mut failure = None;
+
+        while self.next <= now && emulated < MAX_CATCH_UP {
+            let [a, b] = &mut self.consoles;
+            if let Err(f) = Session::linked_frame(a, b) {
+                failure = Some(f);
+                break;
+            }
+            self.next += period;
+            emulated += 1;
+        }
+        if emulated == MAX_CATCH_UP {
+            self.next = Instant::now();
+        }
+
+        if emulated > 0 {
+            for (console, texture) in self.consoles.iter().zip(textures.iter_mut()) {
+                texture.set(
+                    ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], console.pixels.clone()),
+                    TextureOptions::NEAREST,
+                );
+            }
+        }
+        ctx.request_repaint_after(self.next.saturating_duration_since(Instant::now()));
+
+        match failure {
+            Some(f) => Err(f),
+            None => Ok(()),
+        }
+    }
+
+    /// The two screens side by side, with the one holding the keyboard framed.
+    fn ui(&self, ui: &mut egui::Ui, textures: &[TextureHandle; 2]) {
+        /// Gap between the two screens. Without it the two pictures read as one
+        /// wide one, which with the same game running twice is genuinely
+        /// confusing.
+        const GUTTER: f32 = 16.0;
+
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, Color32::BLACK);
+
+        let width = ((area.width() - GUTTER) / 2.0).max(1.0);
+        let halves = [
+            egui::Rect::from_min_size(area.min, Vec2::new(width, area.height())),
+            egui::Rect::from_min_size(
+                egui::pos2(area.max.x - width, area.min.y),
+                Vec2::new(width, area.height()),
+            ),
+        ];
+
+        for (index, half) in halves.into_iter().enumerate() {
+            let picture = self.consoles[index].paint(ui, &textures[index], half);
+            if index == self.focus {
+                // Where the keyboard is has to be readable at a glance: with two
+                // copies of the same game on screen, pressing a key into the
+                // wrong one is the mistake waiting to happen.
+                ui.painter().rect_stroke(
+                    picture.expand(4.0),
+                    2.0,
+                    egui::Stroke::new(2.0, ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
     }
 }
 
