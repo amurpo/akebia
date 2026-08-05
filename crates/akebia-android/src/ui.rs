@@ -53,6 +53,8 @@ pub struct Phone {
     connecting: Option<net::Pending>,
     /// The address box, open with whatever has been typed into it.
     address: Option<String>,
+    /// Whether the way out has been pressed and is waiting to be meant.
+    leaving: bool,
     /// What was typed there last. Retyping an address is a poor way to spend the
     /// moment before a trade, and worse on glass than on a keyboard.
     last_address: String,
@@ -101,6 +103,7 @@ impl Phone {
             insets: [0.0; 4],
             connecting: None,
             address: None,
+            leaving: false,
             last_address: String::new(),
         }
     }
@@ -130,6 +133,9 @@ impl Phone {
         // A connection half made has nobody left to hand a console to.
         self.connecting = None;
         self.address = None;
+        // Whether the question was answered or the game ended on its own, there
+        // is no longer a game to be asked about leaving.
+        self.leaving = false;
         self.screen = Screen::List;
         self.warning = warning;
         // A finger held down when the screen changed would otherwise stay held
@@ -185,6 +191,61 @@ impl Phone {
         let remote = Box::new(Remote::new(wire, console.console_mut(), role));
         self.screen = Screen::Linked { console, remote };
         self.warning = None;
+    }
+
+    /// The question the way out asks before it is taken.
+    ///
+    /// The button sits in a corner of the glass, which is where a thumb goes
+    /// when it reaches past the screen; pressed by accident it used to end the
+    /// game there and then. What that costs is not the saved game —that is
+    /// written on the way out— but everything since the last time the game
+    /// itself saved, and on a Game Boy that can be an hour ago.
+    fn leave_dialog(&mut self, ctx: &egui::Context) {
+        if !self.leaving {
+            return;
+        }
+        let mut leave = false;
+        let mut stay = false;
+
+        let response = egui::Modal::new(egui::Id::new("leave")).show(ctx, |ui| {
+            ui.set_width(ui.available_width().min(420.0));
+            ui.label(RichText::new("Leave the game?").size(20.0).strong());
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "The cartridge is saved on the way out. What the game itself \
+                     has not saved is what is lost.",
+                )
+                .size(13.0)
+                .color(Color32::from_gray(0x8A)),
+            );
+
+            ui.add_space(16.0);
+            stay |= ui
+                .add_sized(
+                    Vec2::new(ui.available_width(), 52.0),
+                    egui::Button::new("Keep playing"),
+                )
+                .clicked();
+            ui.add_space(6.0);
+            leave |= ui
+                .add_sized(
+                    Vec2::new(ui.available_width(), 52.0),
+                    egui::Button::new("Leave for the list"),
+                )
+                .clicked();
+        });
+
+        // Tapping outside it is one more way of saying no, and the likeliest one
+        // if the button was hit by mistake in the first place.
+        if response.should_close() {
+            stay = true;
+        }
+        if leave {
+            self.back_to_list(None);
+        } else if stay {
+            self.leaving = false;
+        }
     }
 
     /// The box the address is typed into, and the two ways to start a link.
@@ -356,9 +417,15 @@ impl eframe::App for Phone {
         }
 
         self.touches.update(ctx);
+        // Nothing is held down while a dialog is up. The controls are read
+        // straight from the raw touches and know nothing of egui's layers, so
+        // without this a finger reaching for a button in the middle of a dialog
+        // would press whatever of the console's is underneath it — and both
+        // dialogs are drawn right over the cross.
+        let asking = self.leaving || self.address.is_some();
         self.down = match &self.pad {
-            Some(pad) => pad.pressed(&self.touches),
-            None => [false; 8],
+            Some(pad) if !asking => pad.pressed(&self.touches),
+            _ => [false; 8],
         };
 
         let mut failure = None;
@@ -419,7 +486,7 @@ impl eframe::App for Phone {
         self.pad = Some(pad);
 
         if menu.clicked() {
-            self.back_to_list(None);
+            self.leaving = true;
         }
         if cable.clicked() {
             match &self.screen {
@@ -430,6 +497,7 @@ impl eframe::App for Phone {
             }
         }
         self.link_dialog(&ui.ctx().clone());
+        self.leave_dialog(&ui.ctx().clone());
     }
 
     /// Being closed has to save the game just like leaving for the list.
