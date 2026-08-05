@@ -24,7 +24,7 @@
 //! folder chooser is Akebia's own; see the README.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -61,6 +61,10 @@ pub struct Pending {
     cancelled: Arc<AtomicBool>,
     /// What to say while it has not answered.
     pub what: String,
+    /// The address the other machine has to be given, when this end is the one
+    /// waiting. `None` when this end went looking instead —there is nobody to
+    /// tell anything to— and when it could not be worked out.
+    pub here: Option<String>,
     /// Whether this end went looking rather than waited. It is the only
     /// asymmetry the two have, and something has to use it: see
     /// [`crate::remote::Role`].
@@ -83,7 +87,13 @@ impl Pending {
         thread::spawn(move || {
             let _ = tell.send(accept_one(port, &watching));
         });
-        Self { answer, cancelled, what: format!("Waiting on port {port}"), dialled: false }
+        Self {
+            answer,
+            cancelled,
+            what: format!("Waiting on port {port}"),
+            here: this_machine().map(|address| format!("{address}:{port}")),
+            dialled: false,
+        }
     }
 
     /// Goes looking for a console that is already listening.
@@ -98,7 +108,7 @@ impl Pending {
         });
         // Nothing to raise here: `connect_timeout` gives up on its own, and the
         // thread goes with it.
-        Self { answer, cancelled: Arc::new(AtomicBool::new(false)), what, dialled: true }
+        Self { answer, cancelled: Arc::new(AtomicBool::new(false)), what, here: None, dialled: true }
     }
 
     /// The connection, once there is one. `None` while it is still being made.
@@ -112,6 +122,26 @@ impl Pending {
             }
         }
     }
+}
+
+/// The address of this machine on the network, as the other end would have to
+/// type it.
+///
+/// It is asked of a UDP socket and not of a list of interfaces, because the
+/// standard library has no such list and a machine has more than one address
+/// anyway: loopback, whatever a container or a virtual machine left behind, and
+/// the one a telephone on the same house network would actually reach. Which is
+/// which is a question about routing, so routing is asked: connecting a UDP
+/// socket sends nothing at all —there is no handshake in UDP— and only fixes
+/// which interface a packet for that address would leave by. The address it is
+/// pointed at is documentation's own and is not routed anywhere on purpose.
+///
+/// `None` when there is no route out, which on a machine with no network is the
+/// honest answer: there is no address to give anybody.
+fn this_machine() -> Option<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    Some(socket.local_addr().ok()?.ip())
 }
 
 /// A connection carrying packets, in both directions, without blocking anybody.

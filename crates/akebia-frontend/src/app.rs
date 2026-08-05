@@ -426,6 +426,26 @@ impl App {
                         .on_hover_text("Keep playing on this console alone")
                         .clicked();
                 });
+
+                // A connection being made says so here, at the far end of the
+                // same row. Until this, the only sign that "Wait for a console"
+                // had done anything at all was the window's title, which is
+                // covered by a full screen, cut short by some window managers
+                // and not looked at by anybody in the middle of a game: what it
+                // came to was choosing it and seeing nothing happen.
+                //
+                // Waiting also has to say where, because the other machine has
+                // to be told an address and this is the end that knows it.
+                if let Some(pending) = &self.connecting {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        let said = match &pending.here {
+                            Some(here) => format!("{} — this machine is {here}", pending.what),
+                            None => pending.what.clone(),
+                        };
+                        ui.label(RichText::new(said).color(ACCENT));
+                    });
+                }
             });
         });
 
