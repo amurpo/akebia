@@ -194,20 +194,14 @@ impl Pad {
         pill(painter, self.start, "START", down[6], accent);
         pill(painter, self.select, "SELECT", down[7], accent);
 
-        // The way out, kept quiet: it is not something one reaches for while
-        // playing, and a bright button there would be pressed by accident.
-        for (rect, glyph, lit) in
-            [(self.menu, "≡", false), (self.link, "⇄", linked)]
-        {
-            painter.rect_filled(rect, 6.0, if lit { accent } else { FACE });
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                glyph,
-                FontId::proportional(rect.height() * 0.6),
-                if lit { FACE } else { LABEL },
-            );
-        }
+        // The way out and the cable, kept quiet: neither is something one reaches
+        // for while playing, and bright buttons there would be pressed by
+        // accident.
+        painter.rect_filled(self.menu, 6.0, FACE);
+        strokes(painter, &menu_icon(self.menu), self.menu, LABEL);
+
+        painter.rect_filled(self.link, 6.0, if linked { accent } else { FACE });
+        strokes(painter, &link_icon(self.link), self.link, if linked { FACE } else { LABEL });
     }
 }
 
@@ -300,6 +294,59 @@ fn menu_corner(area: Rect, index: usize) -> Rect {
     let gap = 6.0;
     let offset = (side + gap) * index as f32;
     Rect::from_min_size(Pos2::new(area.right() - side - offset, area.top()), Vec2::splat(side))
+}
+
+/// The three lines of a menu.
+///
+/// Drawn and not written, and that is the whole point of these two. What was
+/// here before was `≡` and `⇄`, one character each and no code at all — and both
+/// came out as the empty box a font puts in place of a character it does not
+/// carry. egui brings its own fonts and neither of those two symbols is in any
+/// of them; Android's are never asked. Lines and arrowheads are there on every
+/// telephone because they are drawn by hand.
+fn menu_icon(rect: Rect) -> Vec<[Pos2; 2]> {
+    let centre = rect.center();
+    let half = rect.width() * 0.22;
+    let gap = rect.height() * 0.15;
+    [-1.0, 0.0, 1.0]
+        .into_iter()
+        .map(|step| {
+            let y = centre.y + gap * step;
+            [Pos2::new(centre.x - half, y), Pos2::new(centre.x + half, y)]
+        })
+        .collect()
+}
+
+/// Two arrows passing each other, which is what a cable between two consoles is
+/// for: something goes each way.
+fn link_icon(rect: Rect) -> Vec<[Pos2; 2]> {
+    let centre = rect.center();
+    let half = rect.width() * 0.22;
+    let gap = rect.height() * 0.12;
+    let head = rect.width() * 0.10;
+
+    let mut lines = Vec::with_capacity(6);
+    // The upper one points right and the lower one left, mirrored through the
+    // middle: `towards` is which way each is going.
+    for (step, towards) in [(-1.0, 1.0), (1.0, -1.0)] {
+        let y = centre.y + gap * step;
+        let tip = Pos2::new(centre.x + half * towards, y);
+        lines.push([Pos2::new(centre.x - half * towards, y), tip]);
+        // The head as two strokes off the tip and not as a filled triangle: at
+        // this size a triangle is a handful of pixels and comes out a blob.
+        for slant in [-1.0, 1.0] {
+            lines.push([tip, Pos2::new(tip.x - head * towards, tip.y + head * slant)]);
+        }
+    }
+    lines
+}
+
+/// Draws an icon, with a line thick enough to be seen on glass.
+fn strokes(painter: &Painter, lines: &[[Pos2; 2]], rect: Rect, colour: Color32) {
+    let stroke = Stroke::new((rect.height() * 0.055).max(1.5), colour);
+    for line in lines {
+        painter.line_segment(*line, stroke);
+    }
 }
 
 fn inside_circle(rect: Rect, point: Pos2) -> bool {
@@ -457,6 +504,27 @@ mod tests {
             [false; 4],
             "a thumb resting in the middle presses nothing"
         );
+    }
+
+    /// The two corner icons are drawn and not written, which turns them into
+    /// arithmetic — and arithmetic is what this module is here to check.
+    #[test]
+    fn the_corner_icons_stay_inside_their_buttons() {
+        for (name, width, height) in SCREENS {
+            let pad = Pad::lay_out(area(width, height));
+            for (control, rect, lines) in [
+                ("menu", pad.menu, menu_icon(pad.menu)),
+                ("link", pad.link, link_icon(pad.link)),
+            ] {
+                assert!(!lines.is_empty(), "{name}: {control} came out with no icon at all");
+                for [from, to] in lines {
+                    assert!(
+                        rect.contains(from) && rect.contains(to),
+                        "{name}: the {control} icon runs {from:?} to {to:?}, outside {rect:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Two fingers at once, which is the whole reason the touches are tracked by
