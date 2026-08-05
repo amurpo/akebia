@@ -51,7 +51,7 @@ akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 332 tests
+cargo test                   # 350 tests
 ```
 
 ### The game list
@@ -418,6 +418,7 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `joypad.rs`, `serial.rs` | input and the serial shift register |
 | `link/mod.rs` | two consoles on one cable, advanced in lockstep |
 | `link/bgb.rs` | BGB's link protocol: the packets, and the clock they carry |
+| `link/session.rs` | the rule that decides when a console may run |
 | `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |

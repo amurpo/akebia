@@ -112,6 +112,16 @@ impl Stamp {
     pub const fn plus_t_cycles(self, t_cycles: u64) -> Self {
         Self(self.0.wrapping_add((t_cycles / T_CYCLES_PER_UNIT) as u32) & STAMP_MASK)
     }
+
+    /// This instant moved by `units`, which may be negative.
+    ///
+    /// It is how an instant on one console's clock is read on the other's: the
+    /// two count from their own switching on, so what one of them calls 5000 is
+    /// some other number here, and the distance between the two is what turns
+    /// one into the other.
+    pub const fn shifted(self, units: i32) -> Self {
+        Self(self.0.wrapping_add(units as u32) & STAMP_MASK)
+    }
 }
 
 /// What a console reports about the clock it is driving, packed the way `sync1`

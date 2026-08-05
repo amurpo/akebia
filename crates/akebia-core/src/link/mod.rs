@@ -33,6 +33,7 @@
 //! is where a real cycle-count protocol becomes necessary.
 
 pub mod bgb;
+pub mod session;
 
 use crate::cpu::Fault;
 use crate::gameboy::T_CYCLES_PER_FRAME;
