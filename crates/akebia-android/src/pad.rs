@@ -67,6 +67,12 @@ pub struct Pad {
     select: Rect,
     /// The way back to the list.
     pub menu: Rect,
+    /// The cable: waiting for another machine, or going to one.
+    ///
+    /// Next to the way out and as quiet, for the same reason. A telephone has no
+    /// menu bar to hide it in, and the two things one reaches for while a game
+    /// is running are leaving it and joining somebody.
+    pub link: Rect,
 }
 
 impl Pad {
@@ -115,7 +121,7 @@ impl Pad {
             button,
         );
         let (start, select) = pills(band, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area) }
+        Self { screen, cross, a, b, start, select, menu: menu_corner(area, 0), link: menu_corner(area, 1) }
     }
 
     fn turned(area: Rect) -> Self {
@@ -140,7 +146,7 @@ impl Pad {
         // Underneath the picture, which is the only strip of nothing left.
         let pills_row = (area.height() * 0.12).clamp(38.0, 54.0);
         let (start, select) = pills(screen, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area) }
+        Self { screen, cross, a, b, start, select, menu: menu_corner(area, 0), link: menu_corner(area, 1) }
     }
 
     /// Which of the eight are held down by the fingers currently on the glass.
@@ -164,7 +170,7 @@ impl Pad {
     }
 
     /// Draws them, lit where a finger is.
-    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32) {
+    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32, linked: bool) {
         let arm = self.cross.width() / 3.0;
         let centre = self.cross.center();
         let lit = |on: bool| if on { accent } else { FACE };
@@ -190,14 +196,18 @@ impl Pad {
 
         // The way out, kept quiet: it is not something one reaches for while
         // playing, and a bright button there would be pressed by accident.
-        painter.rect_filled(self.menu, 6.0, FACE);
-        painter.text(
-            self.menu.center(),
-            Align2::CENTER_CENTER,
-            "≡",
-            FontId::proportional(self.menu.height() * 0.6),
-            LABEL,
-        );
+        for (rect, glyph, lit) in
+            [(self.menu, "≡", false), (self.link, "⇄", linked)]
+        {
+            painter.rect_filled(rect, 6.0, if lit { accent } else { FACE });
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::proportional(rect.height() * 0.6),
+                if lit { FACE } else { LABEL },
+            );
+        }
     }
 }
 
@@ -284,9 +294,12 @@ fn pills(band: Rect, height: f32) -> (Rect, Rect) {
     )
 }
 
-fn menu_corner(area: Rect) -> Rect {
+/// The `index`-th small button along the top right corner, counting inwards.
+fn menu_corner(area: Rect, index: usize) -> Rect {
     let side = 44.0;
-    Rect::from_min_size(Pos2::new(area.right() - side, area.top()), Vec2::splat(side))
+    let gap = 6.0;
+    let offset = (side + gap) * index as f32;
+    Rect::from_min_size(Pos2::new(area.right() - side - offset, area.top()), Vec2::splat(side))
 }
 
 fn inside_circle(rect: Rect, point: Pos2) -> bool {
@@ -346,7 +359,7 @@ mod tests {
     }
 
     /// Every control, as a rectangle, with the name to complain about.
-    fn controls(pad: &Pad) -> [(&'static str, Rect); 6] {
+    fn controls(pad: &Pad) -> [(&'static str, Rect); 7] {
         [
             ("cross", pad.cross),
             ("A", pad.a),
@@ -354,6 +367,7 @@ mod tests {
             ("start", pad.start),
             ("select", pad.select),
             ("menu", pad.menu),
+            ("link", pad.link),
         ]
     }
 

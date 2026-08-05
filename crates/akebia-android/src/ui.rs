@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use akebia_core::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use akebia_frontend::app::{Session, Settings, ACCENT, BACKGROUND};
 use akebia_frontend::args::Args;
-use akebia_frontend::roms;
+use akebia_frontend::remote::{Remote, Role};
+use akebia_frontend::{net, roms};
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
 
 use crate::java::Java;
@@ -48,12 +49,25 @@ pub struct Phone {
     /// pixels. Asked of Android every frame because turning the telephone
     /// changes it.
     insets: [f32; 4],
+    /// A connection being made, while the game carries on.
+    connecting: Option<net::Pending>,
+    /// The address box, open with whatever has been typed into it.
+    address: Option<String>,
+    /// What was typed there last. Retyping an address is a poor way to spend the
+    /// moment before a trade, and worse on glass than on a keyboard.
+    last_address: String,
 }
 
 enum Screen {
     List,
     /// Boxed because a session holds a whole console inside.
     Playing(Box<Session>),
+    /// The same console, with the other end of its cable on another machine.
+    ///
+    /// There is no second screen and no second keyboard: a telephone has room
+    /// for neither, and over a network it needs neither, because the other
+    /// console is somebody else's and is drawing itself over there.
+    Linked { console: Box<Session>, remote: Box<Remote> },
 }
 
 impl Phone {
@@ -85,6 +99,9 @@ impl Phone {
             pad: None,
             down: [false; 8],
             insets: [0.0; 4],
+            connecting: None,
+            address: None,
+            last_address: String::new(),
         }
     }
 
@@ -105,9 +122,14 @@ impl Phone {
 
     /// Saves the game and goes back to the list.
     fn back_to_list(&mut self, warning: Option<String>) {
-        if let Screen::Playing(session) = &mut self.screen {
-            session.close();
+        match &mut self.screen {
+            Screen::Playing(session) => session.close(),
+            Screen::Linked { console, .. } => console.close(),
+            Screen::List => {}
         }
+        // A connection half made has nobody left to hand a console to.
+        self.connecting = None;
+        self.address = None;
         self.screen = Screen::List;
         self.warning = warning;
         // A finger held down when the screen changed would otherwise stay held
@@ -119,6 +141,109 @@ impl Phone {
     fn rescan(&mut self) {
         if let Some(dir) = self.java.roms_dir() {
             self.games = roms::scan(&dir);
+        }
+    }
+
+    /// Pulls the cable out, keeping the console.
+    fn unplug(&mut self) {
+        let Screen::Linked { console, remote } = std::mem::replace(&mut self.screen, Screen::List)
+        else {
+            return;
+        };
+        remote.close();
+        let mut console = console;
+        console.console_mut().set_link_connected(false);
+        self.screen = Screen::Playing(console);
+    }
+
+    /// Picks up a connection once it is made, and plugs the cable in.
+    fn collect_connection(&mut self) {
+        let Some(pending) = self.connecting.as_mut() else {
+            return;
+        };
+        let dialled = pending.dialled;
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.connecting = None;
+
+        let wire = match result {
+            Ok(wire) => wire,
+            Err(failure) => {
+                self.warning = Some(failure.to_string());
+                return;
+            }
+        };
+        // The console it was for may be gone: the game was left for the list
+        // while the connection was being made. Taking the screen apart anyway
+        // would drop a session without saving it.
+        let Screen::Playing(session) = std::mem::replace(&mut self.screen, Screen::List) else {
+            return;
+        };
+        let mut console = session;
+        let role = if dialled { Role::Dialled } else { Role::Waited };
+        let remote = Box::new(Remote::new(wire, console.console_mut(), role));
+        self.screen = Screen::Linked { console, remote };
+        self.warning = None;
+    }
+
+    /// The box the address is typed into, and the two ways to start a link.
+    ///
+    /// A dialog and not a screen of its own: the game stays where it is and
+    /// cancelling costs nothing. On glass it is also the only sensible place for
+    /// a text field, which is a thing this interface otherwise does not have.
+    fn link_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut typed) = self.address.take() else {
+            return;
+        };
+        let mut go = false;
+        let mut wait = false;
+        let mut cancelled = false;
+
+        let response = egui::Modal::new(egui::Id::new("link")).show(ctx, |ui| {
+            // A modal is offered the whole window, so the width has to be said
+            // rather than taken: 420 points is about a thumb's reach across.
+            ui.set_width(ui.available_width().min(420.0));
+            ui.label(RichText::new("Link cable").size(20.0).strong());
+            ui.add_space(10.0);
+
+            wait |= ui
+                .add_sized(Vec2::new(ui.available_width(), 52.0), egui::Button::new("Wait here"))
+                .clicked();
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("...and let the other machine connect to this one.")
+                    .size(13.0)
+                    .color(Color32::from_gray(0x8A)),
+            );
+
+            ui.add_space(14.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .hint_text("192.168.1.20")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            go |= ui
+                .add_sized(Vec2::new(ui.available_width(), 52.0), egui::Button::new("Connect"))
+                .clicked();
+
+            ui.add_space(14.0);
+            cancelled |= ui
+                .add_sized(Vec2::new(ui.available_width(), 44.0), egui::Button::new("Cancel"))
+                .clicked();
+        });
+
+        if response.should_close() {
+            cancelled = true;
+        }
+        if wait {
+            self.connecting = Some(net::Pending::listen(akebia_core::link::bgb::DEFAULT_PORT));
+        } else if go && !typed.trim().is_empty() {
+            self.last_address = typed.clone();
+            self.connecting = Some(net::Pending::connect(typed));
+        } else if !cancelled {
+            self.address = Some(typed);
         }
     }
 
@@ -223,6 +348,12 @@ impl eframe::App for Phone {
             self.play(path);
         }
         self.insets = self.java.insets();
+        self.collect_connection();
+        if self.connecting.is_some() {
+            // Nothing else on this screen would ask for the repaint that looks
+            // at the connection again.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         self.touches.update(ctx);
         self.down = match &self.pad {
@@ -231,15 +362,26 @@ impl eframe::App for Phone {
         };
 
         let mut failure = None;
-        if let Screen::Playing(session) = &mut self.screen {
-            // Before emulating, so the buttons are already set when the game
-            // reads the joypad.
-            for (button, held) in BUTTONS.into_iter().zip(self.down) {
+        // Before emulating, so the buttons are already set when the game reads
+        // the joypad.
+        let pressed = |session: &mut Session, down: [bool; 8]| {
+            for (button, held) in BUTTONS.into_iter().zip(down) {
                 session.press(button, held);
             }
-            if let Err(reason) = session.advance(ctx, &mut self.texture) {
-                failure = Some(reason.lines().next().unwrap_or_default().to_owned());
+        };
+        let outcome = match &mut self.screen {
+            Screen::Playing(session) => {
+                pressed(session, self.down);
+                Some(session.advance(ctx, &mut self.texture))
             }
+            Screen::Linked { console, remote } => {
+                pressed(console, self.down);
+                Some(console.advance_over(remote, ctx, &mut self.texture))
+            }
+            Screen::List => None,
+        };
+        if let Some(Err(reason)) = outcome {
+            failure = Some(reason.lines().next().unwrap_or_default().to_owned());
         }
         if failure.is_some() {
             self.back_to_list(failure);
@@ -252,34 +394,50 @@ impl eframe::App for Phone {
         let safe = self.safe_area(ui);
         let ui = &mut ui.new_child(egui::UiBuilder::new().max_rect(safe));
 
-        let playing = matches!(self.screen, Screen::Playing(_));
-        if !playing {
-            if let Some(path) = self.list(ui) {
-                self.play(path);
+        let console = match &self.screen {
+            Screen::Playing(session) => session,
+            Screen::Linked { console, .. } => console,
+            Screen::List => {
+                if let Some(path) = self.list(ui) {
+                    self.play(path);
+                }
+                return;
             }
-            return;
-        }
+        };
 
         let pad = Pad::lay_out(safe);
-        if let Screen::Playing(session) = &self.screen {
-            let mut inside = ui.new_child(egui::UiBuilder::new().max_rect(pad.screen));
-            session.ui(&mut inside, &self.texture);
-        }
-        pad.paint(ui.painter(), &self.down, ACCENT);
+        let mut inside = ui.new_child(egui::UiBuilder::new().max_rect(pad.screen));
+        console.ui(&mut inside, &self.texture);
+        let linked = matches!(self.screen, Screen::Linked { .. }) || self.connecting.is_some();
+        pad.paint(ui.painter(), &self.down, ACCENT, linked);
 
-        // The way out is a widget and not another touch region: it is a tap like
-        // any other, and egui already knows how to tell a tap from a slide.
+        // The two corner buttons are widgets and not touch regions: they are
+        // taps like any other, and egui already knows how to tell a tap from a
+        // slide. The eight that are not are the ones a thumb slides between.
         let menu = ui.interact(pad.menu, egui::Id::new("back"), egui::Sense::click());
+        let cable = ui.interact(pad.link, egui::Id::new("link"), egui::Sense::click());
         self.pad = Some(pad);
+
         if menu.clicked() {
             self.back_to_list(None);
         }
+        if cable.clicked() {
+            match &self.screen {
+                // Already joined, or joining: the button is the way out of it.
+                Screen::Linked { .. } => self.unplug(),
+                _ if self.connecting.is_some() => self.connecting = None,
+                _ => self.address = Some(self.last_address.clone()),
+            }
+        }
+        self.link_dialog(&ui.ctx().clone());
     }
 
     /// Being closed has to save the game just like leaving for the list.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Screen::Playing(session) = &mut self.screen {
-            session.close();
+        match &mut self.screen {
+            Screen::Playing(session) => session.close(),
+            Screen::Linked { console, .. } => console.close(),
+            Screen::List => {}
         }
     }
 }

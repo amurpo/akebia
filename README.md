@@ -252,7 +252,14 @@ there is no second picture to fit anywhere and no saved game to share, because
 the other console belongs to somebody else.
 
 What crosses is [BGB's link protocol](https://bgb.bircd.org/bgblink.html), so
-the far end may be BGB itself or any emulator that already speaks it.
+the far end may be BGB itself or any emulator that already speaks it — or the
+Android build, where the same two choices live behind the `⇄` button in the
+corner, next to the way back to the list. A telephone has no menu bar to put
+them in and needs no second screen either, which is the whole reason the network
+is the right shape for it and a second console in the same window is not.
+
+Either end may be the one that waits. On a home network the machine that is
+easier to name should be the one waiting, which usually means the desktop.
 
 Measured against a real cartridge over the loopback: two consoles walked to the
 Cable Club, linked, and ran 3400 frames apiece stopping to wait for each other
