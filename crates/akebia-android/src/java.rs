@@ -54,6 +54,26 @@ impl Java {
         self.path(jni_str!("getRomsDir"))
     }
 
+    /// Whether the cartridges can be kept out of the application's own folder.
+    ///
+    /// It is the difference between a saved game that survives uninstalling
+    /// Akebia and one that does not, and nothing else: with it or without it the
+    /// emulator plays and saves the same way.
+    pub fn storage_granted(&self) -> bool {
+        self.flag(jni_str!("hasStorage"))
+    }
+
+    /// Asks for it, which means sending the user to the system's settings.
+    ///
+    /// Like the file picker, the answer does not come back from here: it is seen
+    /// on the way back, the next time [`Java::storage_granted`] is asked.
+    pub fn request_storage(&self) -> Result<(), String> {
+        self.attach(|env, activity| {
+            env.call_method(activity, jni_str!("requestStorage"), jni_sig!("()V"), &[])?;
+            Ok(())
+        })
+    }
+
     /// How far the clock, the navigation bar and the camera's hole reach into
     /// the window: left, top, right and bottom, in pixels.
     ///
@@ -74,6 +94,24 @@ impl Java {
             Err(message) => {
                 log::error!("getInsets: {message}");
                 [0.0; 4]
+            }
+        }
+    }
+
+    /// Calls a method with no arguments that answers yes or no.
+    ///
+    /// A question that could not be asked is a no. Every one of them is about
+    /// something Akebia may do and not about something it needs, so the false
+    /// leaves the emulator on the path that asks for nothing.
+    fn flag(&self, method: &'static JNIStr) -> bool {
+        let answer = self.attach(|env, activity| {
+            env.call_method(activity, method, jni_sig!("()Z"), &[])?.z()
+        });
+        match answer {
+            Ok(flag) => flag,
+            Err(message) => {
+                log::error!("{method}: {message}");
+                false
             }
         }
     }

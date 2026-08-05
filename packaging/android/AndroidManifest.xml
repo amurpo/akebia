@@ -23,7 +23,33 @@
          grant: it is declared here and given at install. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <application android:label="Akebia" android:icon="@mipmap/ic_launcher">
+    <!-- Where the saved games live. Android erases everything an application
+         owns when it is uninstalled, and a saved game inside that folder goes
+         with it: a hundred hours are lost to reinstalling the emulator. So the
+         cartridges and their `.sav` are kept out in the shared storage, in
+         `/sdcard/Akebia`, and reaching it is what these two ask for.
+
+         They are two because Android changed how it is asked halfway through the
+         range of telephones this runs on. Up to Android 10 it is the old runtime
+         permission, granted in a dialog; `maxSdkVersion` retires it after that,
+         where it no longer does anything. From Android 11 on, writing outside
+         one's own folder means `MANAGE_EXTERNAL_STORAGE`, which no dialog grants:
+         the user turns it on in the settings, and Akebia sends them there.
+
+         Neither is required to play. Without them the emulator falls back to its
+         own folder and everything works exactly as it did before - up until the
+         day the application is uninstalled. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!-- Android 10 only, and it is the reason the permission above is enough
+         there: that release put every application under scoped storage, where
+         the old permission stopped granting a path to write to, and left this
+         flag as the way to say the old rules still apply. Android 11 ignores it
+         outright, which is what `MANAGE_EXTERNAL_STORAGE` is for. -->
+    <application android:label="Akebia" android:icon="@mipmap/ic_launcher"
+        android:requestLegacyExternalStorage="true">
 
         <!-- `configChanges` lists what the activity survives. Without it Android
              destroys and rebuilds it on every rotation, and rebuilding it means

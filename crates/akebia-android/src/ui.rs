@@ -32,6 +32,10 @@ pub struct Phone {
     screen: Screen,
     /// The cartridges already imported.
     games: Vec<roms::Entry>,
+    /// Whether the cartridges are kept outside the application's own folder,
+    /// which is the same as asking whether a saved game survives uninstalling
+    /// Akebia. False until Android is asked and says so.
+    storage: bool,
     /// Whatever went wrong last, shown over the list.
     warning: Option<String>,
     touches: Touches,
@@ -88,6 +92,9 @@ impl Phone {
         );
 
         let settings = Settings::from_args(&args);
+        // In this order: where the cartridges are depends on the answer, and
+        // asking afterwards would list the wrong folder for one frame.
+        let storage = java.storage_granted();
         let games = java.roms_dir().map(|dir| roms::scan(&dir)).unwrap_or_default();
         Self {
             java,
@@ -96,6 +103,7 @@ impl Phone {
             texture,
             screen: Screen::List,
             games,
+            storage,
             warning: None,
             touches: Touches::default(),
             pad: None,
@@ -331,6 +339,52 @@ impl Phone {
         }
     }
 
+    /// What is standing between the saved games and the next uninstall, while
+    /// there is anything standing there at all.
+    ///
+    /// It is worth the room it takes on the list: a saved game is the one thing
+    /// in the telephone that cannot be downloaded again, and the day it is found
+    /// missing is the day it is too late. Once the folder is out of Android's
+    /// reach the notice goes away for good.
+    fn storage_notice(&mut self, ui: &mut egui::Ui) {
+        if self.storage {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Uninstalling Akebia erases the saved games with it.")
+                        .size(14.0)
+                        .color(ACCENT),
+                );
+                ui.add_space(6.0);
+                let move_out = ui.add_sized(
+                    Vec2::new(220.0, 44.0),
+                    egui::Button::new(RichText::new("Keep them outside…").size(16.0)),
+                );
+                if move_out.clicked() {
+                    // Android grants this in its own settings and nowhere else,
+                    // so the button leaves for another application entirely. The
+                    // answer is seen on the way back, in `logic`.
+                    if let Err(message) = self.java.request_storage() {
+                        self.warning = Some(message);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "...in /sdcard/Akebia, along with the cartridges.\n\
+                         Android asks for this in its settings.",
+                    )
+                    .size(13.0)
+                    .color(Color32::from_gray(0x8A)),
+                );
+            });
+        });
+        ui.add_space(12.0);
+    }
+
     /// The list of cartridges. Answers with the one that was tapped.
     fn list(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
         let mut picked = None;
@@ -363,6 +417,8 @@ impl Phone {
             });
             ui.add_space(6.0);
         }
+
+        self.storage_notice(ui);
 
         if self.games.is_empty() {
             ui.add_space(40.0);
@@ -407,6 +463,19 @@ impl eframe::App for Phone {
         if let Some(path) = self.java.imported_rom() {
             self.rescan();
             self.play(path);
+        }
+        // Coming back from the settings the access may be there now, and with it
+        // another folder to list: granting it moves what was inside across.
+        //
+        // Only from the list, and that is deliberate rather than thrift. The
+        // move happens the first time the folder is asked for, and a game
+        // running while its `.sav` was carried elsewhere would go on autosaving
+        // to the file left behind. From the list there is no game to strand.
+        if !self.storage && matches!(self.screen, Screen::List) {
+            self.storage = self.java.storage_granted();
+            if self.storage {
+                self.rescan();
+            }
         }
         self.insets = self.java.insets();
         self.collect_connection();
