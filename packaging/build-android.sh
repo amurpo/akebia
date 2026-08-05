@@ -71,7 +71,15 @@ fi
 
 WORK="$ROOT/target/android"
 APK="$WORK/akebia-$ABI.apk"
-KEYSTORE="$WORK/debug.keystore"
+
+# The signing key, and it is deliberately nowhere near `target/`. Android will
+# only update a package whose signature it has seen before, so losing the key
+# means uninstalling to get the new build on the telephone — and uninstalling
+# takes the saved games with it. `target/` is a directory that exists to be
+# thrown away; a key that dies with it is a key that dies about once a month.
+# Out of the repository too: it is a private key, throwaway or not.
+KEYS="${XDG_DATA_HOME:-$HOME/.local/share}/akebia"
+KEYSTORE="$KEYS/debug.keystore"
 
 # The version lives in the binary's crate, the same place the RPM reads it from:
 # the root Cargo.toml only declares the workspace and has no `version` field.
@@ -146,9 +154,18 @@ cp -r "$OUT/$ABI" "$WORK/lib/"
 "$TOOLS/zipalign" -f -P 16 4 "$WORK/unaligned.apk" "$WORK/aligned.apk"
 
 # A throwaway key: it only has to prove that every version of the package comes
-# from the same place. It lives under `target/`, out of the repository. Wiping
-# `target/` mints another one, and Android refuses to update a package whose
-# signature changed —uninstall first if that happens.
+# from the same place.
+mkdir -p "$KEYS"
+
+# Where it used to be kept. Carried across rather than left to be wiped with the
+# next `target/`: it is the key the package already on the telephone was signed
+# with, and minting another one instead would turn every future build into a
+# different application as far as Android is concerned.
+if [ ! -f "$KEYSTORE" ] && [ -f "$WORK/debug.keystore" ]; then
+    echo "==> Moving the debug key to $KEYS..."
+    mv "$WORK/debug.keystore" "$KEYSTORE"
+fi
+
 if [ ! -f "$KEYSTORE" ]; then
     echo "==> Minting a debug key..."
     keytool -genkeypair -keystore "$KEYSTORE" -alias akebia \
