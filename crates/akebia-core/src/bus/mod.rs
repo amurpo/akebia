@@ -234,7 +234,7 @@ impl SystemBus {
 
     /// Clocks a byte in from the console driving the clock. See
     /// [`Serial::clock_in`].
-    pub fn link_clock_in(&mut self, incoming: u8) -> u8 {
+    pub fn link_clock_in(&mut self, incoming: u8) -> Option<u8> {
         self.serial.clock_in(incoming, &mut self.interrupts)
     }
 

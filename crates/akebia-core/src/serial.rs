@@ -58,7 +58,7 @@ const INTERNAL_CLOCK: u8 = 0x01;
 ///
 /// The data line rests high, so a console clocking eight bits at an empty cable
 /// —or at one whose other end is not listening— shifts in eight ones.
-const IDLE_LINE: u8 = 0xFF;
+pub const IDLE_LINE: u8 = 0xFF;
 
 /// Something that happened on the cable, recorded when the trace is on.
 ///
@@ -268,7 +268,13 @@ impl Serial {
 
     /// Clocks a whole byte in from the other console, which is the one driving
     /// the clock. Returns what this end had in its register, which is exactly
-    /// what the other one receives.
+    /// what the other one receives, or `None` if it had armed nothing.
+    ///
+    /// `None` is not `Some(IDLE_LINE)`: one is a console that gave up a byte
+    /// which happened to be all ones, the other is a console that gave up
+    /// nothing at all. Over a cable the two look the same; over a network they
+    /// are different packets, which is why the difference is kept here rather
+    /// than flattened at the point it is discovered.
     ///
     /// # A console that has not armed a transfer answers nothing
     ///
@@ -285,7 +291,7 @@ impl Serial {
     /// connected to something that is not listening. From there the two are in
     /// different stages of the protocol and neither can get out. `0xFF` says
     /// "nobody home", which is a thing a game can wait on.
-    pub fn clock_in(&mut self, incoming: u8, ic: &mut InterruptController) -> u8 {
+    pub fn clock_in(&mut self, incoming: u8, ic: &mut InterruptController) -> Option<u8> {
         let armed = self.sc & START != 0 && self.sc & INTERNAL_CLOCK == 0;
         let event = LinkEvent::Transferred {
             at: self.now,
@@ -296,7 +302,7 @@ impl Serial {
         };
         self.record(event);
         if !armed {
-            return IDLE_LINE;
+            return None;
         }
 
         let outgoing = self.sb;
@@ -305,7 +311,7 @@ impl Serial {
         self.sc &= !START;
         self.bits = 0;
         ic.request(Interrupt::Serial);
-        outgoing
+        Some(outgoing)
     }
 
     /// Plugs the cable in or pulls it out. With nothing plugged in, transfers
@@ -325,6 +331,12 @@ impl Serial {
 
     /// T-cycles per bit. The fast clock is a CGB register; on a DMG that bit
     /// does not exist and reads as 1, so it cannot be consulted.
+    /// Whether this console is driving the CGB's fast shift clock. It is what a
+    /// `sync1` has to carry, because the byte takes a thirty-second of the time.
+    pub fn fast_clock(&self) -> bool {
+        self.model == Model::Cgb && self.sc & FAST != 0
+    }
+
     fn bit_period(&self) -> u32 {
         if self.model == Model::Cgb && self.sc & FAST != 0 {
             FAST_BIT_T_CYCLES
@@ -476,7 +488,7 @@ mod tests {
         s.write(0xFF02, 0x80); // armed, external clock
 
         let sent = s.clock_in(0xBB, &mut ic);
-        assert_eq!(sent, 0xAA, "the other end receives what this one was holding");
+        assert_eq!(sent, Some(0xAA), "the other end receives what this one was holding");
         assert_eq!(s.read(0xFF01), 0xBB);
         assert_eq!(s.read(0xFF02) & START, 0);
         assert_eq!(ic.pending(), Some(Interrupt::Serial));
@@ -496,7 +508,7 @@ mod tests {
         s.write(0xFF01, 0xAA);
 
         let sent = s.clock_in(0xBB, &mut ic);
-        assert_eq!(sent, IDLE_LINE, "there is nobody driving the line");
+        assert_eq!(sent, None, "there is nobody driving the line");
         assert_eq!(s.read(0xFF01), 0xAA, "and nothing was shifted in either");
         assert_eq!(ic.pending(), None, "nothing was armed: the game is not told");
     }

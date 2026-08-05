@@ -48,7 +48,7 @@ pub const DEFAULT_PORT: u16 = 8765;
 ///
 /// The timestamps count at 2 MiHz, 2^21 per second, and the console's clock runs
 /// at 2^22. So a unit is two T-cycles exactly, with no rounding to argue about.
-const T_CYCLES_PER_UNIT: u64 = 2;
+pub const T_CYCLES_PER_UNIT: u64 = 2;
 
 /// Bits a timestamp really has. The highest one is always zero.
 const STAMP_BITS: u32 = 31;

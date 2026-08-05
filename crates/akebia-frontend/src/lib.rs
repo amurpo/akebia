@@ -20,6 +20,8 @@ pub mod app;
 pub mod args;
 pub mod audio;
 pub mod debug;
+pub mod net;
+pub mod remote;
 pub mod roms;
 pub mod save;
 

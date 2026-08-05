@@ -48,6 +48,32 @@ use super::bgb::{Control, Packet, Stamp};
 /// hands the other starts being visibly stale.
 pub const ANNOUNCE_EVERY_T_CYCLES: u64 = crate::gameboy::T_CYCLES_PER_FRAME as u64;
 
+/// How far past the other end's last word a console is allowed to get.
+///
+/// # Why there is a lead at all
+///
+/// Because without one nothing moves. "Run up to what the other end vouched
+/// for" sounds like the safe rule and it is a deadlock: a console cannot run a
+/// frame until its partner says it has, and its partner is waiting on exactly
+/// the same thing. Both sit at the instant they met.
+///
+/// So a console is allowed a frame's head start over what it has been told, and
+/// that is what turns the two of them over: each runs a frame, says so, and the
+/// saying so is what buys the other its next frame. It also decides how much
+/// delay the link swallows without either console slowing down — a round trip
+/// shorter than a frame is free, which covers a local network and most of
+/// Bluetooth.
+///
+/// # What it costs
+///
+/// Honesty about a byte's placing. A byte the other end clocks may be dated up
+/// to this far before the instant this console has already reached, and there is
+/// nothing to be done about that but apply it where we are. It is the one
+/// approximation in the whole cable, it is the same one BGB makes, and a frame
+/// of it is nothing against protocols whose own bytes are a millisecond apart
+/// and padded besides.
+pub const LEAD_T_CYCLES: u64 = crate::gameboy::T_CYCLES_PER_FRAME as u64;
+
 /// What the caller has to do about a packet it just handed over.
 ///
 /// Everything else —version checks, status, timestamps, packets from a newer BGB
@@ -170,7 +196,22 @@ impl Session {
         if !self.is_ready() || self.awaiting_answer || self.offset.is_none() {
             return false;
         }
-        !self.ours.is_after(self.theirs)
+        !self.ours.is_after(self.theirs.plus_t_cycles(LEAD_T_CYCLES))
+    }
+
+    /// How many T-cycles the console may still run before it has to wait.
+    ///
+    /// [`Session::may_run`] answers whether; this answers how far, which is what
+    /// lets a caller emulate a stretch at a time instead of asking again after
+    /// every instruction. Zero means the two are level — the caller should still
+    /// run one instruction, or two consoles that meet exactly would each sit
+    /// waiting for the other to move first.
+    pub fn allowance_t_cycles(&self) -> u64 {
+        if !self.may_run() {
+            return 0;
+        }
+        let limit = self.theirs.plus_t_cycles(LEAD_T_CYCLES);
+        limit.since(self.ours).max(0) as u64 * super::bgb::T_CYCLES_PER_UNIT
     }
 
     /// This console has now lived to `t_cycles`.
@@ -384,7 +425,7 @@ mod tests {
         session.receive(Packet::Reached(Stamp::from_t_cycles(0)));
         assert!(session.may_run(), "an hour of age is no reason to stall");
 
-        session.advance_to(HOUR + 10_000);
+        session.advance_to(HOUR + 10_000 + LEAD_T_CYCLES);
         assert!(!session.may_run(), "and it still stops where the other end stopped");
 
         session.receive(Packet::Reached(Stamp::from_t_cycles(30_000)));
@@ -403,28 +444,52 @@ mod tests {
         assert!(session.take_outgoing().is_empty(), "nothing more is said to it");
     }
 
-    /// The rule, in one test: a console runs to the last instant vouched for and
-    /// stops there.
+    /// The rule, in one test: a console runs to the last instant vouched for,
+    /// plus the head start that keeps the two of them turning over, and stops.
     #[test]
-    fn it_runs_up_to_what_the_other_end_vouched_for_and_no_further() {
+    fn it_runs_a_lead_past_what_the_other_end_vouched_for_and_no_further() {
         let mut session = greeted();
         session.receive(Packet::Reached(Stamp::from_t_cycles(10_000)));
 
-        session.advance_to(9_998);
+        session.advance_to(10_000 + LEAD_T_CYCLES - 2);
         assert!(session.may_run());
 
-        session.advance_to(10_000);
-        assert!(session.may_run(), "level with it is still allowed");
+        session.advance_to(10_000 + LEAD_T_CYCLES);
+        assert!(session.may_run(), "level with the limit is still allowed");
 
-        session.advance_to(10_002);
+        session.advance_to(10_000 + LEAD_T_CYCLES + 2);
         assert!(!session.may_run(), "past it is not");
+    }
+
+    /// The reason there is a lead at all. With none, neither console could run
+    /// the frame whose running is what would let the other one move.
+    #[test]
+    fn two_consoles_that_meet_exactly_do_not_both_sit_there() {
+        let session = greeted();
+        assert!(session.may_run(), "level at the start, and it still has a frame to run");
+        assert!(session.allowance_t_cycles() >= LEAD_T_CYCLES);
+    }
+
+    #[test]
+    fn how_far_it_may_run_is_the_distance_to_that_word() {
+        let mut session = greeted();
+        session.receive(Packet::Reached(Stamp::from_t_cycles(10_000)));
+
+        session.advance_to(4_000);
+        assert_eq!(session.allowance_t_cycles(), 6_000 + LEAD_T_CYCLES);
+
+        session.advance_to(10_000 + LEAD_T_CYCLES);
+        assert_eq!(session.allowance_t_cycles(), 0, "level: one instruction and no more");
+
+        session.advance_to(10_000 + LEAD_T_CYCLES + 2_000);
+        assert_eq!(session.allowance_t_cycles(), 0, "and past it, nothing at all");
     }
 
     #[test]
     fn a_further_word_lets_it_go_further() {
         let mut session = greeted();
         session.receive(Packet::Reached(Stamp::from_t_cycles(10_000)));
-        session.advance_to(20_000);
+        session.advance_to(20_000 + LEAD_T_CYCLES);
         assert!(!session.may_run());
 
         session.receive(Packet::Reached(Stamp::from_t_cycles(30_000)));
@@ -439,14 +504,14 @@ mod tests {
         session.receive(Packet::Reached(Stamp::from_t_cycles(30_000)));
         session.receive(Packet::Reached(Stamp::from_t_cycles(10_000)));
 
-        session.advance_to(29_000);
+        session.advance_to(29_000 + LEAD_T_CYCLES);
         assert!(session.may_run(), "the older word must not take the leave away");
     }
 
     #[test]
     fn a_byte_from_the_other_end_moves_the_mark_like_an_announcement_does() {
         let mut session = greeted();
-        session.advance_to(50_000);
+        session.advance_to(50_000 + LEAD_T_CYCLES);
         assert!(!session.may_run());
 
         let control = Control::new(false, false);

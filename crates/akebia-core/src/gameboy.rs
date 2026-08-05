@@ -202,8 +202,13 @@ impl GameBoy {
 
     /// Clocks a byte in from the console that drives the clock, and returns what
     /// this one was sending back on the same edges.
-    pub fn link_clock_in(&mut self, incoming: u8) -> u8 {
+    pub fn link_clock_in(&mut self, incoming: u8) -> Option<u8> {
         self.bus.link_clock_in(incoming)
+    }
+
+    /// What this console would put in a `sync1`: which clock it is driving.
+    pub fn link_control(&self) -> crate::link::bgb::Control {
+        crate::link::bgb::Control::new(self.bus.serial.fast_clock(), self.bus.double_speed())
     }
 
     /// Starts or stops recording everything that goes over the cable. See

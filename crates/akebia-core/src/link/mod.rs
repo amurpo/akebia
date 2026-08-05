@@ -180,11 +180,13 @@ pub fn exchange(a: &mut GameBoy, b: &mut GameBoy) {
         // one behind leaves you doing— reads the register one instruction before
         // the game filled it.
         (Some(from_a), None) if b.t_cycles() >= a.t_cycles() => {
-            let from_b = b.link_clock_in(from_a);
+            // A console that armed nothing gives up no byte, and the line it
+            // leaves alone rests high.
+            let from_b = b.link_clock_in(from_a).unwrap_or(crate::serial::IDLE_LINE);
             a.link_complete(from_b);
         }
         (None, Some(from_b)) if a.t_cycles() >= b.t_cycles() => {
-            let from_a = a.link_clock_in(from_b);
+            let from_a = a.link_clock_in(from_b).unwrap_or(crate::serial::IDLE_LINE);
             b.link_complete(from_a);
         }
         // Either nothing is in flight, or the answering end has not caught up

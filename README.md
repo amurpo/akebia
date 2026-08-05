@@ -51,7 +51,7 @@ akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 350 tests
+cargo test                   # 364 tests
 ```
 
 ### The game list
@@ -422,6 +422,13 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
+
+And in the frontend, the two adapters the cable needs to leave the machine:
+
+| Module | Contents |
+|---|---|
+| `net.rs` | packets over a socket, on a thread of their own |
+| `remote.rs` | a console, a session and a wire, driven together |
 
 ## Status
 
