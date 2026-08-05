@@ -5,8 +5,17 @@
 //! telling whether the two games never agreed on who leads, agreed and then lost
 //! each other, or are talking perfectly to a partner that is not listening.
 //!
+//! It drives the two consoles from the same script, which is a thing no keyboard
+//! can do —press on both at once— and that is the point: it takes the player's
+//! timing out of the question and leaves only the cable's. `--lag` puts it back.
+//!
 //! ```text
+//! # both consoles here, one cable, no sockets
 //! cargo run --release --example link_trace -- <rom> <sav> [script] [--frames N]
+//!
+//! # one console here and one on the other end of a socket
+//! cargo run --release --example link_trace -- <rom> <sav> --serve 8765 [script]
+//! cargo run --release --example link_trace -- <rom> <sav> --join host [script]
 //! ```
 //!
 //! The script is a word per action: `w30` waits thirty frames, `a2` holds A for
@@ -19,6 +28,8 @@ use akebia_core::ports::VideoOutput;
 use akebia_core::ppu::{FrameBuffer, SCREEN_HEIGHT, SCREEN_WIDTH};
 use akebia_core::serial::LinkEvent;
 use akebia_core::GameBoy;
+use akebia_frontend::net::Wire;
+use akebia_frontend::remote::{Remote, Role};
 
 /// Keeps the last frame each console produced, to print or write out.
 struct Screen {
@@ -134,6 +145,9 @@ fn main() {
     let mut every = 0u32;
     let mut ppm = String::from("link");
     let mut lag = 0usize;
+    let mut over_the_wire: Option<Wire> = None;
+    let mut waiting: Option<u16> = None;
+    let mut calling: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -156,6 +170,14 @@ fn main() {
                 i += 1;
                 lag = args[i].parse().unwrap();
             }
+            "--serve" => {
+                i += 1;
+                waiting = Some(args[i].parse().unwrap());
+            }
+            "--join" => {
+                i += 1;
+                calling = Some(args[i].clone());
+            }
             other => positional.push(other.to_owned()),
         }
         i += 1;
@@ -175,11 +197,31 @@ fn main() {
     }
 
     let script = parse_script(&positional[2..]);
-
-    // The copy is taken before anything is pressed, exactly as the window does
-    // it, and the cable goes in straight away.
-    let mut b = a.clone();
     a.set_link_log_enabled(true);
+
+    // One console here and the other somewhere else. There is nothing to copy:
+    // the partner is a second run of this same program.
+    let mut role = Role::Waited;
+    if let Some(port) = waiting {
+        eprintln!("waiting on port {port}");
+        let listener = std::net::TcpListener::bind(("0.0.0.0", port)).expect("the port");
+        over_the_wire = Some(Wire::accept_from(&listener).expect("a console"));
+    } else if let Some(address) = calling {
+        eprintln!("connecting to {address}");
+        role = Role::Dialled;
+        over_the_wire = Some(Wire::dial(&address).expect("a console"));
+    }
+
+    if let Some(wire) = over_the_wire {
+        eprintln!("linked to {}", wire.peer);
+        a.set_link_connected(true);
+        let mut remote = Remote::new(wire, &mut a, role);
+        return over_a_socket(a, &mut remote, script, limit, every, &ppm);
+    }
+
+    // Both consoles here, on the shortest cable there is. The copy is taken
+    // before anything is pressed, exactly as the window does it.
+    let mut b = a.clone();
     b.set_link_log_enabled(true);
     link::connect(&mut a, &mut b);
 
@@ -237,4 +279,74 @@ fn main() {
 
     dump("final", [&screen_a, &screen_b]);
     write_ppm(&format!("{ppm}-final.ppm"), [&screen_a, &screen_b]);
+}
+
+/// The same run with the other console on the far end of a socket.
+///
+/// One screen, one script, and whatever the far end says about when this one may
+/// move. What it is really testing is the pacing: a byte crossing a socket is
+/// already covered by the tests, but a real game deadlocking against the rule
+/// that lets it run is not the sort of thing a synthetic ROM finds.
+fn over_a_socket(
+    mut gb: GameBoy,
+    remote: &mut Remote,
+    script: Vec<Action>,
+    limit: u32,
+    every: u32,
+    ppm: &str,
+) {
+    let mut screen = Screen::new();
+    let blank = Screen::new();
+    let mut frame = 0u32;
+    let mut actions = script.into_iter();
+    let mut current = actions.next();
+    let mut held: Option<Button> = None;
+    let mut stalls = 0u32;
+
+    while frame < limit {
+        let want = current.as_ref().and_then(|action| action.button);
+        if want != held {
+            if let Some(button) = held {
+                gb.set_button(button, false);
+            }
+            if let Some(button) = want {
+                gb.set_button(button, true);
+            }
+            held = want;
+        }
+
+        match remote.run_frame(&mut gb, &mut screen) {
+            Ok(true) => frame += 1,
+            // Waiting on the other console. It is normal and it is the whole
+            // point; only counted, so a run that spends its life waiting says so.
+            Ok(false) => {
+                stalls += 1;
+                continue;
+            }
+            Err(trouble) => {
+                eprintln!("the link ended: {trouble}");
+                break;
+            }
+        }
+
+        if let Some(action) = current.as_mut() {
+            action.frames -= 1;
+            if action.frames == 0 {
+                current = actions.next();
+            }
+        }
+
+        let events = gb.take_link_log();
+        if !events.is_empty() {
+            println!("-- frame {frame}");
+            report('L', &events);
+        }
+        if every > 0 && frame % every == 0 {
+            write_ppm(&format!("{ppm}-{frame:05}.ppm"), [&screen, &blank]);
+        }
+    }
+
+    eprintln!("{frame} frames, {stalls} waits on the other console");
+    dump("final", [&screen, &blank]);
+    write_ppm(&format!("{ppm}-final.ppm"), [&screen, &blank]);
 }

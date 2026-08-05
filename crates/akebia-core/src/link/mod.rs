@@ -105,6 +105,31 @@ pub fn connect(a: &mut GameBoy, b: &mut GameBoy) {
     b.offset_clock(now - b.t_cycles());
 }
 
+/// Runs a console on its own for [a fraction of a frame](SWITCH_ON_STAGGER),
+/// so that two which would otherwise be in perfect step are not.
+///
+/// It is the same tie-break [`connect`] arranges, for a cable that does not go
+/// between two consoles in one process. There, one clock can simply be declared
+/// to read later than the other and the stepping does the rest; over a network
+/// there is no shared clock to declare anything about, and the only way to move
+/// a console's `DIV`, its VBlank and every countdown a game derives from them is
+/// to actually live those cycles.
+///
+/// Exactly one of the two ends should call it — the one that dialled, say, since
+/// exactly one of them did. Both calling it puts them right back in step.
+///
+/// A fault here is not reported: the console is about to be run properly, and
+/// whatever it fell over on it will fall over on again, where the caller is
+/// looking.
+pub fn stagger(gb: &mut GameBoy) {
+    let until = gb.t_cycles() + SWITCH_ON_STAGGER;
+    while gb.t_cycles() < until {
+        if gb.step().is_err() {
+            return;
+        }
+    }
+}
+
 /// Pulls the cable out of both.
 ///
 /// A transfer left half-way is answered `0xFF` on the next tick, so neither game

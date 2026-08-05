@@ -35,7 +35,8 @@ use eframe::egui::{
 };
 
 use crate::args::Args;
-use crate::{audio, debug, roms, save};
+use crate::remote::Remote;
+use crate::{audio, debug, net, remote, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
 pub const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
@@ -245,6 +246,15 @@ struct App {
     /// second one is only painted while a cable is plugged in, but it costs
     /// 160×144 pixels to keep and saves creating a texture mid-game.
     textures: [TextureHandle; 2],
+    /// A connection being made, while the game carries on. Both waiting and
+    /// dialling take as long as they take, so neither stops the window.
+    connecting: Option<net::Pending>,
+    /// The address box, open with whatever is in it.
+    address: Option<String>,
+    /// What was typed there last. Going back to the same machine is far and away
+    /// the commonest thing to want, and retyping an address is a poor way to
+    /// spend the moment before a trade.
+    last_address: String,
 }
 
 enum Screen {
@@ -254,6 +264,8 @@ enum Screen {
     Playing(Box<Session>),
     /// Two consoles joined by a link cable.
     Linked(Box<Pair>),
+    /// One console, with the other end of the cable on another machine.
+    Networked(Box<Wired>),
 }
 
 impl App {
@@ -294,6 +306,9 @@ impl App {
             screen,
             dialog: None,
             textures,
+            connecting: None,
+            address: None,
+            last_address: String::new(),
         }
     }
 
@@ -332,11 +347,16 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let playing = matches!(self.screen, Screen::Playing(_));
         let linked = matches!(self.screen, Screen::Linked(_));
+        let networked = matches!(self.screen, Screen::Networked(_));
+        let waiting = self.connecting.is_some();
         let mut open_dialog = false;
         let mut back_to_list = false;
         let mut connect = false;
         let mut swap = false;
         let mut unplug = false;
+        let mut listen = false;
+        let mut dial = false;
+        let mut give_up = false;
         let mut settings = self.settings.clone();
 
         egui::Panel::top("menu").show(ui, |ui| {
@@ -378,7 +398,7 @@ impl App {
                 });
                 ui.menu_button("Link", |ui| {
                     connect = ui
-                        .add_enabled(playing, egui::Button::new("Second console"))
+                        .add_enabled(playing && !waiting, egui::Button::new("Second console"))
                         .on_hover_text("Copy this console and join the two with a link cable")
                         .clicked();
                     swap = ui
@@ -386,9 +406,24 @@ impl App {
                         .on_hover_text("Hand the keyboard to the other console")
                         .clicked();
                     ui.separator();
+                    // Over a network the second console is somebody else's, so
+                    // there is nothing to copy and nothing to swap to: each
+                    // machine shows its own screen and keeps its own keyboard.
+                    listen = ui
+                        .add_enabled(playing && !waiting, egui::Button::new("Wait for a console…"))
+                        .on_hover_text("Let another machine connect to this one")
+                        .clicked();
+                    dial = ui
+                        .add_enabled(playing && !waiting, egui::Button::new("Connect to a console…"))
+                        .on_hover_text("Go to another machine that is already waiting")
+                        .clicked();
+                    give_up = ui
+                        .add_enabled(waiting, egui::Button::new("Stop waiting"))
+                        .clicked();
+                    ui.separator();
                     unplug = ui
-                        .add_enabled(linked, egui::Button::new("Unplug the cable"))
-                        .on_hover_text("Keep playing on the console that has the keyboard")
+                        .add_enabled(linked || networked, egui::Button::new("Unplug the cable"))
+                        .on_hover_text("Keep playing on this console alone")
                         .clicked();
                 });
             });
@@ -411,8 +446,137 @@ impl App {
                 pair.swap_keyboard(&self.settings);
             }
         }
+        if listen {
+            self.start_waiting(ctx);
+        }
+        if dial {
+            // Whatever was typed last: reconnecting to the same machine is far
+            // and away the commonest thing to want.
+            self.address = Some(self.last_address.clone());
+        }
+        if give_up {
+            self.connecting = None;
+            self.retitle(ctx);
+        }
         if unplug {
             self.unplug(ctx);
+        }
+    }
+
+    /// Starts waiting for another machine to connect to this one.
+    fn start_waiting(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Playing(_)) {
+            return;
+        }
+        self.connecting = Some(net::Pending::listen(akebia_core::link::bgb::DEFAULT_PORT));
+        self.retitle(ctx);
+    }
+
+    /// Goes looking for a machine that is already waiting.
+    fn start_dialling(&mut self, ctx: &egui::Context, address: String) {
+        if !matches!(self.screen, Screen::Playing(_)) || address.trim().is_empty() {
+            return;
+        }
+        self.last_address = address.clone();
+        self.connecting = Some(net::Pending::connect(address));
+        self.retitle(ctx);
+    }
+
+    /// Picks up a connection once it has been made, and plugs the cable in.
+    fn collect_connection(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.connecting.as_mut() else {
+            return;
+        };
+        let dialled = pending.dialled;
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.connecting = None;
+        let role = if dialled { remote::Role::Dialled } else { remote::Role::Waited };
+
+        let wire = match result {
+            Ok(wire) => wire,
+            Err(failure) => {
+                // Back to the game with the reason on the list's warning line
+                // would mean throwing the game away to say it. The title bar is
+                // where a thing that happened *to* the window belongs.
+                ctx.send_viewport_cmd(ViewportCommand::Title(format!("Akebia — {failure}")));
+                return;
+            }
+        };
+
+        // Whatever the cable was for is no longer on screen: a second console
+        // was copied in the meantime, or the game was left for the list. Taking
+        // the screen apart here regardless would drop a session without saving
+        // it, which is a great deal worse than a connection nobody uses.
+        if !matches!(self.screen, Screen::Playing(_)) {
+            return;
+        }
+        let aside = Screen::List(List::new(self.folder.clone()));
+        if let Screen::Playing(mut session) = std::mem::replace(&mut self.screen, aside) {
+            let remote = Remote::new(wire, session.console_mut(), role);
+            self.screen = Screen::Networked(Box::new(Wired { console: *session, remote }));
+            self.retitle(ctx);
+        }
+    }
+
+    /// Puts on the title bar whatever the window is doing.
+    fn retitle(&mut self, ctx: &egui::Context) {
+        let name = match (&self.screen, &self.connecting) {
+            (_, Some(pending)) => format!("Akebia — {}", pending.what),
+            (Screen::Networked(wired), None) => {
+                format!("Akebia — {} ↔ {}", wired.console.title, wired.remote.peer())
+            }
+            (Screen::Linked(pair), None) => linked_title(pair),
+            (Screen::Playing(session), None) => title(Some(session)),
+            (Screen::List(_), None) => title(None),
+        };
+        ctx.send_viewport_cmd(ViewportCommand::Title(name));
+    }
+
+    /// The box the address is typed into.
+    ///
+    /// A dialog and not a screen of its own, like the folder chooser: whatever
+    /// is being played stays where it is, and cancelling costs nothing.
+    fn address_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut typed) = self.address.take() else {
+            return;
+        };
+        let mut go = false;
+        let mut cancelled = false;
+
+        let response = egui::Modal::new(egui::Id::new("address")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Connect to a console").size(18.0).strong());
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("The address of the machine that is waiting. Without a port it\nuses the usual one for a link cable.")
+                    .size(13.0)
+                    .color(Color32::from_gray(0x9A)),
+            );
+            ui.add_space(10.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .hint_text("192.168.1.20")
+                    .desired_width(f32::INFINITY),
+            );
+            field.request_focus();
+            go |= field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                go |= ui.button("Connect").clicked();
+                cancelled |= ui.button("Cancel").clicked();
+            });
+        });
+
+        if response.should_close() {
+            cancelled = true;
+        }
+        if go {
+            self.start_dialling(ctx, typed);
+        } else if !cancelled {
+            // Still being typed into.
+            self.address = Some(typed);
         }
     }
 
@@ -438,15 +602,25 @@ impl App {
     /// Pulls the cable out, keeping whichever console has the keyboard and
     /// saving the other one on its way out.
     fn unplug(&mut self, ctx: &egui::Context) {
-        if !matches!(self.screen, Screen::Linked(_)) {
+        if !matches!(self.screen, Screen::Linked(_) | Screen::Networked(_)) {
             return;
         }
         let list = Screen::List(List::new(self.folder.clone()));
-        if let Screen::Linked(pair) = std::mem::replace(&mut self.screen, list) {
-            let session = pair.split(&self.settings);
-            ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
-            self.resize_for(ctx, false);
-            self.screen = Screen::Playing(Box::new(session));
+        match std::mem::replace(&mut self.screen, list) {
+            Screen::Linked(pair) => {
+                let session = pair.split(&self.settings);
+                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                self.resize_for(ctx, false);
+                self.screen = Screen::Playing(Box::new(session));
+            }
+            Screen::Networked(wired) => {
+                // No resizing: a networked pair never took a second screen's
+                // worth of window in the first place.
+                let session = wired.split();
+                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                self.screen = Screen::Playing(Box::new(session));
+            }
+            other => self.screen = other,
         }
     }
 
@@ -482,6 +656,7 @@ impl App {
         match &mut self.screen {
             Screen::Playing(session) => session.apply(&self.settings),
             Screen::Linked(pair) => pair.apply(&self.settings),
+            Screen::Networked(wired) => wired.console.apply(&self.settings),
             Screen::List(_) => {}
         }
     }
@@ -534,8 +709,11 @@ impl App {
         match &mut self.screen {
             Screen::Playing(session) => session.close(),
             Screen::Linked(pair) => pair.close(),
+            Screen::Networked(wired) => wired.console.close(),
             Screen::List(_) => {}
         }
+        // A connection half made has nobody left to hand a console to.
+        self.connecting = None;
         let mut list = List::new(self.folder.clone());
         list.warning = warning;
         self.screen = Screen::List(list);
@@ -551,7 +729,13 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dialog = self.dialog.is_some();
+        self.collect_connection(ctx);
+        // A connection being made has to be looked at again soon, and nothing on
+        // the list screen would otherwise ask for a repaint.
+        if self.connecting.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let dialog = self.dialog.is_some() || self.address.is_some();
 
         if matches!(self.screen, Screen::List(_)) {
             return;
@@ -565,6 +749,11 @@ impl eframe::App for App {
             match &mut self.screen {
                 Screen::Playing(session) => session.pause(),
                 Screen::Linked(pair) => pair.pause(),
+                // Not paused: the other machine is still running, and a console
+                // that stops while a dialog is open is one that stops answering
+                // its partner. Pausing here would look to them like a link that
+                // died because somebody opened a menu.
+                Screen::Networked(_) => {}
                 Screen::List(_) => {}
             }
             return;
@@ -618,6 +807,18 @@ impl eframe::App for App {
                 });
                 (pair.advance(ctx, &mut self.textures), pair.frames())
             }
+            Screen::Networked(wired) => {
+                ctx.input(|i| {
+                    for (key, button) in KEYS {
+                        wired.console.press(button, i.key_down(key));
+                    }
+                });
+                if ctx.input(|i| i.key_pressed(Key::D)) {
+                    wired.console.capture();
+                }
+                let Wired { console, remote } = &mut **wired;
+                (console.advance_over(remote, ctx, &mut self.textures[0]), console.frames)
+            }
             Screen::List(_) => return,
         };
 
@@ -636,6 +837,7 @@ impl eframe::App for App {
         if let Some(dir) = self.folder_dialog(&ctx) {
             self.change_folder(dir);
         }
+        self.address_dialog(&ctx);
 
         let request = match &mut self.screen {
             Screen::List(list) => list.ui(ui),
@@ -645,6 +847,10 @@ impl eframe::App for App {
             }
             Screen::Linked(pair) => {
                 pair.ui(ui, &self.textures);
+                None
+            }
+            Screen::Networked(wired) => {
+                wired.console.ui(ui, &self.textures[0]);
                 None
             }
         };
@@ -660,6 +866,7 @@ impl eframe::App for App {
         match &mut self.screen {
             Screen::Playing(session) => session.close(),
             Screen::Linked(pair) => pair.close(),
+            Screen::Networked(wired) => wired.console.close(),
             Screen::List(_) => {}
         }
     }
@@ -1360,6 +1567,75 @@ impl Session {
         }
     }
 
+    /// The console itself, for whoever has to ask it the time or step it aside.
+    pub fn console_mut(&mut self) -> &mut GameBoy {
+        &mut self.gb
+    }
+
+    /// Emulates whatever is due, with the far end of a cable saying how far.
+    ///
+    /// The wall clock still decides *when* a frame is owed —a link that answers
+    /// instantly must not run the game at a thousand frames a second— and the
+    /// link decides whether it can be delivered.
+    pub fn advance_over(
+        &mut self,
+        remote: &mut Remote,
+        ctx: &egui::Context,
+        texture: &mut TextureHandle,
+    ) -> Result<(), String> {
+        let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
+        let now = Instant::now();
+        let mut emulated = 0;
+        let mut stalled = false;
+        let mut failure = None;
+
+        while self.next <= now && emulated < MAX_CATCH_UP {
+            match remote.run_frame(&mut self.gb, &mut FrameSink { pixels: &mut self.pixels }) {
+                Ok(true) => {
+                    self.after_frame();
+                    self.next += period;
+                    emulated += 1;
+                }
+                // The other console has not got this far yet. The clock is put
+                // back rather than left owing: a wait is not a debt, and running
+                // it off at double speed afterwards would be a worse answer than
+                // having waited.
+                Ok(false) => {
+                    self.next = Instant::now();
+                    stalled = true;
+                    break;
+                }
+                Err(trouble) => {
+                    failure = Some(trouble.to_string());
+                    break;
+                }
+            }
+        }
+        if emulated == MAX_CATCH_UP {
+            self.next = Instant::now();
+        }
+        if emulated > 0 {
+            texture.set(
+                ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], self.pixels.clone()),
+                TextureOptions::NEAREST,
+            );
+        }
+        // Stalled, come straight back: `run_frame` does its waiting on the wire
+        // rather than spinning, so asking again at once is what turns a link
+        // answering in a millisecond into a millisecond of waiting instead of a
+        // frame of it.
+        ctx.request_repaint_after(if stalled {
+            Duration::ZERO
+        } else {
+            self.next.saturating_duration_since(Instant::now())
+        });
+
+        match failure {
+            Some(f) => Err(f),
+            None => Ok(()),
+        }
+    }
+
     /// Stops the clock while a dialog is up, so that closing it does not leave
     /// the session owing every frame the user spent reading.
     pub fn pause(&mut self) {
@@ -1522,6 +1798,27 @@ impl Session {
             Color32::WHITE,
         );
         picture
+    }
+}
+
+/// A console whose partner is on another machine.
+///
+/// It is the network's answer to [`Pair`], and it is deliberately much less:
+/// there is one screen, one keyboard and one saved game, because the other
+/// console belongs to somebody else and has its own. Everything that made a
+/// local pair awkward —whose sound, whose `.sav`, whose turn with the keys— is
+/// simply not a question here.
+pub struct Wired {
+    console: Session,
+    remote: Remote,
+}
+
+impl Wired {
+    /// Pulls the cable out and gives the console back on its own.
+    fn split(mut self) -> Session {
+        self.remote.close();
+        self.console.gb.set_link_connected(false);
+        self.console
     }
 }
 

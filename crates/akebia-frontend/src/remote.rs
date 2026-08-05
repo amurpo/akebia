@@ -60,6 +60,19 @@ impl std::fmt::Display for Trouble {
     }
 }
 
+/// Which end of the connection this is.
+///
+/// The only thing it decides is who steps aside so that two consoles are not in
+/// perfect step; see [`akebia_core::link::stagger`]. Exactly one end dialled, so
+/// it is the tie-break that is going spare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// This end waited for somebody to arrive.
+    Waited,
+    /// This end went looking.
+    Dialled,
+}
+
 /// A console joined to another over a socket.
 pub struct Remote {
     session: Session,
@@ -71,7 +84,14 @@ impl Remote {
     ///
     /// The console's clock is asked for here and not later: the protocol counts
     /// from the moment the two meet, so this is the moment.
-    pub fn new(wire: Wire, gb: &GameBoy) -> Self {
+    pub fn new(wire: Wire, gb: &mut GameBoy, role: Role) -> Self {
+        // Two copies of one saved game, playing the same moves, decide to take
+        // the clock on the very same frame and neither is left listening. On a
+        // table that cannot happen; here it has to be arranged, and the end that
+        // dialled is the one that does the arranging because exactly one did.
+        if role == Role::Dialled {
+            akebia_core::link::stagger(gb);
+        }
         Self { session: Session::new(gb.t_cycles()), wire }
     }
 
@@ -226,7 +246,7 @@ mod tests {
             let mut gb = GameBoy::new(master).unwrap();
             gb.set_link_connected(true);
             let wire = crate::net::Wire::accept_from(&listener).unwrap();
-            let mut remote = Remote::new(wire, &gb);
+            let mut remote = Remote::new(wire, &mut gb, Role::Waited);
             for _ in 0..600 {
                 if remote.run_frame(&mut gb, &mut NullOutput).is_err() {
                     break;
@@ -239,7 +259,7 @@ mod tests {
             let mut gb = GameBoy::new(slave).unwrap();
             gb.set_link_connected(true);
             let wire = crate::net::Wire::dial(&format!("127.0.0.1:{port}")).unwrap();
-            let mut remote = Remote::new(wire, &gb);
+            let mut remote = Remote::new(wire, &mut gb, Role::Dialled);
             for _ in 0..600 {
                 if remote.run_frame(&mut gb, &mut NullOutput).is_err() {
                     break;
@@ -281,7 +301,7 @@ mod tests {
         let mut gb = GameBoy::new(sender(0x42, 0x81)).unwrap();
         gb.set_link_connected(true);
         let wire = crate::net::Wire::accept_from(&listener).unwrap();
-        let mut remote = Remote::new(wire, &gb);
+        let mut remote = Remote::new(wire, &mut gb, Role::Waited);
 
         assert!(!remote.run_frame(&mut gb, &mut NullOutput).unwrap());
         assert_eq!(gb.t_cycles(), 0, "not one instruction without a greeting");

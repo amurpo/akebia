@@ -241,6 +241,33 @@ that fast, so the emulation has to stall until the other end catches up. None of
 that exists yet. What does exist is the part that has to be right first, because
 over a wire the same bug would look like a network fault.
 
+### The cable over a network
+
+`Link` → `Wait for a console…` leaves this machine listening on
+[the usual port](https://bgb.bircd.org/bgblink.html); `Connect to a console…`
+asks for an address and goes looking. Whichever way round, the game carries on
+while the connection is made, and the title bar says what the window is doing.
+From then on each machine shows **its own screen and keeps its own keyboard** —
+there is no second picture to fit anywhere and no saved game to share, because
+the other console belongs to somebody else.
+
+What crosses is [BGB's link protocol](https://bgb.bircd.org/bgblink.html), so
+the far end may be BGB itself or any emulator that already speaks it.
+
+Measured against a real cartridge over the loopback: two consoles walked to the
+Cable Club, linked, and ran 3400 frames apiece stopping to wait for each other
+**four times**. The cost of the network is not in the byte, it is in how far
+ahead a console is allowed to get, and a frame of that is free on any link
+faster than a frame.
+
+There is one case it does not handle, and it is worth naming because it is easy
+to construct on purpose: two copies of the *same* saved game, fed the *same*
+buttons on the *same* frames, decide to take the clock as master on the same
+frame for ever and neither is ever the one listening. Two people cannot do that
+— nobody presses a button on the same frame as somebody else — and the end that
+dialled steps its console aside by a fraction of a frame to break what symmetry
+it can. Perfect symmetry it cannot break.
+
 ### Controls
 
 | Key | Button |
@@ -419,7 +446,6 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `link/mod.rs` | two consoles on one cable, advanced in lockstep |
 | `link/bgb.rs` | BGB's link protocol: the packets, and the clock they carry |
 | `link/session.rs` | the rule that decides when a console may run |
-| `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
 
@@ -429,6 +455,7 @@ And in the frontend, the two adapters the cable needs to leave the machine:
 |---|---|
 | `net.rs` | packets over a socket, on a thread of their own |
 | `remote.rs` | a console, a session and a wire, driven together |
+| `examples/link_trace.rs` | drives a link from a script and prints the cable |
 
 ## Status
 
@@ -559,7 +586,5 @@ into GPLv3. Two are worth remembering when adding another dependency:
 default fonts come under OFL-1.1 and the Ubuntu font licence, which cover the
 font files rather than the program.
 
-No ROM is covered by this licence or distributed here: `.gitignore` drops every
-`.gb`, `.gbc` and `.sav`, so nothing from the `roms/` folder is ever committed.
 The freely redistributable test suites are downloaded from their own projects,
 listed above.

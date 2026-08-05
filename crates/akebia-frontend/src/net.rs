@@ -53,18 +53,37 @@ const KEEPALIVE: Duration = Duration::from_secs(2);
 /// picked up whenever the interface next asks.
 pub struct Pending {
     answer: Receiver<io::Result<Wire>>,
+    /// Raised when this is dropped, to get the thread to give up.
+    ///
+    /// Without it, calling off a wait would leave a thread sitting in `accept`
+    /// holding the port, and the next attempt to listen would be told the
+    /// address is already in use — by a listener nobody can see any more.
+    cancelled: Arc<AtomicBool>,
     /// What to say while it has not answered.
     pub what: String,
+    /// Whether this end went looking rather than waited. It is the only
+    /// asymmetry the two have, and something has to use it: see
+    /// [`crate::remote::Role`].
+    pub dialled: bool,
+}
+
+/// Giving up on a connection tells the thread making it to give up too.
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Pending {
     /// Waits for the other console to connect here.
     pub fn listen(port: u16) -> Self {
         let (tell, answer) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&cancelled);
         thread::spawn(move || {
-            let _ = tell.send(accept_one(port));
+            let _ = tell.send(accept_one(port, &watching));
         });
-        Self { answer, what: format!("Waiting on port {port}") }
+        Self { answer, cancelled, what: format!("Waiting on port {port}"), dialled: false }
     }
 
     /// Goes looking for a console that is already listening.
@@ -77,7 +96,9 @@ impl Pending {
         thread::spawn(move || {
             let _ = tell.send(Wire::dial(&address));
         });
-        Self { answer, what }
+        // Nothing to raise here: `connect_timeout` gives up on its own, and the
+        // thread goes with it.
+        Self { answer, cancelled: Arc::new(AtomicBool::new(false)), what, dialled: true }
     }
 
     /// The connection, once there is one. `None` while it is still being made.
@@ -196,9 +217,27 @@ impl Wire {
 /// The socket is closed as soon as somebody is on it, on purpose: a second
 /// player arriving at a cable with two ends already in it has nowhere to go, and
 /// a listener left open would take the connection and then ignore it.
-fn accept_one(port: u16) -> io::Result<Wire> {
+fn accept_one(port: u16, cancelled: &AtomicBool) -> io::Result<Wire> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
-    Wire::accept_from(&listener)
+    // Asked rather than waited on, so that calling the wait off actually ends
+    // it. The alternative is a thread stuck in `accept` until somebody
+    // connects to a port nobody is offering any more.
+    listener.set_nonblocking(true)?;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the wait was called off"));
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                return Wire::over(stream);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Turns what somebody typed into an address.
@@ -344,6 +383,33 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!server.is_up(), "the link should have been given up as gone");
+    }
+
+    /// A wait called off has to let the port go. Leaving a thread in `accept`
+    /// would make the next attempt fail with "address already in use", against a
+    /// listener nobody can see any more.
+    #[test]
+    fn calling_off_a_wait_frees_the_port() {
+        // A port picked by the system, then released, so the test does not fight
+        // with anything else on the machine for a fixed number.
+        let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+
+        let waiting = Pending::listen(port);
+        // Long enough for the thread to have bound it.
+        thread::sleep(Duration::from_millis(100));
+        drop(waiting);
+
+        // And now it must be possible to wait on it again.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(_) => return,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("the port was never let go of: {e}"),
+            }
+        }
     }
 
     #[test]
