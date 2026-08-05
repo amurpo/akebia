@@ -32,6 +32,8 @@
 //! changes is that the answer no longer arrives in the same instant, and *that*
 //! is where a real cycle-count protocol becomes necessary.
 
+pub mod bgb;
+
 use crate::cpu::Fault;
 use crate::gameboy::T_CYCLES_PER_FRAME;
 use crate::ports::VideoOutput;

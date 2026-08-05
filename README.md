@@ -51,7 +51,7 @@ akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 322 tests
+cargo test                   # 332 tests
 ```
 
 ### The game list
@@ -416,7 +416,8 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `ppu/render.rs` | scanline rendering: background, window and sprites |
 | `timer.rs` | 16-bit counter and edge detection |
 | `joypad.rs`, `serial.rs` | input and the serial shift register |
-| `link.rs` | two consoles on one cable, advanced in lockstep |
+| `link/mod.rs` | two consoles on one cable, advanced in lockstep |
+| `link/bgb.rs` | BGB's link protocol: the packets, and the clock they carry |
 | `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
@@ -512,12 +513,16 @@ Pending, in the recommended order:
    means rewriting `render`. The variable mode 3 duration is already there; what
    is missing is validating both against `dmg-acid2` and `mooneye-gb`, which have
    to be downloaded.
-2. **The cable over a network.** The port and the lockstep are done; what is
-   missing is the transport. A byte lasts a millisecond and no link answers that
-   fast —a LAN takes several, Bluetooth tens— so it cannot be a matter of sending
-   and hoping: each end has to send its cycle count along with the byte and stall
-   until the other catches up. Speaking BGB's link protocol rather than inventing
-   one would also mean being able to trade against other emulators.
+2. **The cable over a network.** The wire format is in —Akebia speaks
+   [BGB's link protocol](https://bgb.bircd.org/bgblink.html), so the other end
+   may be BGB itself or any emulator that already talks to it— and what is
+   missing is the session on top of it and the sockets underneath. A byte lasts a
+   millisecond and no link answers that fast —a LAN takes several, Bluetooth
+   tens— so it cannot be a matter of sending and hoping. What makes it work is
+   that every packet carries a timestamp, and there is one whose only content is
+   a timestamp: knowing how far the other end has already lived, this one may run
+   freely up to that instant. The wait is not per byte, it is per how far ahead
+   one end gets.
 3. **Keyboard in `--tui`**: the terminal mode draws but does not read input.
 
 ## Reference tests
@@ -528,6 +533,11 @@ Pending, in the recommended order:
 - [dmg-acid2](https://github.com/mattcurrie/dmg-acid2) — the PPU in one frame.
 - [mooneye-gb](https://github.com/Gekkio/mooneye-test-suite) — cycle accuracy;
   leave for last.
+- [BGB](https://bgb.bircd.org/), by **beware** — its
+  [link protocol](https://bgb.bircd.org/bgblink.html) is the one Akebia speaks
+  over a network, packet for packet. None of its code is used and none is
+  needed: what is borrowed is the format, and borrowing it is the point. A
+  protocol only one program speaks is not a protocol.
 
 ## Licence
 
