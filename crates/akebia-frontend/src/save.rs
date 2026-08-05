@@ -32,9 +32,10 @@ pub fn default_path(rom: &Path) -> PathBuf {
 /// what survived would be whichever wrote last — over a real saved game, with
 /// the trade that was just made in it.
 ///
-/// The second console still *starts* from the first one's file, because that is
-/// what makes a trade testable at all: a blank game has nothing to trade. From
-/// the first write on, the two go their own ways.
+/// The second console still *starts* from the first one's saved game —it is a
+/// copy of it, right down to where the player is standing— because that is what
+/// makes a trade testable at all: a blank game has nothing to trade. From the
+/// first write on, the two go their own ways.
 pub fn linked_path(rom: &Path) -> PathBuf {
     rom.with_extension("link.sav")
 }
@@ -97,6 +98,21 @@ impl SaveFile {
         }
 
         Some(Self { path, written, frames: 0, warned: false })
+    }
+
+    /// Persistence for a console that was duplicated from another one.
+    ///
+    /// Nothing is read here, and that is the whole difference from [`open`]: the
+    /// SRAM this console came up with **is** the live one it was copied from,
+    /// and loading a file over it would drag the copy back to whatever the
+    /// autosave happened to have written last.
+    ///
+    /// [`open`]: Self::open
+    pub fn copied(gb: &GameBoy, path: PathBuf) -> Option<Self> {
+        gb.save_ram()?;
+        // Nothing written yet as far as this file is concerned, so the first
+        // autosave creates it even if the game has not touched the SRAM since.
+        Some(Self { path, written: Vec::new(), frames: 0, warned: false })
     }
 
     /// Bytes to be written: the SRAM and, after it, the cartridge clock.

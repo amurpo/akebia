@@ -51,7 +51,7 @@ akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 296 tests
+cargo test                   # 322 tests
 ```
 
 ### The game list
@@ -192,11 +192,18 @@ or a `.sav` brought from another machine— is ignored instead of subtracting ti
 
 ### The link cable
 
-`Link` → `Second console…` sets the running game aside and goes back to the list
-so a second one can be picked. From then on both consoles are on screen side by
-side, joined by a cable, and the keyboard drives the one in the red frame; `Tab`
-hands it to the other. `Escape` over the list calls the whole thing off and the
-first console comes back on its own, having lost nothing.
+`Link` → `Second console` **copies the console that is playing** and plugs a
+cable between the two. Nothing is asked for and no game is opened: the second
+console is the first one, in the state it is in, standing where it was standing.
+That is the only way of trying this that ends in a trade — the Cable Club is
+hours into a game, and getting a second console there from the title screen would
+mean playing those hours again on a shared keyboard. The window grows to make
+room, both screens keep the size they had, and the keyboard drives the one in the
+red frame; `Tab` hands it to the other. `Link` → `Unplug the cable` keeps
+whichever console has the keyboard and saves the other on its way out.
+
+The two consoles are the same saved game, so they do not share a file: the copy
+autosaves to `<game>.link.sav` and the original keeps its own.
 
 The cable is emulated, not faked. The serial port shifts a bit every 512
 T-cycles —a byte takes about a millisecond, exactly what the hardware takes— and
@@ -205,6 +212,27 @@ receiving. The two consoles advance one instruction at a time, always whichever
 is behind, so neither can get so much as a single bit ahead of the other. That
 costs about a fifth of the machine's speed: a pair runs at some four times real
 time where one console alone runs at twenty.
+
+Two details of that decide whether a trade is possible at all, and both were
+wrong at first.
+
+**The two consoles are switched on a third of a frame apart.** A game at the
+Cable Club listens first and takes the clock only when it gets tired of waiting;
+since both cartridges run the same code, getting tired first is the *entire*
+mechanism deciding who leads. Two consoles stepped from zero live the very same
+number of cycles, get tired on the same T-cycle, both take the clock, and no game
+ever connects. Nobody switches two consoles on at the same instant, and the
+emulation must not either.
+
+**A console that has not armed a transfer answers nothing.** With bit 7 of `SC`
+clear the shift register does not shift: `SB` keeps what it held and the console
+driving the clock reads `0xFF`, the empty line. Letting it answer anyway looks
+harmless and is not — the two players are never ready at the same moment, so the
+first one to reach the counter sends its byte at a console still walking around,
+and the *next* attempt comes back carrying the previous one. A game that reads
+back the byte it just sent takes it for an answer and moves on to a stage its
+partner knows nothing about. With the register properly idle the tolerance goes
+from under a tenth of a second to as long as the game itself is willing to wait.
 
 Both consoles are in the same process, which is why there is no protocol here and
 nothing can arrive late. A cable between two *machines* —over a network, over
@@ -389,6 +417,7 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `timer.rs` | 16-bit counter and edge detection |
 | `joypad.rs`, `serial.rs` | input and the serial shift register |
 | `link.rs` | two consoles on one cable, advanced in lockstep |
+| `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
 
@@ -453,8 +482,9 @@ Working:
   its bits at the rate the hardware does —512 T-cycles each— in both master and
   slave roles, and the two shift registers swap rather than one sending. The pair
   advances in lockstep, always the console that is behind, so the exchange stays
-  simultaneous. Over a network it would not be: that is the next problem, not
-  this one.
+  simultaneous, and the second console is a copy of the first taken where it
+  stands. Over a network it would not be simultaneous: that is the next problem,
+  not this one.
 
 The cartridges boot, reach their title screen and respond to the keyboard, both
 Game Boy and Game Boy Color ones. With no limiter, the emulation runs at about 17

@@ -176,6 +176,22 @@ fn window_size(scale: f32) -> Vec2 {
     Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale + MENU_BAR_ROOM)
 }
 
+/// Gap left between two linked screens. Without it the two pictures read as one
+/// wide one, which with the same game running twice is genuinely confusing.
+const LINK_GUTTER: f32 = 16.0;
+
+/// The window two linked consoles need: both screens at the size the single one
+/// had, with the gutter between them.
+///
+/// The window grows rather than the screens shrinking, and that is the point. A
+/// second console squeezed into the window the first one had would halve both of
+/// them, and a Game Boy screen at half the size it was is not two consoles: it is
+/// two unreadable ones.
+fn linked_window_size(scale: f32) -> Vec2 {
+    let single = window_size(scale);
+    Vec2::new(single.x * 2.0 + LINK_GUTTER, single.y)
+}
+
 fn title(session: Option<&Session>) -> String {
     match session {
         Some(s) => format!("Akebia — {}", s.title),
@@ -229,10 +245,6 @@ struct App {
     /// second one is only painted while a cable is plugged in, but it costs
     /// 160×144 pixels to keep and saves creating a texture mid-game.
     textures: [TextureHandle; 2],
-    /// A console set aside while its player picks the game for the other end of
-    /// the cable. It is paused, not closed: its saved game is still open and
-    /// cancelling puts it straight back on screen.
-    pending_link: Option<Box<Session>>,
 }
 
 enum Screen {
@@ -282,7 +294,6 @@ impl App {
             screen,
             dialog: None,
             textures,
-            pending_link: None,
         }
     }
 
@@ -296,19 +307,8 @@ impl App {
                     self.folder = dir.to_owned();
                 }
                 let session = Session::new(gb, path, &self.args, &self.settings);
-                // A console was left waiting for a partner: this is the partner,
-                // and picking it is what plugs the cable in.
-                self.screen = match self.pending_link.take() {
-                    Some(first) => {
-                        let pair = Pair::new(*first, session, &self.settings);
-                        ctx.send_viewport_cmd(ViewportCommand::Title(linked_title(&pair)));
-                        Screen::Linked(Box::new(pair))
-                    }
-                    None => {
-                        ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
-                        Screen::Playing(Box::new(session))
-                    }
-                };
+                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                self.screen = Screen::Playing(Box::new(session));
             }
             // Loading can fail because of a mapper not implemented yet or a file
             // that is not a ROM. It is shown in the list and not on stderr:
@@ -378,8 +378,8 @@ impl App {
                 });
                 ui.menu_button("Link", |ui| {
                     connect = ui
-                        .add_enabled(playing, egui::Button::new("Second console…"))
-                        .on_hover_text("Pick another game and join the two with a link cable")
+                        .add_enabled(playing, egui::Button::new("Second console"))
+                        .on_hover_text("Copy this console and join the two with a link cable")
                         .clicked();
                     swap = ui
                         .add_enabled(linked, egui::Button::new("Swap keyboard\tTab"))
@@ -404,7 +404,7 @@ impl App {
             self.back_to_list(ctx, None);
         }
         if connect {
-            self.begin_link();
+            self.plug_in_a_second_console(ctx);
         }
         if swap {
             if let Screen::Linked(pair) = &mut self.screen {
@@ -416,32 +416,23 @@ impl App {
         }
     }
 
-    /// Sets the running game aside and shows the list so its partner can be
-    /// picked. The console is paused, not closed: its saved game stays open, and
-    /// Escape puts it back on screen with nothing lost.
-    fn begin_link(&mut self) {
+    /// Copies the running console and joins the two with a cable.
+    ///
+    /// Nothing is asked for, and no game is opened: the second console is this
+    /// one, in the state it is in. See [`Session::duplicate`].
+    fn plug_in_a_second_console(&mut self, ctx: &egui::Context) {
         if !matches!(self.screen, Screen::Playing(_)) {
             return;
         }
-        let mut list = List::new(self.folder.clone());
-        // The list's one line of prose is the warning slot, and an instruction is
-        // what belongs there now: without it, coming back to the list right after
-        // asking for a second console looks like the menu did nothing.
-        list.warning = Some("Pick the game for the second console".to_owned());
+        let list = Screen::List(List::new(self.folder.clone()));
+        if let Screen::Playing(first) = std::mem::replace(&mut self.screen, list) {
+            let second = first.duplicate(&self.args, &self.settings);
+            let pair = Pair::new(*first, second, &self.settings);
 
-        if let Screen::Playing(session) = std::mem::replace(&mut self.screen, Screen::List(list)) {
-            self.pending_link = Some(session);
+            ctx.send_viewport_cmd(ViewportCommand::Title(linked_title(&pair)));
+            self.resize_for(ctx, true);
+            self.screen = Screen::Linked(Box::new(pair));
         }
-    }
-
-    /// Calls off a link that was never made and resumes the console that was
-    /// waiting for it.
-    fn cancel_link(&mut self, ctx: &egui::Context) {
-        let Some(session) = self.pending_link.take() else {
-            return;
-        };
-        ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
-        self.screen = Screen::Playing(session);
     }
 
     /// Pulls the cable out, keeping whichever console has the keyboard and
@@ -454,8 +445,25 @@ impl App {
         if let Screen::Linked(pair) = std::mem::replace(&mut self.screen, list) {
             let session = pair.split(&self.settings);
             ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+            self.resize_for(ctx, false);
             self.screen = Screen::Playing(Box::new(session));
         }
+    }
+
+    /// Grows the window for a second screen, or gives back the width when the
+    /// cable comes out.
+    ///
+    /// A maximised window is left alone: it is already as big as it gets, and
+    /// unmaximising it to fit a number would be answering a question nobody
+    /// asked.
+    fn resize_for(&self, ctx: &egui::Context, linked: bool) {
+        let scale = self.settings.scale;
+        if scale == 0 {
+            return;
+        }
+        let size =
+            if linked { linked_window_size(scale as f32) } else { window_size(scale as f32) };
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
     }
 
     /// Takes on what the menu just changed.
@@ -475,11 +483,6 @@ impl App {
             Screen::Playing(session) => session.apply(&self.settings),
             Screen::Linked(pair) => pair.apply(&self.settings),
             Screen::List(_) => {}
-        }
-        // The console waiting for a partner has to take the change too, or it
-        // would come back with the palette and the sound it was set aside with.
-        if let Some(pending) = self.pending_link.as_mut() {
-            pending.apply(&self.settings);
         }
     }
 
@@ -533,9 +536,6 @@ impl App {
             Screen::Linked(pair) => pair.close(),
             Screen::List(_) => {}
         }
-        if let Some(mut pending) = self.pending_link.take() {
-            pending.close();
-        }
         let mut list = List::new(self.folder.clone());
         list.warning = warning;
         self.screen = Screen::List(list);
@@ -554,11 +554,6 @@ impl eframe::App for App {
         let dialog = self.dialog.is_some();
 
         if matches!(self.screen, Screen::List(_)) {
-            // Escape over the list, with a console set aside waiting for its
-            // partner, calls the link off instead of doing nothing.
-            if !dialog && self.pending_link.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
-                self.cancel_link(ctx);
-            }
             return;
         }
 
@@ -666,9 +661,6 @@ impl eframe::App for App {
             Screen::Playing(session) => session.close(),
             Screen::Linked(pair) => pair.close(),
             Screen::List(_) => {}
-        }
-        if let Some(pending) = self.pending_link.as_mut() {
-            pending.close();
         }
     }
 }
@@ -1301,25 +1293,46 @@ impl Session {
         session
     }
 
-    /// Makes sure this console is not autosaving over the same file as `other`.
+    /// A second console in the state this one is in, down to the frame.
     ///
-    /// It happens the moment somebody links a game to itself, which is the
-    /// obvious thing to try first: both consoles derive their `.sav` from the
-    /// same ROM path, and from then on two autosaves a second apart take turns
-    /// overwriting one real saved game. This one moves aside; see
-    /// [`save::linked_path`].
-    fn unshare_save_with(&mut self, other: &Self) {
-        let (Some(mine), Some(theirs)) = (self.save.as_ref(), other.save.as_ref()) else {
-            return;
+    /// This is what "second console" means here, and it is not a shortcut. A
+    /// trade happens at the Cable Club, hours into a game; starting the second
+    /// console at the title screen would mean playing those hours again before
+    /// there were two consoles able to talk, and doing it with one keyboard
+    /// shared between them. Copying the console that is already there gives two
+    /// players standing in the same room, which is where the interesting part
+    /// starts.
+    ///
+    /// The copy is complete —CPU, RAM, video, cartridge and its SRAM— so both
+    /// games are the same save, with the same team in it. What it does not copy
+    /// is where that save is written: see [`save::linked_path`].
+    fn duplicate(&self, args: &Args, settings: &Settings) -> Self {
+        let gb = self.gb.clone();
+        let save = self.save.as_ref().and_then(|_| {
+            let path = save::linked_path(&self.rom);
+            eprintln!("the second console saves to {}", path.display());
+            save::SaveFile::copied(&gb, path)
+        });
+
+        let mut copy = Self {
+            gb,
+            title: self.title.clone(),
+            rom: self.rom.clone(),
+            save,
+            audio: None,
+            pixels: self.pixels.clone(),
+            next: Instant::now(),
+            frames: self.frames,
+            trace: args.debug.then(debug::LiveTrace::new),
+            captures: 0,
+            serial: args.serial,
+            // Silent from the start rather than opened and closed a moment later
+            // by the pair: the console being copied is the one already playing,
+            // and it is the one that keeps the speakers.
+            muted: true,
         };
-        if mine.path() != theirs.path() {
-            return;
-        }
-        let moved = save::linked_path(&self.rom);
-        eprintln!("the second console saves to {} so as not to share one file", moved.display());
-        if let Some(save) = self.save.as_mut() {
-            save.redirect(moved);
-        }
+        copy.apply(settings);
+        copy
     }
 
     /// Silences this console, or gives it the speakers back.
@@ -1539,7 +1552,6 @@ impl Pair {
         link::connect(&mut a.gb, &mut b.gb);
         // Only one console is heard; see `Session::muted`.
         b.set_muted(true, settings);
-        b.unshare_save_with(&a);
         Self { consoles: [a, b], focus: 0, next: Instant::now() }
     }
 
@@ -1653,15 +1665,10 @@ impl Pair {
 
     /// The two screens side by side, with the one holding the keyboard framed.
     fn ui(&self, ui: &mut egui::Ui, textures: &[TextureHandle; 2]) {
-        /// Gap between the two screens. Without it the two pictures read as one
-        /// wide one, which with the same game running twice is genuinely
-        /// confusing.
-        const GUTTER: f32 = 16.0;
-
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
 
-        let width = ((area.width() - GUTTER) / 2.0).max(1.0);
+        let width = ((area.width() - LINK_GUTTER) / 2.0).max(1.0);
         let halves = [
             egui::Rect::from_min_size(area.min, Vec2::new(width, area.height())),
             egui::Rect::from_min_size(
