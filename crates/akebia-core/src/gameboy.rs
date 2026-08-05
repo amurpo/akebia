@@ -18,6 +18,7 @@ pub const T_CYCLES_PER_FRAME: u32 = 70_224;
 /// The hardware's real frames per second: ≈59.7275, not 60.
 pub const FRAMES_PER_SECOND: f64 = CLOCK_HZ as f64 / T_CYCLES_PER_FRAME as f64;
 
+#[derive(Clone)]
 pub struct GameBoy {
     cpu: Cpu,
     bus: SystemBus,
@@ -112,6 +113,18 @@ impl GameBoy {
         self.bus.t_cycles()
     }
 
+    /// Moves the clock forward without emulating anything.
+    ///
+    /// It reads as a contradiction and it is not: what it moves is the console's
+    /// place on the clock the two ends of a cable share, not its age. Afterwards
+    /// this console counts as having been switched on *later* than it really
+    /// was, and everything it derives from its own age —`DIV`, the timers, the
+    /// moment VBlank falls— stays exactly where it was, now offset from the
+    /// other console's. That offset is the whole point; see [`crate::link`].
+    pub fn offset_clock(&mut self, t_cycles: u64) {
+        self.bus.offset_clock(t_cycles);
+    }
+
     pub fn set_button(&mut self, button: Button, down: bool) {
         self.bus.set_button(button, down);
     }
@@ -191,6 +204,18 @@ impl GameBoy {
     /// this one was sending back on the same edges.
     pub fn link_clock_in(&mut self, incoming: u8) -> u8 {
         self.bus.link_clock_in(incoming)
+    }
+
+    /// Starts or stops recording everything that goes over the cable. See
+    /// [`LinkEvent`](crate::serial::LinkEvent).
+    pub fn set_link_log_enabled(&mut self, enabled: bool) {
+        self.bus.serial.set_log_enabled(enabled);
+    }
+
+    /// Takes what has been recorded since the last time, leaving the recorder
+    /// running. It has to be drained or it grows without bound.
+    pub fn take_link_log(&mut self) -> Vec<crate::serial::LinkEvent> {
+        self.bus.serial.take_log()
     }
 
     pub fn header(&self) -> &Header {
@@ -281,6 +306,36 @@ mod tests {
         rom[0x0100] = 0x18; // JR -2
         rom[0x0101] = 0xFE;
         rom
+    }
+
+    /// A copy has to be a console and not a snapshot: what matters is not that
+    /// the two look alike the instant the copy is taken, but that from there on
+    /// they *keep on* agreeing, which is only true if every last counter came
+    /// across. Anything left behind —a bank register, a scanline, a timer— shows
+    /// up as the two drifting apart.
+    #[test]
+    fn a_copied_console_goes_on_running_the_same_game() {
+        // Counts up in RAM, so the copy has to bring the work already done and
+        // not just the code: LD A,(0xC000) ; INC A ; LD (0xC000),A ; JR -6
+        let mut rom = vec![0u8; 32 * 1024];
+        rom[0x0100..0x0109].copy_from_slice(&[
+            0xFA, 0x00, 0xC0, 0x3C, 0xEA, 0x00, 0xC0, 0x18, 0xF7,
+        ]);
+
+        let mut original = GameBoy::new(rom).unwrap();
+        for _ in 0..500 {
+            original.step().unwrap();
+        }
+        let mut copy = original.clone();
+        assert_eq!(copy.peek(0xC000), original.peek(0xC000), "it did not start level");
+
+        for _ in 0..500 {
+            original.step().unwrap();
+            copy.step().unwrap();
+        }
+        assert_eq!(copy.peek(0xC000), original.peek(0xC000), "the two counts drifted apart");
+        assert_eq!(copy.t_cycles(), original.t_cycles());
+        assert_eq!(copy.peek(0xFF04), original.peek(0xFF04), "and their clocks with them");
     }
 
     #[test]

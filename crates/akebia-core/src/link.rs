@@ -54,15 +54,52 @@ pub struct LinkFault {
     pub fault: Fault,
 }
 
+/// How far apart the two consoles are switched on. See [`connect`].
+///
+/// A third of a frame: far more than the 4096 T-cycles a byte takes, so no probe
+/// from one end can land inside the other's, and well under a frame, so neither
+/// game is ever a whole frame of reactions behind the other.
+const SWITCH_ON_STAGGER: u64 = T_CYCLES_PER_FRAME as u64 / 3;
+
 /// Plugs the cable into both consoles.
 ///
 /// From here on neither of them will resolve a transfer by itself: they will
 /// wait for the other, which is what a cable is. Advancing them with anything
 /// other than [`step`] or [`run_frame`] will hang the first game that tries to
 /// trade.
+///
+/// # Why the two clocks are pushed apart
+///
+/// Because otherwise they would be *identical*, and no game can talk over that.
+///
+/// A Game Boy at the Cable Club listens first: it arms a transfer as slave and
+/// waits to be clocked. If nobody clocks it in time, it gives up waiting, takes
+/// the clock itself and sends a byte. Whoever gets tired first leads, and that
+/// is the entire negotiation —both cartridges are running the same code, so
+/// there is nothing else to break the tie with.
+///
+/// Two consoles stepped in lockstep from zero have lived the very same number of
+/// cycles, which means the same `DIV`, the same VBlank, the same countdown, and
+/// they get tired **on the same T-cycle**. Both take the clock, neither is
+/// listening, and the games sit there until they call it inactivity. On a table
+/// this cannot happen: nobody switches two consoles on at the same instant.
+///
+/// So the second one is declared to have been switched on [a fraction of a
+/// frame](SWITCH_ON_STAGGER) later. That is the tie-break real hardware gets for
+/// free.
 pub fn connect(a: &mut GameBoy, b: &mut GameBoy) {
     a.set_link_connected(true);
     b.set_link_connected(true);
+
+    // Both are put on one clock, reading the same instant. Without this, joining
+    // a console just switched on to one that has been played for an hour would
+    // make the first linked frame emulate that whole hour to catch it up.
+    let now = a.t_cycles().max(b.t_cycles());
+    // Which of the two is the late one is arbitrary —only the gap matters— and
+    // it falls on `a` so that whoever ends up waiting as slave has been
+    // listening for a while before the other takes the clock.
+    a.offset_clock(now - a.t_cycles() + SWITCH_ON_STAGGER);
+    b.offset_clock(now - b.t_cycles());
 }
 
 /// Pulls the cable out of both.
@@ -174,9 +211,19 @@ mod tests {
         rom
     }
 
+    /// Runs off the head start [`connect`] gives one of the two, after which
+    /// both clocks read the same instant and anything else can be measured
+    /// against them.
+    fn level(a: &mut GameBoy, b: &mut GameBoy) {
+        while a.t_cycles().abs_diff(b.t_cycles()) > 512 {
+            step(a, b).unwrap();
+        }
+    }
+
     /// Enough instructions for a byte —4096 T-cycles— to go through several
     /// times over. The idle loop is a `JR` of 12 T-cycles.
     fn run(a: &mut GameBoy, b: &mut GameBoy) {
+        level(a, b);
         for _ in 0..4000 {
             step(a, b).unwrap();
         }
@@ -251,11 +298,53 @@ mod tests {
         let mut a = GameBoy::new(sender(0x42, 0x81)).unwrap();
         let mut b = GameBoy::new(sender(0x99, 0x80)).unwrap();
         connect(&mut a, &mut b);
+        level(&mut a, &mut b);
 
         for _ in 0..4000 {
             step(&mut a, &mut b).unwrap();
             let drift = a.t_cycles().abs_diff(b.t_cycles());
             assert!(drift < 512, "the consoles drifted {drift} T-cycles apart");
+        }
+    }
+
+    /// A partner that has not armed anything must read as *absent*, not as an
+    /// echo.
+    ///
+    /// This is the shape of the bug that kept a trade from ever starting. The
+    /// two players are never ready at the same instant: one reaches the Cable
+    /// Club first and its game sends `0x01` at a console still walking around
+    /// somewhere. If that console gives up its register anyway, the second
+    /// attempt comes back carrying the first attempt's byte, and a game that
+    /// reads back what it just sent takes it for an answer and moves on to a
+    /// stage the other one knows nothing about.
+    #[test]
+    fn a_console_that_armed_nothing_never_echoes_the_byte_it_was_sent() {
+        let mut a = GameBoy::new(sender(0x01, 0x81)).unwrap(); // drives the clock
+        // `SC` without the start bit: the game is not listening to the cable.
+        let mut b = GameBoy::new(sender(0x99, 0x00)).unwrap();
+        connect(&mut a, &mut b);
+        run(&mut a, &mut b);
+
+        assert_eq!(a.peek(0xFF01), 0xFF, "nobody is answering: the line rests high");
+        assert_eq!(b.peek(0xFF01), 0x99, "and its register was never touched");
+    }
+
+    /// The one thing two consoles must not have in common. Both cartridges run
+    /// the same code, so the only thing that can settle which of them leads is
+    /// that one gets tired of listening before the other; in perfect step they
+    /// get tired on the same T-cycle and no game ever connects. Same ROM and
+    /// same role here on purpose: it is the symmetric worst case.
+    #[test]
+    fn the_two_consoles_never_share_a_clock_phase() {
+        let mut a = GameBoy::new(sender(0x42, 0x81)).unwrap();
+        let mut b = GameBoy::new(sender(0x42, 0x81)).unwrap();
+        connect(&mut a, &mut b);
+        level(&mut a, &mut b);
+
+        for _ in 0..4000 {
+            step(&mut a, &mut b).unwrap();
+            // DIV is the clock every one of those countdowns is counted with.
+            assert_ne!(a.peek(0xFF04), b.peek(0xFF04), "the two consoles share a DIV");
         }
     }
 

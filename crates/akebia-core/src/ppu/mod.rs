@@ -129,6 +129,7 @@ pub enum Mode {
     Drawing = 3,
 }
 
+#[derive(Clone)]
 pub struct Ppu {
     /// The two VRAM banks, contiguous. Bank 1 only exists on CGB and holds the
     /// attributes of the background tiles.

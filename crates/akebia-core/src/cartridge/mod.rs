@@ -19,6 +19,19 @@ pub struct Cartridge {
     mapper: Box<dyn Mapper>,
 }
 
+/// A second cartridge exactly where this one is: the same ROM, the same banks
+/// selected and the same SRAM, clock included.
+///
+/// The ROM is copied along with the rest, which for a big cartridge is a few
+/// megabytes. It happens once, when a console is duplicated, and buying a
+/// reference count for that is not worth the noise it would add to every
+/// mapper.
+impl Clone for Cartridge {
+    fn clone(&self) -> Self {
+        Self { header: self.header.clone(), mapper: self.mapper.duplicate() }
+    }
+}
+
 impl Cartridge {
     /// **Abstract Factory**: inspects the header and builds the right mapping
     /// strategy.
@@ -92,6 +105,9 @@ impl Mapper for Cartridge {
     }
     fn tick(&mut self, t_cycles: u32) {
         self.mapper.tick(t_cycles);
+    }
+    fn duplicate(&self) -> Box<dyn Mapper> {
+        self.mapper.duplicate()
     }
     fn name(&self) -> &'static str {
         self.mapper.name()

@@ -28,6 +28,7 @@ use crate::cartridge::ROM_BANK_SIZE;
 /// Bit 3 of the SRAM bank register on cartridges with rumble.
 const RUMBLE_BIT: u8 = 0x08;
 
+#[derive(Clone)]
 pub struct Mbc5 {
     rom: Vec<u8>,
     ram: CartRam,
@@ -120,6 +121,10 @@ impl Mapper for Mbc5 {
 
     fn load_save_ram(&mut self, data: &[u8]) -> bool {
         self.ram.load(data)
+    }
+
+    fn duplicate(&self) -> Box<dyn Mapper> {
+        Box::new(self.clone())
     }
 
     fn name(&self) -> &'static str {

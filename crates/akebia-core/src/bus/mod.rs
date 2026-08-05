@@ -74,6 +74,7 @@ struct DmaTransfer {
     index: u16,
 }
 
+#[derive(Clone)]
 pub struct SystemBus {
     pub cartridge: Cartridge,
     pub ppu: Ppu,
@@ -199,6 +200,15 @@ impl SystemBus {
 
     pub fn t_cycles(&self) -> u64 {
         self.t_cycles
+    }
+
+    /// See [`GameBoy::offset_clock`]. Only this counter moves: nothing that runs
+    /// off it —timer, PPU, APU— is told, which is precisely what keeps the
+    /// console's own rhythm intact while its place on the shared clock shifts.
+    ///
+    /// [`GameBoy::offset_clock`]: crate::GameBoy::offset_clock
+    pub fn offset_clock(&mut self, t_cycles: u64) {
+        self.t_cycles += t_cycles;
     }
 
     pub fn model(&self) -> Model {

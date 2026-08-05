@@ -31,6 +31,7 @@ enum BankingMode {
     Advanced,
 }
 
+#[derive(Clone)]
 pub struct Mbc1 {
     rom: Vec<u8>,
     ram: CartRam,
@@ -122,6 +123,10 @@ impl Mapper for Mbc1 {
 
     fn load_save_ram(&mut self, data: &[u8]) -> bool {
         self.ram.load(data)
+    }
+
+    fn duplicate(&self) -> Box<dyn Mapper> {
+        Box::new(self.clone())
     }
 
     fn name(&self) -> &'static str {

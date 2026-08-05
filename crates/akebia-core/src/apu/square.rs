@@ -27,6 +27,7 @@ const DUTY_PATTERNS: [u8; 4] = [0b0000_0001, 0b1000_0001, 0b1000_0111, 0b0111_11
 /// Maximum counter length on the square channels.
 const MAX_LENGTH: u16 = 64;
 
+#[derive(Clone)]
 pub struct Square {
     /// `true` if the channel is sounding.
     pub enabled: bool,

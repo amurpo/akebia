@@ -56,6 +56,7 @@ impl Button {
     }
 }
 
+#[derive(Clone)]
 pub struct Joypad {
     /// Real button state, one per bit. 1 = pressed (direct logic; the inversion
     /// is applied only when reading the register).

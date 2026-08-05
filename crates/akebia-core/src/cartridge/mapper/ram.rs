@@ -19,6 +19,7 @@ use crate::cartridge::RAM_BANK_SIZE;
 /// Any other value leaves the memory disconnected from the bus.
 pub const RAM_ENABLE_MAGIC: u8 = 0x0A;
 
+#[derive(Clone)]
 pub struct CartRam {
     bytes: Vec<u8>,
     battery: bool,

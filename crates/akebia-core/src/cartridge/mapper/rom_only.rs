@@ -4,6 +4,7 @@
 use super::{ram::CartRam, Mapper, OPEN_BUS};
 use crate::cartridge::ROM_BANK_SIZE;
 
+#[derive(Clone)]
 pub struct RomOnly {
     rom: Vec<u8>,
     ram: CartRam,
@@ -43,6 +44,10 @@ impl Mapper for RomOnly {
 
     fn load_save_ram(&mut self, data: &[u8]) -> bool {
         self.ram.load(data)
+    }
+
+    fn duplicate(&self) -> Box<dyn Mapper> {
+        Box::new(self.clone())
     }
 
     fn name(&self) -> &'static str {

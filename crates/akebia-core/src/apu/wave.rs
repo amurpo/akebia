@@ -28,6 +28,7 @@ const MAX_LENGTH: u16 = 256;
 /// Level 0 does not shift: it mutes.
 const VOLUME_SHIFT: [u8; 4] = [4, 0, 1, 2];
 
+#[derive(Clone)]
 pub struct Wave {
     pub enabled: bool,
     /// Bit 7 of `NR30`. Unlike the other channels, here the DAC has its own bit

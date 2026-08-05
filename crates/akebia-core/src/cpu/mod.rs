@@ -53,6 +53,7 @@ pub enum Power {
     Stopped,
 }
 
+#[derive(Clone)]
 pub struct Cpu {
     pub regs: Registers,
     pub power: Power,

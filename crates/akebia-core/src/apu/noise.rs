@@ -28,6 +28,7 @@ const MAX_LENGTH: u16 = 64;
 /// are multiples of 16.
 const DIVISORS: [u32; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
+#[derive(Clone)]
 pub struct Noise {
     pub enabled: bool,
     dac_enabled: bool,

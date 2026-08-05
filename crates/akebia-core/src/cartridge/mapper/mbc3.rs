@@ -175,6 +175,7 @@ impl RtcRegisters {
 /// emulation reproducible: the same sequence of inputs always produces the same
 /// result. The difference from the hardware is that here time stops when the
 /// emulator is closed, whereas the real cartridge keeps counting.
+#[derive(Clone)]
 struct Rtc {
     live: RtcRegisters,
     latched: RtcRegisters,
@@ -226,6 +227,7 @@ impl Rtc {
     }
 }
 
+#[derive(Clone)]
 pub struct Mbc3 {
     rom: Vec<u8>,
     ram: CartRam,
@@ -375,6 +377,10 @@ impl Mapper for Mbc3 {
         let saved = u64::from_le_bytes(data[40..48].try_into().unwrap());
         rtc.live.advance(now_unix.saturating_sub(saved));
         true
+    }
+
+    fn duplicate(&self) -> Box<dyn Mapper> {
+        Box::new(self.clone())
     }
 
     fn name(&self) -> &'static str {

@@ -54,6 +54,43 @@ const FAST: u8 = 0x02;
 /// Bit 0 of `SC`: this console drives the clock.
 const INTERNAL_CLOCK: u8 = 0x01;
 
+/// What comes back when there is nobody to answer.
+///
+/// The data line rests high, so a console clocking eight bits at an empty cable
+/// —or at one whose other end is not listening— shifts in eight ones.
+const IDLE_LINE: u8 = 0xFF;
+
+/// Something that happened on the cable, recorded when the trace is on.
+///
+/// It exists because a link that does not work says nothing about *why*. The two
+/// games talk in a protocol —who leads, a couple of zeroes, `0x60` to
+/// synchronise, `0xD4` to pick the Trade Centre— and seeing that conversation, or
+/// seeing where it stops, is the difference between fixing the port and guessing
+/// at it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEvent {
+    /// The game armed a transfer. `internal` says whether it also took the
+    /// clock, which is the whole master/slave question.
+    Armed { at: u64, sb: u8, internal: bool },
+    /// Eight bits went both ways.
+    ///
+    /// `armed` is what makes this worth recording: a console whose game had not
+    /// asked for the transfer gives back the empty line and keeps nothing, so a
+    /// trace full of unarmed transfers is a trace of one game talking to a
+    /// partner that is somewhere else entirely.
+    Transferred { at: u64, sent: u8, received: u8, internal: bool, armed: bool },
+}
+
+impl LinkEvent {
+    /// When it happened, in T-cycles since the console was switched on.
+    pub fn at(&self) -> u64 {
+        match self {
+            Self::Armed { at, .. } | Self::Transferred { at, .. } => *at,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Serial {
     /// Serial Byte: what is going out, and once the transfer ends, what came in.
     sb: u8,
@@ -78,6 +115,14 @@ pub struct Serial {
 
     /// Transmitted bytes the frontend has not collected yet.
     output: Vec<u8>,
+
+    /// T-cycles since the console was switched on, kept here so the trace can
+    /// say *when*. The whole difficulty of a cable is timing; a log of bytes
+    /// with no clock against them would leave out the interesting half.
+    now: u64,
+    /// The cable trace, when it is switched on. `None` costs nothing, which is
+    /// why it is an `Option` and not an empty `Vec`.
+    log: Option<Vec<LinkEvent>>,
 }
 
 impl Serial {
@@ -91,6 +136,25 @@ impl Serial {
             pending: false,
             connected: false,
             output: Vec::new(),
+            now: 0,
+            log: None,
+        }
+    }
+
+    /// Starts or stops recording what goes over the cable. Switching it on
+    /// throws away whatever was recorded before.
+    pub fn set_log_enabled(&mut self, enabled: bool) {
+        self.log = enabled.then(Vec::new);
+    }
+
+    /// Takes the trace recorded so far, leaving the recorder running.
+    pub fn take_log(&mut self) -> Vec<LinkEvent> {
+        self.log.as_mut().map(core::mem::take).unwrap_or_default()
+    }
+
+    fn record(&mut self, event: LinkEvent) {
+        if let Some(log) = self.log.as_mut() {
+            log.push(event);
         }
     }
 
@@ -116,6 +180,8 @@ impl Serial {
 
                 if starting {
                     self.countdown = self.bit_period();
+                    let internal = value & INTERNAL_CLOCK != 0;
+                    self.record(LinkEvent::Armed { at: self.now, sb: self.sb, internal });
                     // The byte is recorded here and not when the transfer ends,
                     // and that is deliberate: this log is Blargg's way out for
                     // text, and those tests write characters faster than a real
@@ -138,12 +204,13 @@ impl Serial {
     /// A slave counts nothing: its bits arrive when the other console decides,
     /// through [`Serial::clock_in`].
     pub fn tick(&mut self, t_cycles: u32, ic: &mut InterruptController) {
+        self.now += u64::from(t_cycles);
         if self.pending {
             // Unplugged while waiting for the answer. Better to hand the game
             // the 0xFF of an empty line than to leave it waiting forever for an
             // interrupt that is no longer coming.
             if !self.connected {
-                self.complete(0xFF, ic);
+                self.complete(IDLE_LINE, ic);
             }
             return;
         }
@@ -164,7 +231,7 @@ impl Serial {
                     // back down the other wire.
                     self.pending = true;
                 } else {
-                    self.complete(0xFF, ic);
+                    self.complete(IDLE_LINE, ic);
                 }
                 return;
             }
@@ -184,6 +251,14 @@ impl Serial {
 
     /// Hands over the byte the other end was sending, ending the transfer.
     pub fn complete(&mut self, received: u8, ic: &mut InterruptController) {
+        let event = LinkEvent::Transferred {
+            at: self.now,
+            sent: self.sb,
+            received,
+            internal: true,
+            armed: true,
+        };
+        self.record(event);
         self.sb = received;
         self.sc &= !START;
         self.bits = 0;
@@ -195,25 +270,41 @@ impl Serial {
     /// the clock. Returns what this end had in its register, which is exactly
     /// what the other one receives.
     ///
-    /// # Why it answers even without an armed transfer
+    /// # A console that has not armed a transfer answers nothing
     ///
-    /// The shift register is wired to the cable all the time; the start bit only
-    /// says whether the interrupt fires when the eight bits are through. A
-    /// console whose game has not armed the next transfer yet still gives up
-    /// whatever `SB` held and still takes in what arrives. It is faithful, and
-    /// it is also what makes the games' resynchronisation work: they count on
-    /// reading stale bytes while the other side catches up, and that is why
-    /// their protocols are full of padding bytes.
+    /// With bit 7 of `SC` clear the shift register **does not shift**: the
+    /// external clock does not reach it, `SB` keeps whatever it held, and the
+    /// console driving the clock reads the empty line, `0xFF`.
+    ///
+    /// That is not a detail, it is what makes a cable work between two people.
+    /// Pokémon at the Cable Club listens, and if nobody clocks it, takes the
+    /// clock and sends `0x01` expecting `0x02` back. Were an idle console to
+    /// give up its `SB` and take in what arrived, the second byte sent to a
+    /// partner who has not reached the Cable Club yet would come back *as the
+    /// echo of the first*, and a game reading its own byte concludes it is
+    /// connected to something that is not listening. From there the two are in
+    /// different stages of the protocol and neither can get out. `0xFF` says
+    /// "nobody home", which is a thing a game can wait on.
     pub fn clock_in(&mut self, incoming: u8, ic: &mut InterruptController) -> u8 {
+        let armed = self.sc & START != 0 && self.sc & INTERNAL_CLOCK == 0;
+        let event = LinkEvent::Transferred {
+            at: self.now,
+            sent: if armed { self.sb } else { IDLE_LINE },
+            received: incoming,
+            internal: false,
+            armed,
+        };
+        self.record(event);
+        if !armed {
+            return IDLE_LINE;
+        }
+
         let outgoing = self.sb;
         self.sb = incoming;
-
-        if self.sc & START != 0 && self.sc & INTERNAL_CLOCK == 0 {
-            self.output.push(outgoing);
-            self.sc &= !START;
-            self.bits = 0;
-            ic.request(Interrupt::Serial);
-        }
+        self.output.push(outgoing);
+        self.sc &= !START;
+        self.bits = 0;
+        ic.request(Interrupt::Serial);
         outgoing
     }
 
@@ -392,16 +483,21 @@ mod tests {
         assert_eq!(s.take_output(), vec![0xAA]);
     }
 
-    /// The register is wired to the cable whether the game armed a transfer or
-    /// not; only the interrupt depends on the start bit.
+    /// With the start bit clear the external clock never reaches the register.
+    ///
+    /// It is the difference between a partner who is not listening and one who
+    /// answers with whatever it happened to be holding, and it decides whether a
+    /// link survives the two players not being ready at the same moment: a game
+    /// that reads back the byte it just sent concludes it is connected, and from
+    /// there the two are talking past each other for good.
     #[test]
-    fn an_unarmed_slave_still_answers_but_is_not_interrupted() {
+    fn an_unarmed_slave_neither_answers_nor_takes_anything_in() {
         let (mut s, mut ic) = dmg();
         s.write(0xFF01, 0xAA);
 
         let sent = s.clock_in(0xBB, &mut ic);
-        assert_eq!(sent, 0xAA);
-        assert_eq!(s.read(0xFF01), 0xBB);
+        assert_eq!(sent, IDLE_LINE, "there is nobody driving the line");
+        assert_eq!(s.read(0xFF01), 0xAA, "and nothing was shifted in either");
         assert_eq!(ic.pending(), None, "nothing was armed: the game is not told");
     }
 

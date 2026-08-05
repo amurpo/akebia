@@ -32,6 +32,16 @@ pub use rom_only::RomOnly;
 pub trait Mapper {
     fn read_rom(&self, addr: u16) -> u8;
 
+    /// A second cartridge in the state this one is in, banks and SRAM included.
+    ///
+    /// It is what lets a whole console be duplicated —see [`GameBoy::clone`]—
+    /// and it has to be a method because the cartridge holds its mapper as a
+    /// trait object: `Clone` is not object safe, and only the mapper itself
+    /// knows what it is made of.
+    ///
+    /// [`GameBoy::clone`]: crate::GameBoy
+    fn duplicate(&self) -> Box<dyn Mapper>;
+
     /// Write over the ROM range: configures the mapper's registers.
     fn write_rom(&mut self, addr: u16, value: u8);
 

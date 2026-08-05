@@ -45,6 +45,7 @@ enum Overflow {
     Pending(u32),
 }
 
+#[derive(Clone)]
 pub struct Timer {
     /// Internal 16-bit counter. `DIV` is its bits 15-8.
     counter: u16,

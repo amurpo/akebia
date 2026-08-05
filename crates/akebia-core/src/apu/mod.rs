@@ -78,6 +78,7 @@ pub struct StereoSample {
     pub right: f32,
 }
 
+#[derive(Clone)]
 pub struct Apu {
     channel1: Square,
     channel2: Square,
