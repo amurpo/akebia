@@ -88,6 +88,11 @@ pub fn execute(
             branch(regs, addr, instruction);
             Ok(())
         }
+        0b111 if instruction & 0x0F00_0000 == 0x0F00_0000 => {
+            software_interrupt(regs, addr);
+            Ok(())
+        }
+        // What is left is the coprocessor space, and this machine has none.
         _ => Err(Fault::Undefined { addr, instruction }),
     }
 }
@@ -422,9 +427,17 @@ fn narrow_or_swap(
     instruction: u32,
 ) -> Result<(), Fault> {
     match (instruction >> 5) & 0b11 {
-        // The multiplies and the swap live here. Only the swap is written yet.
+        // Three instructions share this corner, told apart by bits that mean
+        // nothing anywhere else. The order does not matter here because the
+        // three patterns are disjoint, unlike the carve-outs above.
         0b00 => {
-            if instruction & 0x0FB0_0FF0 == 0x0100_0090 {
+            if instruction & 0x0FC0_00F0 == 0x0000_0090 {
+                multiply(regs, instruction);
+                Ok(())
+            } else if instruction & 0x0F80_00F0 == 0x0080_0090 {
+                multiply_long(regs, instruction);
+                Ok(())
+            } else if instruction & 0x0FB0_0FF0 == 0x0100_0090 {
                 swap(regs, bus, instruction);
                 Ok(())
             } else {
@@ -437,6 +450,101 @@ fn narrow_or_swap(
         }
     }
 }
+
+/// `MUL` and `MLA`: a 32-bit product, and optionally something added to it.
+///
+/// # Why the register fields are in the wrong places
+///
+/// Because this instruction was added to an encoding that was already full. The
+/// destination sits where every other instruction keeps its *first operand*,
+/// and the operands are scattered through the fields left over. Reading them by
+/// the usual positions gets four registers, all of them wrong, and the answer
+/// still lands somewhere plausible — which is why this is worth saying out loud
+/// rather than trusting the shifts below to speak for themselves.
+fn multiply(regs: &mut Registers, instruction: u32) {
+    let rd = ((instruction >> 16) & 0xF) as usize;
+    let rn = ((instruction >> 12) & 0xF) as usize;
+    let rs = ((instruction >> 8) & 0xF) as usize;
+    let rm = (instruction & 0xF) as usize;
+
+    // Wrapping, and signedness does not come into it: the low thirty-two bits
+    // of a product are the same whichever way the operands are read.
+    let mut result = regs.get(rm).wrapping_mul(regs.get(rs));
+    if instruction & (1 << 21) != 0 {
+        result = result.wrapping_add(regs.get(rn));
+    }
+    regs.set(rd, result);
+
+    if instruction & (1 << 20) != 0 {
+        // Only two of the four flags. The architecture says the carry is left
+        // holding a meaningless value, and the honest reading of "meaningless"
+        // is to leave it alone rather than invent a rule for it: a game cannot
+        // depend on what is not defined, and a wrong rule would be a wrong
+        // answer where none is owed.
+        regs.set_nz(result);
+    }
+}
+
+/// `UMULL`, `UMLAL`, `SMULL` and `SMLAL`: a 64-bit product across two
+/// registers.
+fn multiply_long(regs: &mut Registers, instruction: u32) {
+    let high = ((instruction >> 16) & 0xF) as usize;
+    let low = ((instruction >> 12) & 0xF) as usize;
+    let rs = ((instruction >> 8) & 0xF) as usize;
+    let rm = (instruction & 0xF) as usize;
+
+    // Here the signedness does matter, because the top half of the product is
+    // what the sign reaches.
+    let product = if instruction & (1 << 22) != 0 {
+        ((regs.get(rm) as i32 as i64).wrapping_mul(regs.get(rs) as i32 as i64)) as u64
+    } else {
+        u64::from(regs.get(rm)).wrapping_mul(u64::from(regs.get(rs)))
+    };
+
+    let result = if instruction & (1 << 21) != 0 {
+        let existing = (u64::from(regs.get(high)) << 32) | u64::from(regs.get(low));
+        product.wrapping_add(existing)
+    } else {
+        product
+    };
+
+    regs.set(low, result as u32);
+    regs.set(high, (result >> 32) as u32);
+
+    if instruction & (1 << 20) != 0 {
+        // The sign is the top bit of the whole 64-bit answer and the zero is
+        // both halves being zero, so neither flag can be read off one register.
+        regs.set_n(result & 0x8000_0000_0000_0000 != 0);
+        regs.set_z(result == 0);
+    }
+}
+
+/// `SWI`: the instruction a program calls the BIOS with.
+///
+/// It is an exception raised on purpose, and it goes through the same door as
+/// any other: the status register is saved, the mode changes to the one with
+/// the rights, interrupts are masked so the handler's first instructions cannot
+/// be interrupted before it has a stack, and the processor jumps to a fixed
+/// address near the bottom of memory.
+///
+/// The twenty-four bits below the opcode are not read by the processor at all.
+/// They are a message to the handler, which fetches the instruction back out of
+/// memory to see which service was asked for — which is why the link register
+/// has to point just past it.
+fn software_interrupt(regs: &mut Registers, addr: u32) {
+    let caller = regs.cpsr();
+    regs.set_mode(super::Mode::Supervisor);
+    regs.set_spsr(caller);
+    regs.set(14, addr.wrapping_add(4));
+
+    // Into ARM state with interrupts masked, whatever the caller was doing.
+    let status = regs.cpsr();
+    regs.set_cpsr((status | super::registers::I) & !T);
+    regs.set_pc(SWI_VECTOR);
+}
+
+/// Where the processor goes on `SWI`, fixed in the hardware.
+const SWI_VECTOR: u32 = 0x08;
 
 /// `LDRH`, `STRH`, `LDRSB` and `LDRSH`.
 ///
@@ -1414,6 +1522,212 @@ mod tests {
             assert_eq!(mem.read32(DATA + index as u32 * 4), wanted, "r{index}");
         }
         assert_eq!(mem.read32(DATA + 60), BASE + 12, "and the counter, twelve on");
+    }
+
+    /// The register fields of a multiply are in different places from every
+    /// other instruction's. Reading them by the usual positions gets four
+    /// registers, all of them wrong, and an answer that still looks plausible.
+    #[test]
+    fn a_multiply_reads_its_registers_from_the_places_it_keeps_them() {
+        // MUL r0, r1, r2  -  Rd is at 19..16, where an operand normally lives.
+        let (mut cpu, mut mem) = machine(&[0xE000_0291]);
+        cpu.regs.set(1, 6);
+        cpu.regs.set(2, 7);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 42);
+    }
+
+    /// The low half of a product is the same whichever way the operands are
+    /// read, so a plain multiply needs no notion of sign.
+    #[test]
+    fn a_multiply_wraps_and_does_not_care_about_sign() {
+        // MUL r0, r1, r2 with two negatives.
+        let (mut cpu, mut mem) = machine(&[0xE000_0291]);
+        cpu.regs.set(1, 0xFFFF_FFFF);
+        cpu.regs.set(2, 0xFFFF_FFFF);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 1, "-1 times -1");
+
+        let (mut cpu, mut mem) = machine(&[0xE000_0291]);
+        cpu.regs.set(1, 0x1234_5678);
+        cpu.regs.set(2, 0x1000);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 0x4567_8000, "and the top of the product falls off");
+    }
+
+    #[test]
+    fn a_multiply_can_add_something_to_its_product() {
+        // MLA r0, r1, r2, r3 - the destination at 19..16 and the addend at
+        // 15..12, which is the trap the test above is about.
+        let (mut cpu, mut mem) = machine(&[0xE020_3291]);
+        cpu.regs.set(1, 6);
+        cpu.regs.set(2, 7);
+        cpu.regs.set(3, 100);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 142);
+    }
+
+    /// Two flags and not four. The architecture leaves the carry holding a
+    /// meaningless value, so it is left alone rather than given an invented
+    /// rule - a game cannot depend on what is not defined.
+    #[test]
+    fn a_multiply_with_flags_sets_two_of_them_and_leaves_the_rest() {
+        // MULS r0, r1, r2
+        let (mut cpu, mut mem) = machine(&[0xE010_0291]);
+        cpu.regs.set(1, 0);
+        cpu.regs.set(2, 5);
+        cpu.regs.set_c(true);
+        cpu.regs.set_v(true);
+        cpu.step(&mut mem).unwrap();
+        assert!(cpu.regs.z(), "the answer was zero");
+        assert!(cpu.regs.c(), "the carry was not touched");
+        assert!(cpu.regs.v(), "nor the overflow");
+
+        let (mut cpu, mut mem) = machine(&[0xE010_0291]);
+        cpu.regs.set(1, 0xFFFF_FFFF);
+        cpu.regs.set(2, 1);
+        cpu.step(&mut mem).unwrap();
+        assert!(cpu.regs.n(), "and a negative answer sets the sign");
+    }
+
+    /// A long multiply keeps the whole product across two registers, and here
+    /// the signedness matters because the sign reaches the top half.
+    #[test]
+    fn a_long_multiply_keeps_the_whole_product_and_minds_the_sign() {
+        // UMULL r0, r1, r2, r3  -  low in r0, high in r1.
+        let (mut cpu, mut mem) = machine(&[0xE081_0392]);
+        cpu.regs.set(2, 0xFFFF_FFFF);
+        cpu.regs.set(3, 0xFFFF_FFFF);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 1, "unsigned: the low half");
+        assert_eq!(cpu.regs.get(1), 0xFFFF_FFFE, "and a very large top half");
+
+        // SMULL r0, r1, r2, r3 - the same operands read as -1 each.
+        let (mut cpu, mut mem) = machine(&[0xE0C1_0392]);
+        cpu.regs.set(2, 0xFFFF_FFFF);
+        cpu.regs.set(3, 0xFFFF_FFFF);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 1, "signed: -1 times -1 is one");
+        assert_eq!(cpu.regs.get(1), 0, "with nothing in the top half at all");
+    }
+
+    #[test]
+    fn a_long_multiply_can_accumulate_across_both_halves() {
+        // UMLAL r0, r1, r2, r3
+        let (mut cpu, mut mem) = machine(&[0xE0A1_0392]);
+        cpu.regs.set(0, 0xFFFF_FFFF);
+        cpu.regs.set(1, 0);
+        cpu.regs.set(2, 2);
+        cpu.regs.set(3, 1);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 1, "the low half wrapped");
+        assert_eq!(cpu.regs.get(1), 1, "and carried into the high one");
+    }
+
+    /// The sign is the top bit of the whole 64-bit answer and the zero is both
+    /// halves being zero, so neither flag can be read off one register.
+    #[test]
+    fn a_long_multiplys_flags_come_from_both_halves_at_once() {
+        // SMULLS r0, r1, r2, r3 with a zero answer.
+        let (mut cpu, mut mem) = machine(&[0xE0D1_0392]);
+        cpu.regs.set(2, 0);
+        cpu.regs.set(3, 1234);
+        cpu.step(&mut mem).unwrap();
+        assert!(cpu.regs.z(), "both halves were zero");
+
+        // A product whose low half is zero but whose high half is not.
+        let (mut cpu, mut mem) = machine(&[0xE0D1_0392]);
+        cpu.regs.set(2, 0x1_0000);
+        cpu.regs.set(3, 0x1_0000);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 0, "the low half is zero");
+        assert_eq!(cpu.regs.get(1), 1);
+        assert!(!cpu.regs.z(), "and the answer is not");
+
+        // And a negative one.
+        let (mut cpu, mut mem) = machine(&[0xE0D1_0392]);
+        cpu.regs.set(2, 0xFFFF_FFFF);
+        cpu.regs.set(3, 2);
+        cpu.step(&mut mem).unwrap();
+        assert!(cpu.regs.n(), "-2 is negative in sixty-four bits too");
+    }
+
+    /// The three instructions sharing this corner are told apart by bits that
+    /// mean nothing anywhere else, so each has to reach its own.
+    #[test]
+    fn the_multiplies_and_the_swap_are_not_confused_with_each_other() {
+        // A swap must not multiply.
+        let (mut cpu, mut mem) = machine(&[0xE101_2090]);
+        mem.write32(DATA, 0x1111);
+        cpu.regs.set(0, 0x2222);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x1111, "it swapped");
+
+        // And a multiply must not swap.
+        let (mut cpu, mut mem) = machine(&[0xE000_0291]);
+        cpu.regs.set(1, 3);
+        cpu.regs.set(2, 4);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 12, "it multiplied");
+    }
+
+    /// `SWI` is an exception raised on purpose: the status register is saved,
+    /// the mode changes, interrupts are masked and the processor jumps to a
+    /// fixed address.
+    #[test]
+    fn a_software_interrupt_goes_through_the_same_door_as_any_exception() {
+        // SWI 0x060000 - a division, as it happens, though nothing here reads
+        // the number.
+        let (mut cpu, mut mem) = machine(&[0xEF06_0000]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set_cpsr(cpu.regs.cpsr() & !crate::cpu::registers::I);
+        cpu.regs.set(13, 0x0300_7F00);
+        let caller = cpu.regs.cpsr();
+
+        cpu.step(&mut mem).unwrap();
+
+        assert_eq!(cpu.regs.pc(), 0x08, "it jumped to the vector");
+        assert_eq!(cpu.regs.mode(), Mode::Supervisor, "in the mode with the rights");
+        assert_eq!(cpu.regs.spsr(), caller, "with the caller's status saved");
+        assert_eq!(cpu.regs.lr(), BASE + 4, "and the way back just past the instruction");
+        assert!(cpu.regs.irq_disabled(), "interrupts masked until the handler has a stack");
+        assert!(!cpu.regs.thumb(), "and in ARM state whatever the caller was doing");
+    }
+
+    /// The link register has to point *past* the instruction, because the
+    /// handler fetches it back out of memory to see which service was asked
+    /// for. The processor itself never reads those twenty-four bits.
+    #[test]
+    fn the_handler_can_find_the_number_the_caller_asked_for() {
+        let (mut cpu, mut mem) = machine(&[0xEF12_3456]);
+        cpu.step(&mut mem).unwrap();
+
+        let instruction = mem.read32(cpu.regs.lr() - 4);
+        assert_eq!(instruction & 0x00FF_FFFF, 0x12_3456, "the message came back out");
+    }
+
+    /// And it returns the way every other handler does.
+    #[test]
+    fn a_software_interrupt_comes_back_from_where_it_went() {
+        // SWI, then at the vector: MOVS pc, lr
+        let (mut cpu, mut mem) = machine(&[0xEF00_0000]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set(13, 0x0300_7F00);
+
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.mode(), Mode::Supervisor);
+
+        // The vector is in the BIOS, which cannot be written, so the handler is
+        // run by hand from where it would have been.
+        let (mut handler, mut mem2) = machine(&[0xE1B0_F00E]);
+        handler.regs = cpu.regs.clone();
+        handler.regs.set_pc(BASE);
+        handler.step(&mut mem2).unwrap();
+
+        assert_eq!(handler.regs.pc(), BASE + 4, "back to just past the SWI");
+        assert_eq!(handler.regs.mode(), Mode::User, "and out of the handler's mode");
+        assert_eq!(handler.regs.sp(), 0x0300_7F00, "with the caller's stack");
     }
 
     /// Something end to end: counting down to zero, which needs the ALU, the

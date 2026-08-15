@@ -18,8 +18,14 @@
 //!
 //! # Where this is
 //!
-//! Early. The register file is here and validated; the instruction sets are
-//! not. Nothing loads a ROM yet.
+//! The processor runs ARM code: the register file with its banking, the memory
+//! map, and every instruction of the first of the two sets. THUMB says it is
+//! not written rather than decoding a halfword as if it were a word.
+//!
+//! Nothing else exists yet — no picture, no sound, no cartridge, no timing —
+//! and nothing loads a ROM. The next thing worth doing is measuring what is
+//! here against a test ROM, because everything above this depends on the
+//! processor being right and none of it is worth writing on top of a wrong one.
 
 pub mod bus;
 pub mod cpu;
