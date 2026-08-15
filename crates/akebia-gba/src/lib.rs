@@ -21,6 +21,7 @@
 //! Early. The register file is here and validated; the instruction sets are
 //! not. Nothing loads a ROM yet.
 
+pub mod bus;
 pub mod cpu;
 
 pub use cpu::{Mode, Registers};
