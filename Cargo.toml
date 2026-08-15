@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/akebia-android", "crates/akebia-core", "crates/akebia-frontend"]
+members = [
+    "crates/akebia-android",
+    "crates/akebia-core",
+    "crates/akebia-frontend",
+    "crates/akebia-gba",
+]
 
 [workspace.package]
 edition = "2024"
@@ -9,10 +14,14 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 akebia-core = { path = "crates/akebia-core" }
+akebia-gba = { path = "crates/akebia-gba" }
 
-# The core is built in release even during a debug `cargo run`:
+# The cores are built in release even during a debug `cargo run`:
 # an interpreted emulator is unusable without optimisations.
 [profile.dev.package.akebia-core]
+opt-level = 3
+
+[profile.dev.package.akebia-gba]
 opt-level = 3
 
 [profile.release]
