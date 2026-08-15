@@ -89,7 +89,7 @@ pub fn execute(
             Ok(())
         }
         0b111 if instruction & 0x0F00_0000 == 0x0F00_0000 => {
-            software_interrupt(regs, addr);
+            software_interrupt(regs, addr.wrapping_add(4));
             Ok(())
         }
         // What is left is the coprocessor space, and this machine has none.
@@ -531,11 +531,15 @@ fn multiply_long(regs: &mut Registers, instruction: u32) {
 /// They are a message to the handler, which fetches the instruction back out of
 /// memory to see which service was asked for — which is why the link register
 /// has to point just past it.
-fn software_interrupt(regs: &mut Registers, addr: u32) {
+///
+/// `return_to` is where the caller resumes, which is not the same distance on
+/// in the two instruction sets — four bytes in ARM and two in THUMB — so it is
+/// worked out by the caller rather than assumed here.
+pub(super) fn software_interrupt(regs: &mut Registers, return_to: u32) {
     let caller = regs.cpsr();
     regs.set_mode(super::Mode::Supervisor);
     regs.set_spsr(caller);
-    regs.set(14, addr.wrapping_add(4));
+    regs.set(14, return_to);
 
     // Into ARM state with interrupts masked, whatever the caller was doing.
     let status = regs.cpsr();
@@ -1001,15 +1005,6 @@ mod tests {
         let (mut cpu, mut mem) = machine(&[0xEE00_0000]);
         let fault = cpu.step(&mut mem).unwrap_err();
         assert_eq!(fault, Fault::Undefined { addr: BASE, instruction: 0xEE00_0000 });
-    }
-
-    /// THUMB is not written yet, and says that rather than decoding a halfword
-    /// as if it were a word.
-    #[test]
-    fn thumb_state_says_it_is_not_written_yet() {
-        let (mut cpu, mut mem) = machine(&[mov_imm(0, 1)]);
-        cpu.regs.set_thumb(true);
-        assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::Thumb { addr: BASE });
     }
 
     /// Somewhere to load from and store to, well away from the code.

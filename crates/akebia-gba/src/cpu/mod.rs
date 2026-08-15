@@ -6,6 +6,7 @@ pub mod bus;
 pub mod condition;
 pub mod registers;
 pub mod shift;
+pub mod thumb;
 
 pub use bus::Bus;
 pub use condition::Condition;
@@ -26,12 +27,6 @@ pub enum Fault {
     /// not have and the interesting information is *where*, not what happens
     /// next.
     Undefined { addr: u32, instruction: u32 },
-    /// An instruction in THUMB state, which is not implemented yet.
-    ///
-    /// A placeholder with a date on it: it goes when the second instruction set
-    /// does, and until then it tells the difference between "this decoded to
-    /// nothing" and "this has not been written".
-    Thumb { addr: u32 },
 }
 
 impl core::fmt::Display for Fault {
@@ -40,7 +35,6 @@ impl core::fmt::Display for Fault {
             Self::Undefined { addr, instruction } => {
                 write!(f, "undefined instruction {instruction:08X} at {addr:08X}")
             }
-            Self::Thumb { addr } => write!(f, "THUMB is not implemented yet (at {addr:08X})"),
         }
     }
 }
@@ -83,7 +77,9 @@ impl Cpu {
         let addr = self.regs.pc();
 
         if self.regs.thumb() {
-            return Err(Fault::Thumb { addr });
+            let instruction = bus.read16(addr);
+            self.regs.set_pc(addr.wrapping_add(2));
+            return thumb::execute(&mut self.regs, bus, addr, instruction);
         }
 
         let instruction = bus.read32(addr);
