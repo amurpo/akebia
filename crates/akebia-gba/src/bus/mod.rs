@@ -37,13 +37,18 @@ use crate::ppu::{self, Ppu};
 pub const BIOS_LEN: usize = 16 * 1024;
 pub const EWRAM_LEN: usize = 256 * 1024;
 pub const IWRAM_LEN: usize = 32 * 1024;
-pub const PRAM_LEN: usize = 1024;
-pub const VRAM_LEN: usize = 96 * 1024;
-pub const OAM_LEN: usize = 1024;
+/// The three video memories belong to the picture unit and are re-exported
+/// here because they are still regions of this map like any other.
+pub use crate::ppu::{OAM_LEN, PRAM_LEN, VRAM_LEN};
 /// The most cartridge ROM the address space has room for.
 pub const ROM_MAX: usize = 32 * 1024 * 1024;
 /// Battery-backed save memory, on an 8-bit bus.
 pub const SRAM_LEN: usize = 64 * 1024;
+
+/// The sound level register, which is the only part of the sound hardware
+/// that is here. See [`Memory::sound_bias`].
+const SOUND_BIAS: u32 = 0x0400_0088;
+const SOUND_BIAS_AT_RESET: u16 = 0x0200;
 
 /// The blocks video memory repeats in: 128 KiB, of which it fills 96.
 const VRAM_BLOCK: u32 = 0x2_0000;
@@ -57,11 +62,6 @@ pub struct Memory {
     /// The small, fast one: 32 KiB on a 32-bit bus, on the chip itself. Where
     /// anything that matters for speed goes.
     iwram: Box<[u8; IWRAM_LEN]>,
-    /// Palette memory: 512 colours in 15 bits each.
-    pram: Box<[u8; PRAM_LEN]>,
-    vram: Box<[u8; VRAM_LEN]>,
-    /// 128 sprites' worth of attributes.
-    oam: Box<[u8; OAM_LEN]>,
     /// The cartridge, however much of it there is. Kept at its real length
     /// rather than padded to the 32 MiB the address space allows, because
     /// reading past the end is not reading zeros — see [`Memory::read_bytes`].
@@ -77,6 +77,20 @@ pub struct Memory {
     /// in [`Memory::run_transfers`], because moving them means reaching the
     /// whole map — which is this and not them.
     dma: Dma,
+    /// The one sound register that exists, and the reason it does.
+    ///
+    /// There is no sound here at all, and this changes that not one bit: it
+    /// holds what is written and hands it back. It is here because the BIOS's
+    /// routine for changing the level does so a step at a time, reading the
+    /// register back after each step and stopping when it has reached the
+    /// target — so a register that always read zero was a target never reached,
+    /// and the BIOS span in that loop for ever. It cost one of the test suites
+    /// its entire run.
+    ///
+    /// The rest of the sound registers are still absent, and a register that
+    /// merely remembers is not an implementation of anything. This one is here
+    /// because *reading it back* is the whole of what the BIOS needs.
+    sound_bias: u16,
     cycles: u64,
 }
 
@@ -92,14 +106,14 @@ impl Memory {
             bios: Box::new([0; BIOS_LEN]),
             ewram: Box::new([0; EWRAM_LEN]),
             iwram: Box::new([0; IWRAM_LEN]),
-            pram: Box::new([0; PRAM_LEN]),
-            vram: Box::new([0; VRAM_LEN]),
-            oam: Box::new([0; OAM_LEN]),
             rom: Vec::new(),
             sram: Box::new([0; SRAM_LEN]),
             irq: Interrupts::new(),
             ppu: Ppu::new(),
             dma: Dma::new(),
+            // What the hardware holds after a reset: the level sitting at the
+            // midpoint of its range.
+            sound_bias: SOUND_BIAS_AT_RESET,
             cycles: 0,
         }
     }
@@ -153,6 +167,7 @@ impl Memory {
         match addr & !1 {
             ppu::DISPCNT..=ppu::VCOUNT => self.ppu.read8(addr),
             dma::BASE..=dma::LAST => self.dma.read8(addr),
+            SOUND_BIAS => half(self.sound_bias),
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
@@ -170,6 +185,7 @@ impl Memory {
         match addr & !1 {
             ppu::DISPCNT..=ppu::VCOUNT => self.ppu.write8(addr, value),
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
+            SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
                 self.irq.set_enabled(updated);
@@ -270,9 +286,9 @@ impl Memory {
         match bank {
             Bank::Ewram => &self.ewram[..],
             Bank::Iwram => &self.iwram[..],
-            Bank::Pram => &self.pram[..],
-            Bank::Vram => &self.vram[..],
-            Bank::Oam => &self.oam[..],
+            Bank::Pram => self.ppu.pram(),
+            Bank::Vram => self.ppu.vram(),
+            Bank::Oam => self.ppu.oam(),
             Bank::Sram => &self.sram[..],
         }
     }
@@ -281,9 +297,9 @@ impl Memory {
         match bank {
             Bank::Ewram => &mut self.ewram[..],
             Bank::Iwram => &mut self.iwram[..],
-            Bank::Pram => &mut self.pram[..],
-            Bank::Vram => &mut self.vram[..],
-            Bank::Oam => &mut self.oam[..],
+            Bank::Pram => self.ppu.pram_mut(),
+            Bank::Vram => self.ppu.vram_mut(),
+            Bank::Oam => self.ppu.oam_mut(),
             Bank::Sram => &mut self.sram[..],
         }
     }
@@ -447,14 +463,14 @@ impl Bus for Memory {
             Bank::Oam => {}
             Bank::Pram => {
                 let pair = offset & !1;
-                self.pram[pair] = value;
-                self.pram[pair + 1] = value;
+                self.ppu.pram_mut()[pair] = value;
+                self.ppu.pram_mut()[pair + 1] = value;
             }
             Bank::Vram => {
                 if (offset as u32) < self.ppu.obj_base() {
                     let pair = offset & !1;
-                    self.vram[pair] = value;
-                    self.vram[pair + 1] = value;
+                    self.ppu.vram_mut()[pair] = value;
+                    self.ppu.vram_mut()[pair + 1] = value;
                 }
             }
         }

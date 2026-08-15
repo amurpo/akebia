@@ -4,6 +4,7 @@
 //! cargo run --release -p akebia-gba --example run -- arm.gba
 //! cargo run --release -p akebia-gba --example run -- game.gba --bios gba_bios.bin
 //! cargo run --release -p akebia-gba --example run -- arm.gba --trace 40
+//! cargo run --release -p akebia-gba --example run -- hello.gba --ppm out.ppm
 //! ```
 //!
 //! # Where it starts, and why not at the beginning
@@ -31,8 +32,18 @@
 //! printed: the processor faulted, the ROM settled, or neither happened before
 //! the step limit — which is the only one that means nothing at all.
 //!
-//! There is no BIOS here and no picture, so a ROM that wants either will not
-//! get far. That is expected: this is for the ones that check the processor.
+//! That shape is not the only way a suite finishes. Some run their checks and
+//! then wait for the beam in the BIOS's own loop, which never returns and is
+//! not a branch to itself — so a run that reaches the step limit is not a
+//! failure by itself. The way to tell is to run twice with very different
+//! limits: identical registers and identical video memory mean it is done and
+//! is only waiting.
+//!
+//! # Seeing what it drew
+//!
+//! `--ppm` writes the picture out, which is the only way to check a renderer
+//! and the only way to read a suite that reports on screen — which is how
+//! `jsmolka/gba-tests` reports, in words rather than in a register.
 
 use std::process::ExitCode;
 
@@ -49,21 +60,28 @@ const DEFAULT_STEPS: u64 = 50_000_000;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N]");
+        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--ppm FILE]");
         return ExitCode::FAILURE;
     };
 
     let mut limit = DEFAULT_STEPS;
     let mut trace = 0u64;
     let mut bios = None;
+    let mut ppm = None;
     let mut boot = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--boot" => boot = true,
-            "--bios" => match args.next() {
-                Some(path) => bios = Some(path),
+            "--bios" | "--ppm" => match args.next() {
+                Some(path) => {
+                    if flag == "--bios" {
+                        bios = Some(path);
+                    } else {
+                        ppm = Some(path);
+                    }
+                }
                 None => {
-                    eprintln!("--bios wants a file");
+                    eprintln!("{flag} wants a file");
                     return ExitCode::FAILURE;
                 }
             },
@@ -148,6 +166,16 @@ fn main() -> ExitCode {
     let outcome = run(&mut cpu, &mut mem, limit, trace);
     report(&cpu, &mem, &outcome);
 
+    if let Some(path) = &ppm {
+        let lines = draw_one_more_frame(&mut cpu, &mut mem);
+        println!("\n  drew a whole frame in {lines} further steps");
+        if let Err(why) = write_ppm(path, mem.ppu().frame()) {
+            eprintln!("{path}: {why}");
+            return ExitCode::FAILURE;
+        }
+        println!("\n  wrote {path}");
+    }
+
     match outcome {
         Outcome::Settled { .. } => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
@@ -191,6 +219,60 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
         }
     }
     Outcome::RanOn
+}
+
+/// Keeps the machine running until it has swept one whole frame, and says how
+/// many steps that took.
+///
+/// # Why a capture needs this
+///
+/// Because a line is drawn as the beam passes it and is never revisited, so the
+/// picture at any moment is made of whatever each line's registers said at
+/// different times. A ROM that fills video memory and then stops has been
+/// drawing blank lines the entire time it was working: every one of the 160 was
+/// swept before the contents arrived, and capturing there gives an empty screen
+/// that looks exactly like a renderer that does not work.
+///
+/// This is not a fudge to make the picture look better. It is the difference
+/// between photographing the screen while a game is still loading and
+/// photographing it afterwards.
+fn draw_one_more_frame(cpu: &mut Cpu, mem: &mut Memory) -> u64 {
+    // Two boundaries and not one: starting mid-frame, the first only finishes
+    // the frame that was already partly swept with the old contents.
+    let until = mem.ppu().frames() + 2;
+    let mut steps = 0;
+    while mem.ppu().frames() < until {
+        if cpu.step(mem).is_err() {
+            break;
+        }
+        steps += 1;
+    }
+    steps
+}
+
+/// Writes the picture out as an image, which is the only way to check a
+/// renderer.
+///
+/// # Turning five bits into eight
+///
+/// The top three bits of the result are the bottom three of the source rather
+/// than zeros. Shifting alone would make the brightest a channel can be 248
+/// instead of 255, so nothing would ever be quite white and every picture would
+/// come out slightly dark — a difference small enough to look like a bad
+/// palette and never like an arithmetic mistake.
+fn write_ppm(path: &str, frame: &[u16]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let width = akebia_gba::SCREEN_WIDTH;
+    let mut out = Vec::with_capacity(frame.len() * 3 + 32);
+    write!(out, "P6\n{width} {}\n255\n", akebia_gba::SCREEN_HEIGHT)?;
+    for &colour in frame {
+        for channel in 0..3 {
+            let five = (colour >> (channel * 5)) & 0x1F;
+            out.push(((five << 3) | (five >> 2)) as u8);
+        }
+    }
+    std::fs::write(path, out)
 }
 
 fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {

@@ -47,8 +47,20 @@
 //! writing in a number that was measured on someone else's hardware would make
 //! this look more exact than it is.
 
+pub mod render;
+
 use crate::interrupts::{Interrupts, Source};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
+
+/// Palette memory: 512 colours in 15 bits each, the first 256 for backgrounds
+/// and the rest for sprites.
+pub const PRAM_LEN: usize = 1024;
+pub const VRAM_LEN: usize = 96 * 1024;
+/// 128 sprites' worth of attributes.
+pub const OAM_LEN: usize = 1024;
+
+/// Pixels in a picture.
+pub const PIXELS: usize = SCREEN_WIDTH * SCREEN_HEIGHT;
 
 /// A dot is four cycles of the master clock.
 const DOT_CYCLES: u32 = 4;
@@ -60,7 +72,7 @@ const DOTS_PER_LINE: u32 = 308;
 const HBLANK_AT: u32 = SCREEN_WIDTH as u32 * DOT_CYCLES;
 
 /// A whole line, in cycles.
-const LINE_CYCLES: u32 = DOTS_PER_LINE * DOT_CYCLES;
+pub const LINE_CYCLES: u32 = DOTS_PER_LINE * DOT_CYCLES;
 
 /// Lines in a frame: the 160 that are drawn, and 68 more that are not.
 pub const LINES_PER_FRAME: u16 = 228;
@@ -145,6 +157,15 @@ pub struct Ppu {
     /// it is for whatever is driving the emulator to know when a picture is
     /// finished.
     frames: u64,
+    /// The three memories the picture is made of. They live here rather than in
+    /// the memory map because this is the only thing that reads them, and the
+    /// map reaches them the same way it reaches the registers: by asking.
+    pram: Box<[u8; PRAM_LEN]>,
+    vram: Box<[u8; VRAM_LEN]>,
+    oam: Box<[u8; OAM_LEN]>,
+    /// The picture, a 15-bit colour per pixel, filled a line at a time as the
+    /// beam passes.
+    frame: Box<[u16; PIXELS]>,
 }
 
 impl Default for Ppu {
@@ -155,7 +176,53 @@ impl Default for Ppu {
 
 impl Ppu {
     pub fn new() -> Self {
-        Self { dispcnt: 0, green_swap: 0, dispstat: 0, vcount: 0, dot: 0, frames: 0 }
+        Self {
+            dispcnt: 0,
+            green_swap: 0,
+            dispstat: 0,
+            vcount: 0,
+            dot: 0,
+            frames: 0,
+            pram: Box::new([0; PRAM_LEN]),
+            vram: Box::new([0; VRAM_LEN]),
+            oam: Box::new([0; OAM_LEN]),
+            frame: Box::new([0; PIXELS]),
+        }
+    }
+
+    pub fn pram(&self) -> &[u8] {
+        &self.pram[..]
+    }
+
+    pub fn pram_mut(&mut self) -> &mut [u8] {
+        &mut self.pram[..]
+    }
+
+    pub fn vram(&self) -> &[u8] {
+        &self.vram[..]
+    }
+
+    pub fn vram_mut(&mut self) -> &mut [u8] {
+        &mut self.vram[..]
+    }
+
+    pub fn oam(&self) -> &[u8] {
+        &self.oam[..]
+    }
+
+    pub fn oam_mut(&mut self) -> &mut [u8] {
+        &mut self.oam[..]
+    }
+
+    /// The picture as it stands, a 15-bit colour per pixel in rows of
+    /// [`SCREEN_WIDTH`].
+    ///
+    /// Whatever is driving the emulator reads it when a frame is finished. It
+    /// is not double-buffered: reading it mid-frame gives the lines drawn so
+    /// far and the previous frame's below them, which is what the hardware
+    /// would be sending as well.
+    pub fn frame(&self) -> &[u16] {
+        &self.frame[..]
     }
 
     /// Moves the beam on by that many cycles, raising whatever it passes and
@@ -175,6 +242,13 @@ impl Ppu {
             left -= step;
 
             if self.dot == HBLANK_AT {
+                // The line is drawn here, where the drawing of it ends, out of
+                // the registers as they stand at this moment. See
+                // [`render`](crate::ppu::render).
+                if self.vcount < VBLANK_AT {
+                    self.draw_line(self.vcount);
+                }
+
                 // The interrupt goes out in every line, not only the drawn
                 // ones: the beam keeps sweeping below the screen and a game can
                 // time on it there. What is *reported* is narrower — see

@@ -22,18 +22,18 @@
 //! banking by mode, the whole memory map, and interrupts. A cartridge runs, and
 //! a real BIOS can be handed in and boots one.
 //!
-//! The picture unit sweeps but does not draw. That order is deliberate — the
-//! sweep is what gives a game a sense of time, and without it a cartridge stops
-//! at the first thing it waits for, which is usually the second thing it does.
-//! See [`ppu`].
+//! The picture unit sweeps, and draws the three bitmap modes. The sweep came
+//! first on purpose — it is what gives a game a sense of time, and without it a
+//! cartridge stops at the first thing it waits for. The tiled modes, which is
+//! what games actually draw with, are not written. See [`ppu`].
 //!
 //! The four memory movers work, which is what carries a game's own code and
 //! graphics from the cartridge into the memory it runs them out of. See
 //! [`dma`].
 //!
-//! Nothing else exists yet: no sound, no timers, and no timing worth the name —
-//! a step of the processor charges one cycle, which is a floor and not a
-//! measurement.
+//! Nothing else exists yet: no sound bar the one register the BIOS insists on
+//! reading back, no timers, and no timing worth the name — a step of the
+//! processor charges one cycle, which is a floor and not a measurement.
 
 pub mod bus;
 pub mod cpu;
