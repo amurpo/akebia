@@ -27,12 +27,17 @@
 //! at the first thing it waits for, which is usually the second thing it does.
 //! See [`ppu`].
 //!
-//! Nothing else exists yet: no sound, no direct memory access, no timers, and
-//! no timing worth the name — a step of the processor charges one cycle, which
-//! is a floor and not a measurement.
+//! The four memory movers work, which is what carries a game's own code and
+//! graphics from the cartridge into the memory it runs them out of. See
+//! [`dma`].
+//!
+//! Nothing else exists yet: no sound, no timers, and no timing worth the name —
+//! a step of the processor charges one cycle, which is a floor and not a
+//! measurement.
 
 pub mod bus;
 pub mod cpu;
+pub mod dma;
 pub mod interrupts;
 pub mod ppu;
 

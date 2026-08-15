@@ -30,6 +30,7 @@
 //! purpose. That wants a pipeline to ask, and there is not one yet.
 
 use crate::cpu::Bus;
+use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
 use crate::ppu::{self, Ppu};
 
@@ -72,6 +73,10 @@ pub struct Memory {
     /// The picture unit, which lives here because that is where a game reaches
     /// it: its registers are four addresses in this map like any other.
     ppu: Ppu,
+    /// The four memory movers. They keep their settings here and the bytes move
+    /// in [`Memory::run_transfers`], because moving them means reaching the
+    /// whole map — which is this and not them.
+    dma: Dma,
     cycles: u64,
 }
 
@@ -94,6 +99,7 @@ impl Memory {
             sram: Box::new([0; SRAM_LEN]),
             irq: Interrupts::new(),
             ppu: Ppu::new(),
+            dma: Dma::new(),
             cycles: 0,
         }
     }
@@ -146,6 +152,7 @@ impl Memory {
         let half = |value: u16| (value >> ((addr & 1) * 8)) as u8;
         match addr & !1 {
             ppu::DISPCNT..=ppu::VCOUNT => self.ppu.read8(addr),
+            dma::BASE..=dma::LAST => self.dma.read8(addr),
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
@@ -162,6 +169,7 @@ impl Memory {
         };
         match addr & !1 {
             ppu::DISPCNT..=ppu::VCOUNT => self.ppu.write8(addr, value),
+            dma::BASE..=dma::LAST => self.dma.write8(addr, value),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
                 self.irq.set_enabled(updated);
@@ -185,6 +193,35 @@ impl Memory {
             // pretended away.
             0x0400_0300 if addr & 1 == 1 => self.irq.halt(),
             _ => {}
+        }
+    }
+
+    /// Runs whatever the memory movers have been asked to move.
+    ///
+    /// # Why the bytes move here and not in [`crate::dma`]
+    ///
+    /// Because a transfer reaches the whole address space, and the whole
+    /// address space is this. The channels keep their settings and decide when
+    /// and how far each address steps; what they hand over is a plain value
+    /// describing the work, so that nothing borrows a channel while the copy
+    /// runs through a map the channels are part of.
+    ///
+    /// A transfer goes through the same reads and writes the processor uses,
+    /// which is not a shortcut: it is what makes a channel writing to palette
+    /// memory behave like palette memory, and one reading past the end of a
+    /// cartridge read back the floating pattern rather than zeros.
+    fn run_transfers(&mut self) {
+        while let Some(index) = self.dma.next_ready() {
+            let job = self.dma.job(index);
+            let mut source = job.source;
+            let mut dest = job.dest;
+            for _ in 0..job.units {
+                let value = self.read_bytes(source & !(job.width - 1), job.width as usize);
+                self.write_bytes(dest & !(job.width - 1), value, job.width as usize);
+                source = source.wrapping_add(job.source_step);
+                dest = dest.wrapping_add(job.dest_step);
+            }
+            self.dma.finished(index, source, dest, &mut self.irq);
         }
     }
 
@@ -440,7 +477,9 @@ impl Bus for Memory {
     /// first thing it waits for, and would look like a bug in the game.
     fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
-        self.ppu.tick(cycles, &mut self.irq);
+        let crossed = self.ppu.tick(cycles, &mut self.irq);
+        self.dma.at_blanking(crossed);
+        self.run_transfers();
     }
 
     fn interrupts(&self) -> &Interrupts {
@@ -748,6 +787,69 @@ mod tests {
         mem.tick(crate::ppu::FRAME_CYCLES / 2);
         assert_ne!(mem.read16(0x0400_0006), 0, "and the clock moves it");
         assert_eq!(mem.read16(0x0400_0006), mem.ppu().vcount());
+    }
+
+    /// The whole point of the movers: bytes that were in one memory are in
+    /// another afterwards, without the processor having touched them.
+    #[test]
+    fn a_mover_carries_bytes_from_one_memory_to_another() {
+        let mut mem = Memory::new();
+        for index in 0..8u32 {
+            mem.write32(EWRAM + index * 4, 0x1000_0000 + index);
+        }
+
+        // Channel 3, eight words, external RAM to video memory, go now.
+        mem.write32(0x0400_00D4, EWRAM);
+        mem.write32(0x0400_00D8, VRAM);
+        mem.write16(0x0400_00DC, 8);
+        mem.write16(0x0400_00DE, 0x8400);
+
+        assert_eq!(mem.read32(VRAM), 0, "nothing has moved yet");
+        mem.tick(1);
+
+        for index in 0..8u32 {
+            assert_eq!(mem.read32(VRAM + index * 4), 0x1000_0000 + index, "word {index}");
+        }
+        assert_eq!(mem.read16(0x0400_00DE) & 0x8000, 0, "and the channel switched itself off");
+    }
+
+    /// A mover waiting for the bottom of the frame runs when the beam gets
+    /// there and not before, which is the arrangement every game uses to change
+    /// what is on screen without tearing it.
+    #[test]
+    fn a_mover_waiting_for_the_gap_runs_when_the_beam_reaches_it() {
+        let mut mem = Memory::new();
+        mem.write32(EWRAM, 0xABCD_1234);
+
+        mem.write32(0x0400_00D4, EWRAM);
+        mem.write32(0x0400_00D8, PRAM);
+        mem.write16(0x0400_00DC, 1);
+        // Enabled, one word, when the beam reaches the bottom.
+        mem.write16(0x0400_00DE, 0x8400 | 0x1000);
+
+        mem.tick(crate::ppu::FRAME_CYCLES / 4);
+        assert_eq!(mem.read32(PRAM), 0, "the beam is still on the screen");
+
+        mem.tick(crate::ppu::FRAME_CYCLES);
+        assert_eq!(mem.read32(PRAM), 0xABCD_1234, "and now it has been past the bottom");
+    }
+
+    /// A transfer goes through the same map the processor does, so a memory
+    /// with a rule of its own still has it. Save memory takes the low byte of
+    /// whatever is written and no more, mover or not.
+    #[test]
+    fn a_transfer_obeys_the_memory_it_lands_in() {
+        let mut mem = Memory::new();
+        mem.write32(EWRAM, 0x1122_3344);
+
+        mem.write32(0x0400_00D4, EWRAM);
+        mem.write32(0x0400_00D8, 0x0E00_0000);
+        mem.write16(0x0400_00DC, 1);
+        mem.write16(0x0400_00DE, 0x8400);
+        mem.tick(1);
+
+        assert_eq!(mem.read8(0x0E00_0000), 0x44, "the low byte, as with any other write");
+        assert_eq!(mem.read8(0x0E00_0001), 0, "and nothing beside it");
     }
 
     /// The picture unit raises through the same controller everything else

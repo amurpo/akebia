@@ -108,6 +108,25 @@ const DISPSTAT_WRITABLE: u16 = VBLANK_IRQ | HBLANK_IRQ | VCOUNT_IRQ | 0xFF00;
 const OBJ_BASE_TILED: u32 = 0x1_0000;
 const OBJ_BASE_BITMAP: u32 = 0x1_4000;
 
+/// Which blanking periods a sweep began.
+///
+/// It exists for the memory mover, which does its work in the gaps because
+/// that is when video memory is free — so it has to be told when a gap starts
+/// and cannot be left to watch the line counter and guess.
+///
+/// The report at the end of a line covers the drawn lines only, which is
+/// narrower than the interrupt of the same name. Below the screen there is
+/// nothing being drawn to interleave with, and hardware does not start a
+/// transfer there; a mover that ran anyway would move 68 times more than it
+/// was asked to, every frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Crossed {
+    /// The beam reached the bottom of the screen.
+    pub vblank: bool,
+    /// The beam reached the end of a line that was being drawn.
+    pub hblank: bool,
+}
+
 /// The picture unit.
 pub struct Ppu {
     dispcnt: u16,
@@ -139,11 +158,13 @@ impl Ppu {
         Self { dispcnt: 0, green_swap: 0, dispstat: 0, vcount: 0, dot: 0, frames: 0 }
     }
 
-    /// Moves the beam on by that many cycles, raising whatever it passes.
+    /// Moves the beam on by that many cycles, raising whatever it passes and
+    /// reporting which blanking periods began.
     ///
     /// It steps from one boundary to the next rather than a cycle at a time, so
     /// handing it a whole frame's worth costs the same as handing it a line's.
-    pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) {
+    pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) -> Crossed {
+        let mut crossed = Crossed::default();
         let mut left = cycles;
         while left > 0 {
             // The only two places anything happens: where the drawn part of the
@@ -154,26 +175,32 @@ impl Ppu {
             left -= step;
 
             if self.dot == HBLANK_AT {
-                // In every line, not only the drawn ones. The beam keeps
-                // sweeping below the screen and a game can time on it there.
+                // The interrupt goes out in every line, not only the drawn
+                // ones: the beam keeps sweeping below the screen and a game can
+                // time on it there. What is *reported* is narrower — see
+                // [`Crossed`].
                 if self.dispstat & HBLANK_IRQ != 0 {
                     irq.raise(Source::HBlank);
                 }
+                crossed.hblank |= self.vcount < VBLANK_AT;
             } else if self.dot == LINE_CYCLES {
                 self.dot = 0;
-                self.finish_line(irq);
+                crossed.vblank |= self.finish_line(irq);
             }
         }
+        crossed
     }
 
-    fn finish_line(&mut self, irq: &mut Interrupts) {
+    /// Ends the line, and says whether that was the one the screen ends on.
+    fn finish_line(&mut self, irq: &mut Interrupts) -> bool {
         self.vcount += 1;
         if self.vcount == LINES_PER_FRAME {
             self.vcount = 0;
             self.frames += 1;
         }
 
-        if self.vcount == VBLANK_AT && self.dispstat & VBLANK_IRQ != 0 {
+        let bottom = self.vcount == VBLANK_AT;
+        if bottom && self.dispstat & VBLANK_IRQ != 0 {
             irq.raise(Source::VBlank);
         }
         // The comparison happens as the line changes, which is why a game can
@@ -182,6 +209,7 @@ impl Ppu {
         if self.vcount == self.match_line() && self.dispstat & VCOUNT_IRQ != 0 {
             irq.raise(Source::VCount);
         }
+        bottom
     }
 
     /// One byte of the four registers.
