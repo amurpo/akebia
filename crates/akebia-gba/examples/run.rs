@@ -90,7 +90,11 @@ fn main() -> ExitCode {
 
 enum Outcome {
     /// The processor could not carry on.
-    Faulted(Fault),
+    ///
+    /// The step count comes with it because it is the useful half: a fault at
+    /// the first instruction and a fault at the six-hundredth mean very
+    /// different things about what is working.
+    Faulted(Fault, u64),
     /// The ROM branched to itself, which is how a test suite says it is done.
     Settled { at: u32, steps: u64 },
     /// Neither happened in time, which tells us nothing.
@@ -106,7 +110,7 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
         }
 
         if let Err(fault) = cpu.step(mem) {
-            return Outcome::Faulted(fault);
+            return Outcome::Faulted(fault, step);
         }
 
         // A branch to its own address. Nothing else can move the counter back
@@ -121,7 +125,7 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
 fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
     println!();
     match outcome {
-        Outcome::Faulted(fault) => println!("stopped: {fault}"),
+        Outcome::Faulted(fault, steps) => println!("stopped after {steps} steps: {fault}"),
         Outcome::Settled { at, steps } => {
             println!("settled at {at:08X} after {steps} steps");
             println!("  the instruction there: {:08X}", mem.peek32(*at));
