@@ -23,10 +23,10 @@
 //!
 //! # What is not here yet
 //!
-//! The I/O registers, the cartridge and its save memory. Reads of those regions
-//! come back zero, and the real answer is not zero — unmapped addresses on this
-//! machine return whatever the processor last fetched, which some games read on
-//! purpose. That wants a pipeline to ask, and there is not one yet.
+//! The I/O registers. Reads of that region come back zero, and the real answer
+//! is not zero — an unmapped address on this machine returns whatever the
+//! processor last fetched, which some games read on purpose. That wants a
+//! pipeline to ask, and there is not one yet.
 
 use crate::cpu::Bus;
 
@@ -36,6 +36,10 @@ pub const IWRAM_LEN: usize = 32 * 1024;
 pub const PRAM_LEN: usize = 1024;
 pub const VRAM_LEN: usize = 96 * 1024;
 pub const OAM_LEN: usize = 1024;
+/// The most cartridge ROM the address space has room for.
+pub const ROM_MAX: usize = 32 * 1024 * 1024;
+/// Battery-backed save memory, on an 8-bit bus.
+pub const SRAM_LEN: usize = 64 * 1024;
 
 /// Where video memory stops being backgrounds and starts being sprites, in
 /// tiled modes. In the bitmap modes it is `0x1_4000` instead, and only the
@@ -59,6 +63,12 @@ pub struct Memory {
     vram: Box<[u8; VRAM_LEN]>,
     /// 128 sprites' worth of attributes.
     oam: Box<[u8; OAM_LEN]>,
+    /// The cartridge, however much of it there is. Kept at its real length
+    /// rather than padded to the 32 MiB the address space allows, because
+    /// reading past the end is not reading zeros — see [`Memory::read_bytes`].
+    rom: Vec<u8>,
+    /// The cartridge's save memory.
+    sram: Box<[u8; SRAM_LEN]>,
     /// Where sprites begin in video memory, which decides whether a byte write
     /// lands or is dropped. See [`Memory::set_obj_base`].
     obj_base: u32,
@@ -80,6 +90,8 @@ impl Memory {
             pram: Box::new([0; PRAM_LEN]),
             vram: Box::new([0; VRAM_LEN]),
             oam: Box::new([0; OAM_LEN]),
+            rom: Vec::new(),
+            sram: Box::new([0; SRAM_LEN]),
             obj_base: OBJ_BASE_TILED,
             cycles: 0,
         }
@@ -90,6 +102,17 @@ impl Memory {
     pub fn load_bios(&mut self, image: &[u8]) {
         let len = image.len().min(BIOS_LEN);
         self.bios[..len].copy_from_slice(&image[..len]);
+    }
+
+    /// Puts a cartridge in. Anything past the 32 MiB the address space allows
+    /// is not reachable and is dropped.
+    pub fn load_rom(&mut self, image: &[u8]) {
+        self.rom.clear();
+        self.rom.extend_from_slice(&image[..image.len().min(ROM_MAX)]);
+    }
+
+    pub fn rom_len(&self) -> usize {
+        self.rom.len()
     }
 
     /// Tells the memory where sprites begin in video memory, which the picture
@@ -120,6 +143,25 @@ impl Memory {
             0x05 => Where::Ram(Bank::Pram, addr as usize & (PRAM_LEN - 1)),
             0x06 => Where::Ram(Bank::Vram, vram_offset(addr)),
             0x07 => Where::Ram(Bank::Oam, addr as usize & (OAM_LEN - 1)),
+            // The cartridge appears three times over. It is one chip and one
+            // set of contents; what differs between the three windows is how
+            // long an access takes, which a game chooses by reading its code
+            // through one and its data through another. Nothing here can tell
+            // them apart yet because nothing here counts cycles.
+            0x08..=0x0D => {
+                let offset = (addr as usize) & (0x0200_0000 - 1);
+                if offset < self.rom.len() {
+                    Where::Rom(&self.rom[..], offset)
+                } else {
+                    // Past the end of the cartridge — or with none in at all —
+                    // the bus is left floating and settles into a pattern made
+                    // of the address itself. Some games read it on purpose and
+                    // more read it by accident, so zeros here would be a
+                    // different machine.
+                    Where::Floating
+                }
+            }
+            0x0E | 0x0F => Where::Ram(Bank::Sram, addr as usize & (SRAM_LEN - 1)),
             _ => Where::Nowhere,
         }
     }
@@ -131,6 +173,7 @@ impl Memory {
             Bank::Pram => &self.pram[..],
             Bank::Vram => &self.vram[..],
             Bank::Oam => &self.oam[..],
+            Bank::Sram => &self.sram[..],
         }
     }
 
@@ -141,6 +184,7 @@ impl Memory {
             Bank::Pram => &mut self.pram[..],
             Bank::Vram => &mut self.vram[..],
             Bank::Oam => &mut self.oam[..],
+            Bank::Sram => &mut self.sram[..],
         }
     }
 
@@ -149,15 +193,30 @@ impl Memory {
     fn writable(&mut self, addr: u32) -> Option<(Bank, usize)> {
         match self.locate(addr) {
             Where::Ram(bank, offset) => Some((bank, offset)),
-            // The BIOS is read-only and unmapped space is not there at all.
-            Where::Rom(..) | Where::Nowhere => None,
+            // The BIOS and the cartridge are read-only, and unmapped space is
+            // not there at all.
+            Where::Rom(..) | Where::Floating | Where::Nowhere => None,
         }
     }
 
     fn read_bytes(&self, addr: u32, len: usize) -> u32 {
         let (bytes, offset) = match self.locate(addr) {
             Where::Rom(bytes, offset) => (bytes, offset),
+            Where::Ram(Bank::Sram, offset) => {
+                // Save memory sits on an eight-bit bus, so a wider read does
+                // not fetch more: it fetches the one byte and hands back copies
+                // of it. A game that reads its save file a word at a time gets
+                // four of the first byte, which is what the hardware gives and
+                // not what a plain array would.
+                let byte = u32::from(self.sram[offset]);
+                return match len {
+                    1 => byte,
+                    2 => byte * 0x0101,
+                    _ => byte * 0x0101_0101,
+                };
+            }
             Where::Ram(bank, offset) => (self.bank(bank), offset),
+            Where::Floating => return floating(addr, len),
             Where::Nowhere => return 0,
         };
         let mut value = 0u32;
@@ -171,6 +230,12 @@ impl Memory {
         let Some((bank, offset)) = self.writable(addr) else {
             return;
         };
+        if bank == Bank::Sram {
+            // Eight bits wide going out as well: only the bottom byte lands,
+            // wherever in the word it was written from.
+            self.sram[offset] = value as u8;
+            return;
+        }
         let bytes = self.bank_mut(bank);
         for index in 0..len {
             bytes[offset + index] = (value >> (index * 8)) as u8;
@@ -187,14 +252,33 @@ enum Bank {
     Pram,
     Vram,
     Oam,
+    Sram,
 }
 
 enum Where<'a> {
     /// Readable and not writable.
     Rom(&'a [u8], usize),
     Ram(Bank, usize),
+    /// Cartridge space with no cartridge behind it, which reads as a pattern
+    /// made of the address rather than as nothing.
+    Floating,
     /// Not backed by anything.
     Nowhere,
+}
+
+/// What cartridge space reads as when there is no cartridge behind it.
+///
+/// The bus is left floating and settles into a pattern made of the address: each
+/// halfword reads back as its own index. It is not a fiction — it is what the
+/// hardware measurably does, and a machine that answered zero here would be a
+/// different one.
+fn floating(addr: u32, len: usize) -> u32 {
+    let half = |at: u32| (at >> 1) & 0xFFFF;
+    match len {
+        1 => (half(addr) >> ((addr & 1) * 8)) & 0xFF,
+        2 => half(addr),
+        _ => half(addr) | (half(addr.wrapping_add(2)) << 16),
+    }
 }
 
 /// Video memory's fold: 96 KiB of storage in blocks of 128, the last quarter of
@@ -237,7 +321,9 @@ impl Bus for Memory {
             return;
         };
         match bank {
-            Bank::Ewram | Bank::Iwram => self.bank_mut(bank)[offset] = value,
+            // Save memory is the one region a byte is the *natural* width for:
+            // its bus is eight bits wide and a byte is all it can ever take.
+            Bank::Ewram | Bank::Iwram | Bank::Sram => self.bank_mut(bank)[offset] = value,
             Bank::Oam => {}
             Bank::Pram => {
                 let pair = offset & !1;
@@ -460,14 +546,65 @@ mod tests {
     /// Reads of what is not there come back zero, which is *not* what the
     /// hardware does - it gives back whatever was last fetched. Pinned here so
     /// that when a pipeline exists to ask, this test is what changes.
+    ///
+    /// The cartridge used to be on this list and has come off it, which is the
+    /// list working as intended.
     #[test]
     fn what_is_not_mapped_yet_reads_as_zero() {
         let mut mem = Memory::new();
-        for addr in [0x0400_0000, 0x0800_0000, 0x0E00_0000, 0x1000_0000, BIOS_LEN as u32] {
+        for addr in [0x0400_0000, 0x1000_0000, BIOS_LEN as u32] {
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X}");
             mem.write32(addr, 0xFFFF_FFFF);
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X} after a write");
         }
+    }
+
+    #[test]
+    fn a_cartridge_appears_three_times_over_and_cannot_be_written() {
+        let mut mem = Memory::new();
+        mem.load_rom(&[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(mem.rom_len(), 4);
+
+        for window in [0x0800_0000u32, 0x0A00_0000, 0x0C00_0000] {
+            assert_eq!(mem.read32(window), 0x4433_2211, "window 0x{window:08X}");
+        }
+
+        mem.write32(0x0800_0000, 0xFFFF_FFFF);
+        assert_eq!(mem.read32(0x0800_0000), 0x4433_2211, "a write to it is dropped");
+    }
+
+    /// Past the end of a cartridge - or with none in at all - the bus is left
+    /// floating and settles into a pattern made of the address, each halfword
+    /// reading back as its own index. Zeros here would be a different machine.
+    #[test]
+    fn cartridge_space_with_nothing_behind_it_reads_the_address_back() {
+        let mut mem = Memory::new();
+        assert_eq!(mem.read16(0x0800_0000), 0x0000);
+        assert_eq!(mem.read16(0x0800_0002), 0x0001, "the next halfword, the next index");
+        assert_eq!(mem.read16(0x0800_0008), 0x0004);
+        assert_eq!(mem.read32(0x0800_0000), 0x0001_0000, "a word is two of them");
+
+        // And it picks up immediately past a cartridge that is there.
+        mem.load_rom(&[0xAA; 4]);
+        assert_eq!(mem.read32(0x0800_0000), 0xAAAA_AAAA, "the cartridge");
+        assert_eq!(mem.read16(0x0800_0004), 0x0002, "and the float just past it");
+    }
+
+    /// Save memory is eight bits wide, so a wider read does not fetch more: it
+    /// fetches the one byte and hands back copies. A game reading its save a
+    /// word at a time gets four of the first byte.
+    #[test]
+    fn save_memory_answers_every_width_with_one_byte() {
+        let mut mem = Memory::new();
+        mem.write8(0x0E00_0000, 0x5A);
+        assert_eq!(mem.read8(0x0E00_0000), 0x5A);
+        assert_eq!(mem.read16(0x0E00_0000), 0x5A5A, "a halfword is the byte twice");
+        assert_eq!(mem.read32(0x0E00_0000), 0x5A5A_5A5A, "and a word is it four times");
+
+        // Going out it is the same: only the bottom byte lands.
+        mem.write32(0x0E00_0010, 0x1234_5678);
+        assert_eq!(mem.read8(0x0E00_0010), 0x78);
+        assert_eq!(mem.read8(0x0E00_0011), 0, "and the neighbour was not touched");
     }
 
     #[test]
