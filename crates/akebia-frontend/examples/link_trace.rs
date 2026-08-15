@@ -214,7 +214,6 @@ fn main() {
 
     if let Some(wire) = over_the_wire {
         eprintln!("linked to {}", wire.peer);
-        a.set_link_connected(true);
         let mut remote = Remote::new(wire, &mut a, role);
         return over_a_socket(a, &mut remote, script, limit, every, &ppm);
     }

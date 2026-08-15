@@ -85,6 +85,17 @@ impl Remote {
     /// The console's clock is asked for here and not later: the protocol counts
     /// from the moment the two meet, so this is the moment.
     pub fn new(wire: Wire, gb: &mut GameBoy, role: Role) -> Self {
+        // The cable is plugged in *here*, and not left to whoever built the
+        // `Remote`, because both frontends forgot and there was nothing to tell
+        // them: an unplugged console finishes its transfers on its own with the
+        // 0xFF of an empty line —see `Serial::tick`— so it never holds a byte
+        // out, `link_pending` never answers, and not one `Master` packet ever
+        // reaches the socket. The two ends greet each other, announce
+        // themselves, run at full speed, and trade nothing at all. From inside
+        // the game that is a partner who never replies, which is the message it
+        // puts on the screen. This is the one call that makes a link a link, so
+        // it belongs at the one place a link is made.
+        gb.set_link_connected(true);
         // Two copies of one saved game, playing the same moves, decide to take
         // the clock on the very same frame and neither is left listening. On a
         // table that cannot happen; here it has to be arranged, and the end that
@@ -244,7 +255,6 @@ mod tests {
 
         let listening = std::thread::spawn(move || {
             let mut gb = GameBoy::new(master).unwrap();
-            gb.set_link_connected(true);
             let wire = crate::net::Wire::accept_from(&listener).unwrap();
             let mut remote = Remote::new(wire, &mut gb, Role::Waited);
             for _ in 0..600 {
@@ -257,7 +267,6 @@ mod tests {
 
         let calling = std::thread::spawn(move || {
             let mut gb = GameBoy::new(slave).unwrap();
-            gb.set_link_connected(true);
             let wire = crate::net::Wire::dial(&format!("127.0.0.1:{port}")).unwrap();
             let mut remote = Remote::new(wire, &mut gb, Role::Dialled);
             for _ in 0..600 {
@@ -299,7 +308,6 @@ mod tests {
         let mute = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
 
         let mut gb = GameBoy::new(sender(0x42, 0x81)).unwrap();
-        gb.set_link_connected(true);
         let wire = crate::net::Wire::accept_from(&listener).unwrap();
         let mut remote = Remote::new(wire, &mut gb, Role::Waited);
 
@@ -307,5 +315,24 @@ mod tests {
         assert_eq!(gb.t_cycles(), 0, "not one instruction without a greeting");
         assert!(!remote.is_ready());
         drop(mute);
+    }
+
+    /// The one line a frontend cannot be trusted to remember, and both of them
+    /// forgot: without it the console answers its own transfers with an empty
+    /// line and the socket carries no bytes at all. Nothing above this notices —
+    /// the link greets, paces and keeps running— so it is checked here.
+    #[test]
+    fn making_a_link_plugs_the_cable_in() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        let mut gb = GameBoy::new(sender(0x42, 0x81)).unwrap();
+        assert!(!gb.link_connected(), "a console starts with nothing on the port");
+
+        let wire = crate::net::Wire::accept_from(&listener).unwrap();
+        let _remote = Remote::new(wire, &mut gb, Role::Waited);
+        assert!(gb.link_connected(), "the console has to know there is a cable in it");
+        drop(peer);
     }
 }
