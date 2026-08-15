@@ -80,11 +80,122 @@ pub fn execute(
             single_transfer(regs, bus, addr, instruction);
             Ok(())
         }
+        0b100 => {
+            block_transfer(regs, bus, addr, instruction);
+            Ok(())
+        }
         0b101 => {
             branch(regs, addr, instruction);
             Ok(())
         }
         _ => Err(Fault::Undefined { addr, instruction }),
+    }
+}
+
+/// `LDM` and `STM`: up to sixteen registers in one instruction.
+///
+/// # The rule that makes the four modes one piece of code
+///
+/// **Registers always go in ascending order at ascending addresses.** The
+/// lowest-numbered register is always at the lowest address, whichever
+/// direction the instruction is written in. The direction bits do not reverse
+/// the order — they only decide *where the block starts*.
+///
+/// That is what lets a stack be pushed with one mode and popped with its
+/// opposite and come back in the right order, and it is why the code below
+/// works out the bottom of the block first and then walks upward, rather than
+/// walking whichever way the instruction seems to say.
+fn block_transfer(regs: &mut Registers, bus: &mut impl Bus, addr: u32, instruction: u32) {
+    let rn = ((instruction >> 16) & 0xF) as usize;
+    let load = instruction & (1 << 20) != 0;
+    let up = instruction & (1 << 23) != 0;
+    let pre = instruction & (1 << 24) != 0;
+    let base = regs.get(rn);
+
+    // An empty list is not a no-op. This processor transfers `R15` alone and
+    // moves the base by the full sixteen registers' worth, which is what a
+    // compiler never emits and a test ROM always asks about.
+    let listed = instruction & 0xFFFF;
+    let (list, count) = if listed == 0 { (0x8000, 16) } else { (listed, listed.count_ones()) };
+    let span = count * 4;
+
+    // The bottom of the block, from which everything is counted upward.
+    let bottom = if up {
+        if pre { base.wrapping_add(4) } else { base }
+    } else if pre {
+        base.wrapping_sub(span)
+    } else {
+        base.wrapping_sub(span).wrapping_add(4)
+    };
+    let moved = if up { base.wrapping_add(span) } else { base.wrapping_sub(span) };
+
+    // The `S` bit asks for the registers a *user-mode* program would see, so
+    // that a handler can save the registers of what it interrupted rather than
+    // its own. The exception is a load that includes `R15`, where `S` means
+    // something else entirely — see below — and the banked registers are the
+    // ones wanted.
+    let restores_status = load && instruction & (1 << 22) != 0 && list & 0x8000 != 0;
+    let user_bank = instruction & (1 << 22) != 0 && !restores_status;
+    let writes_back = instruction & (1 << 21) != 0;
+    let mode = regs.mode();
+    if user_bank {
+        regs.set_mode(super::Mode::User);
+    }
+
+    let mut at = bottom;
+    let mut first = true;
+    for index in 0..16usize {
+        if list & (1 << index) == 0 {
+            continue;
+        }
+        if load {
+            let value = bus.read32(at);
+            regs.set(index, value);
+        } else {
+            let value = if index == 15 {
+                // The same twelve as a single store.
+                addr.wrapping_add(PIPELINE_SHIFTED)
+            } else if index == rn && writes_back && !first {
+                // Storing the base register itself puts down the *moved* value,
+                // unless it is the first one out — in which case the write-back
+                // has not happened yet and the old value goes down. With no
+                // write-back asked for there is no moved value to put down at
+                // all. Nothing sensible depends on any of this and it is
+                // exactly the sort of thing a test ROM exists to catch.
+                moved
+            } else {
+                regs.get(index)
+            };
+            bus.write32(at, value);
+        }
+        at = at.wrapping_add(4);
+        first = false;
+    }
+
+    if user_bank {
+        regs.set_mode(mode);
+    }
+
+    // The base moves after the transfer, and a load that brought a new value
+    // into the base register keeps that value: the write-back loses.
+    if writes_back && !(load && list & (1 << rn) != 0) {
+        regs.set(rn, moved);
+    }
+
+    if restores_status {
+        // `LDM` with `R15` in the list and `S` set is a return from an
+        // exception, exactly as `MOVS pc, lr` is: the saved status register
+        // goes back whole, mode and register bank with it. It is how a handler
+        // that pushed its working registers gets out in one instruction.
+        regs.restore_cpsr();
+    }
+
+    // A word loaded into `R15` is a branch, and the address is aligned to
+    // whichever instruction set it lands in — which the restore above may just
+    // have changed.
+    if load && list & 0x8000 != 0 {
+        let target = regs.pc();
+        regs.set_pc(if regs.thumb() { target & !1 } else { target & !3 });
     }
 }
 
@@ -1063,6 +1174,246 @@ mod tests {
         }
         assert_eq!(cpu.regs.get(3), 60, "ten and twenty and thirty");
         assert_eq!(cpu.regs.get(1), DATA + 12, "and the base walked all three");
+    }
+
+    /// Registers always go in ascending order at ascending addresses, whichever
+    /// direction the instruction is written in. It is what lets a stack be
+    /// pushed with one mode and popped with its opposite.
+    #[test]
+    fn registers_go_in_ascending_order_whichever_way_the_block_runs() {
+        // STMIA r4!, {r0-r2}  then read the three words back by hand.
+        let (mut cpu, mut mem) = machine(&[0xE8A4_0007]);
+        cpu.regs.set(0, 0xAAAA);
+        cpu.regs.set(1, 0xBBBB);
+        cpu.regs.set(2, 0xCCCC);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+
+        assert_eq!(mem.read32(DATA), 0xAAAA, "the lowest register at the lowest address");
+        assert_eq!(mem.read32(DATA + 4), 0xBBBB);
+        assert_eq!(mem.read32(DATA + 8), 0xCCCC);
+        assert_eq!(cpu.regs.get(4), DATA + 12, "and the base moved past all three");
+
+        // STMDB r4!, {r0-r2}: the block ends where the base was, and the order
+        // inside it is the same.
+        let (mut cpu, mut mem) = machine(&[0xE924_0007]);
+        cpu.regs.set(0, 0xAAAA);
+        cpu.regs.set(1, 0xBBBB);
+        cpu.regs.set(2, 0xCCCC);
+        cpu.regs.set(4, DATA + 12);
+        cpu.step(&mut mem).unwrap();
+
+        assert_eq!(mem.read32(DATA), 0xAAAA, "still the lowest register lowest");
+        assert_eq!(mem.read32(DATA + 8), 0xCCCC);
+        assert_eq!(cpu.regs.get(4), DATA, "and the base came down by three words");
+    }
+
+    /// The four modes differ only in where the block starts.
+    #[test]
+    fn the_four_modes_put_the_block_in_four_places() {
+        // Each stores r0 alone, from a base of DATA + 4, and says where it went.
+        for (name, instruction, at, after) in [
+            ("increment after", 0xE8A4_0001u32, DATA + 4, DATA + 8),
+            ("increment before", 0xE9A4_0001, DATA + 8, DATA + 8),
+            ("decrement after", 0xE824_0001, DATA + 4, DATA),
+            ("decrement before", 0xE924_0001, DATA, DATA),
+        ] {
+            let (mut cpu, mut mem) = machine(&[instruction]);
+            cpu.regs.set(0, 0x1234);
+            cpu.regs.set(4, DATA + 4);
+            cpu.step(&mut mem).unwrap();
+            assert_eq!(mem.read32(at), 0x1234, "{name}: the word went to the wrong place");
+            assert_eq!(cpu.regs.get(4), after, "{name}: the base ended up wrong");
+        }
+    }
+
+    /// A push and a pop written as opposites bring everything back where it
+    /// was, which is the whole reason the ordering rule exists.
+    #[test]
+    fn a_push_and_its_opposite_pop_come_back_to_where_they_started() {
+        // STMDB sp!, {r0-r3}  /  LDMIA sp!, {r0-r3}
+        let (mut cpu, mut mem) = machine(&[0xE92D_000F, 0xE8BD_000F]);
+        for index in 0..4 {
+            cpu.regs.set(index, 0x1000 + index as u32);
+        }
+        cpu.regs.set(13, DATA + 0x40);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.sp(), DATA + 0x30, "four words down");
+
+        for index in 0..4 {
+            cpu.regs.set(index, 0);
+        }
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.sp(), DATA + 0x40, "and back up");
+        for index in 0..4 {
+            assert_eq!(cpu.regs.get(index), 0x1000 + index as u32, "r{index} came back");
+        }
+    }
+
+    /// A load that brings a new value into its own base register keeps that
+    /// value: the write-back loses, as it does for a single transfer.
+    #[test]
+    fn a_block_load_into_its_own_base_keeps_what_memory_gave() {
+        // LDMIA r4!, {r4}
+        let (mut cpu, mut mem) = machine(&[0xE8B4_0010]);
+        mem.write32(DATA, 0xFEED_FACE);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(4), 0xFEED_FACE, "not DATA + 4");
+    }
+
+    /// Storing the base register itself puts down the moved value, unless it is
+    /// the first one out - where the write-back has not happened yet.
+    #[test]
+    fn storing_the_base_puts_down_the_old_value_only_if_it_goes_first() {
+        // STMIA r0!, {r0,r1} - r0 is the lowest, so it goes first, so the old
+        // value goes down.
+        let (mut cpu, mut mem) = machine(&[0xE8A0_0003]);
+        cpu.regs.set(0, DATA);
+        cpu.regs.set(1, 0x1111);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), DATA, "first out: the old base");
+
+        // STMIA r1!, {r0,r1} - now r1 is second, so the moved value goes down.
+        let (mut cpu, mut mem) = machine(&[0xE8A1_0003]);
+        cpu.regs.set(0, 0x2222);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA + 4), DATA + 8, "not first: the moved base");
+    }
+
+    /// An empty list is not a no-op. This processor transfers `R15` alone and
+    /// moves the base by the full sixteen registers' worth.
+    #[test]
+    fn an_empty_list_transfers_the_counter_and_moves_the_base_by_sixteen() {
+        // STMIA r4!, {} - the encoding with no registers named.
+        let (mut cpu, mut mem) = machine(&[0xE8A4_0000]);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), BASE + 12, "the counter went down, twelve bytes on");
+        assert_eq!(cpu.regs.get(4), DATA + 0x40, "and the base moved by sixteen words");
+
+        // LDMIA r4!, {} - and it comes back as a branch.
+        let (mut cpu, mut mem) = machine(&[0xE8B4_0000]);
+        mem.write32(DATA, BASE + 0x80);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.pc(), BASE + 0x80, "it branched");
+        assert_eq!(cpu.regs.get(4), DATA + 0x40);
+    }
+
+    /// A word loaded into the counter is a branch.
+    #[test]
+    fn a_block_load_into_the_counter_branches() {
+        // LDMIA r4, {r15}
+        let (mut cpu, mut mem) = machine(&[0xE894_8000]);
+        mem.write32(DATA, BASE + 0x40);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.pc(), BASE + 0x40);
+    }
+
+    /// Storing the counter puts down twelve bytes on, the same as a single
+    /// store does.
+    #[test]
+    fn a_block_store_of_the_counter_puts_down_twelve_bytes_on() {
+        // STMIA r4, {r15}
+        let (mut cpu, mut mem) = machine(&[0xE884_8000]);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), BASE + 12);
+    }
+
+    /// The `S` bit asks for the registers a user-mode program would see, so a
+    /// handler can save what it interrupted rather than its own.
+    #[test]
+    fn the_status_bit_reaches_past_the_banking_to_the_users_registers() {
+        // STMIA r4, {r13,r14}^ - the caret is the S bit.
+        let (mut cpu, mut mem) = machine(&[0xE8C4_6000]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set(13, 0x1111_1111);
+        cpu.regs.set(14, 0x2222_2222);
+
+        cpu.regs.set_mode(Mode::Irq);
+        cpu.regs.set(13, 0x3333_3333);
+        cpu.regs.set(14, 0x4444_4444);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+
+        assert_eq!(mem.read32(DATA), 0x1111_1111, "the user's stack pointer, not the handler's");
+        assert_eq!(mem.read32(DATA + 4), 0x2222_2222);
+        assert_eq!(cpu.regs.sp(), 0x3333_3333, "and the handler's own is untouched");
+        assert_eq!(cpu.regs.mode(), Mode::Irq, "as is the mode it was in");
+    }
+
+    /// The base register is the current mode's even when the list is the
+    /// user's, because the address is the handler's business.
+    #[test]
+    fn the_base_of_a_user_bank_transfer_is_still_the_current_modes() {
+        // STMIA r13, {r0}^ - r13 as base, in a mode where it is banked.
+        let (mut cpu, mut mem) = machine(&[0xE8CD_0001]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set(13, 0xDEAD_BEEF);
+        cpu.regs.set_mode(Mode::Irq);
+        cpu.regs.set(13, DATA);
+        cpu.regs.set(0, 0x9999);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), 0x9999, "the handler's base was used");
+    }
+
+    /// `LDM` with the counter in the list and `S` set is a return from an
+    /// exception: the saved status register goes back whole, mode and bank with
+    /// it. A handler gets out in one instruction.
+    #[test]
+    fn a_block_load_with_the_counter_and_the_status_bit_returns_from_a_handler() {
+        // LDMIA r4!, {r0,r15}^
+        let (mut cpu, mut mem) = machine(&[0xE8F4_8001]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set(13, 0x0300_7F00);
+        let interrupted = cpu.regs.cpsr();
+
+        cpu.regs.set_mode(Mode::Irq);
+        cpu.regs.set_spsr(interrupted);
+        cpu.regs.set(13, 0x0300_7FA0);
+        mem.write32(DATA, 0x1234);
+        mem.write32(DATA + 4, BASE + 0x40);
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+
+        assert_eq!(cpu.regs.get(0), 0x1234, "the working register came back");
+        assert_eq!(cpu.regs.pc(), BASE + 0x40, "and it branched");
+        assert_eq!(cpu.regs.mode(), Mode::User, "out of the handler's mode");
+        assert_eq!(cpu.regs.sp(), 0x0300_7F00, "with the interrupted stack pointer");
+    }
+
+    /// A block transfer whose condition fails moves nothing, its base included.
+    #[test]
+    fn a_block_transfer_that_does_not_happen_leaves_its_base_alone() {
+        // STMEQIA r4!, {r0-r2} with Z clear.
+        let (mut cpu, mut mem) = machine(&[0x08A4_0007]);
+        cpu.regs.set(4, DATA);
+        cpu.regs.set_z(false);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(4), DATA);
+        assert_eq!(mem.read32(DATA), 0, "and wrote nothing");
+    }
+
+    /// All sixteen at once, which is what a context switch is made of.
+    #[test]
+    fn all_sixteen_registers_go_out_and_come_back() {
+        // STMIA r4, {r0-r15} then LDMIA r4, {r0-r14}
+        let (mut cpu, mut mem) = machine(&[0xE884_FFFF]);
+        for index in 0..15 {
+            cpu.regs.set(index, 0x100 + index as u32);
+        }
+        cpu.regs.set(4, DATA);
+        cpu.step(&mut mem).unwrap();
+
+        for index in 0..15 {
+            let wanted = if index == 4 { DATA } else { 0x100 + index as u32 };
+            assert_eq!(mem.read32(DATA + index as u32 * 4), wanted, "r{index}");
+        }
+        assert_eq!(mem.read32(DATA + 60), BASE + 12, "and the counter, twelve on");
     }
 
     /// Something end to end: counting down to zero, which needs the ALU, the
