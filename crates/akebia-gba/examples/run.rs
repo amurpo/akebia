@@ -255,4 +255,19 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
     // because a wild value there is not a processor bug — it means whatever was
     // supposed to put the handler in place did not run.
     println!("  handler={:08X}", mem.peek32(0x0300_7FFC));
+
+    // How much of each video memory has been filled in. Nothing here can say
+    // whether a picture is *right*, but it can say whether there is one to
+    // draw at all, which is the difference between a renderer that is wrong
+    // and a game that never got as far as putting anything there.
+    println!();
+    for (name, base, len) in [
+        ("palette", 0x0500_0000u32, akebia_gba::bus::PRAM_LEN),
+        ("video  ", 0x0600_0000, akebia_gba::bus::VRAM_LEN),
+        ("sprites", 0x0700_0000, akebia_gba::bus::OAM_LEN),
+    ] {
+        let words = len as u32 / 4;
+        let filled = (0..words).filter(|index| mem.peek32(base + index * 4) != 0).count();
+        println!("  {name}  {filled:6} of {words:6} words written");
+    }
 }
