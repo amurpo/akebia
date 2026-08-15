@@ -12,12 +12,12 @@ use std::path::PathBuf;
 use akebia_core::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use akebia_frontend::app::{Session, Settings, ACCENT, BACKGROUND};
 use akebia_frontend::args::Args;
-use akebia_frontend::remote::{Remote, Role};
+use akebia_frontend::remote::{Remote, Role, Trouble};
 use akebia_frontend::{net, roms};
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
 
 use crate::java::Java;
-use crate::pad::{Pad, Touches, BUTTONS};
+use crate::pad::{Cable, Pad, Touches, BUTTONS};
 
 /// Height of a row in the list. A finger is not a mouse pointer: below about
 /// fifty points the misses start, and this list is touched with a thumb.
@@ -62,6 +62,14 @@ pub struct Phone {
     /// What was typed there last. Retyping an address is a poor way to spend the
     /// moment before a trade, and worse on glass than on a keyboard.
     last_address: String,
+    /// The last thing that happened to a link, kept over the game until
+    /// something else happens to one.
+    ///
+    /// The list's warning is no use here: everything about a cable happens with
+    /// a game running, and there was nowhere on this screen for any of it to be
+    /// said. Pressing the cable button and seeing nothing but a colour is what
+    /// that came to.
+    notice: Option<String>,
 }
 
 enum Screen {
@@ -113,6 +121,7 @@ impl Phone {
             address: None,
             leaving: false,
             last_address: String::new(),
+            notice: None,
         }
     }
 
@@ -140,6 +149,7 @@ impl Phone {
         }
         // A connection half made has nobody left to hand a console to.
         self.connecting = None;
+        self.notice = None;
         self.address = None;
         // Whether the question was answered or the game ended on its own, there
         // is no longer a game to be asked about leaving.
@@ -168,6 +178,42 @@ impl Phone {
         let mut console = console;
         console.console_mut().set_link_connected(false);
         self.screen = Screen::Playing(console);
+        self.notice = None;
+    }
+
+    /// One line saying where the cable stands, or nothing when there is no cable
+    /// and nothing has happened to one.
+    ///
+    /// Waiting has to say *where*: the other machine has to be told an address,
+    /// and this is the end that knows it. Until this, the telephone knew it and
+    /// said nothing, so the only way to link two of them was to already know
+    /// what the telephone's address was.
+    fn link_status(&self) -> Option<String> {
+        if let Some(pending) = &self.connecting {
+            return Some(match &pending.here {
+                Some(here) => format!("{} — this telephone is {here}", pending.what),
+                None => pending.what.clone(),
+            });
+        }
+        if let Screen::Linked { remote, .. } = &self.screen {
+            let peer = remote.peer();
+            return Some(if remote.is_ready() {
+                format!("Linked to {peer}")
+            } else {
+                format!("Connected to {peer} — waiting for it to answer")
+            });
+        }
+        self.notice.clone()
+    }
+
+    /// What the cable button has to show.
+    fn cable(&self) -> Cable {
+        match &self.screen {
+            Screen::Linked { remote, .. } if remote.is_ready() => Cable::In,
+            Screen::Linked { .. } => Cable::Joining,
+            _ if self.connecting.is_some() => Cable::Joining,
+            _ => Cable::Out,
+        }
     }
 
     /// Picks up a connection once it is made, and plugs the cable in.
@@ -184,7 +230,10 @@ impl Phone {
         let wire = match result {
             Ok(wire) => wire,
             Err(failure) => {
-                self.warning = Some(failure.to_string());
+                // Over the game and not in the list's warning: the game is still
+                // running, and going back to the list to say a connection failed
+                // would throw it away to deliver the news.
+                self.notice = Some(failure.to_string());
                 return;
             }
         };
@@ -199,6 +248,7 @@ impl Phone {
         let remote = Box::new(Remote::new(wire, console.console_mut(), role));
         self.screen = Screen::Linked { console, remote };
         self.warning = None;
+        self.notice = None;
     }
 
     /// The question the way out asks before it is taken.
@@ -498,6 +548,9 @@ impl eframe::App for Phone {
         };
 
         let mut failure = None;
+        // A cable that ended while the game did not. Noted here and acted on
+        // once the borrow on the screen is over.
+        let mut cable_ended = None;
         // Before emulating, so the buttons are already set when the game reads
         // the joypad.
         let pressed = |session: &mut Session, down: [bool; 8]| {
@@ -508,16 +561,33 @@ impl eframe::App for Phone {
         let outcome = match &mut self.screen {
             Screen::Playing(session) => {
                 pressed(session, self.down);
-                Some(session.advance(ctx, &mut self.texture))
+                session.advance(ctx, &mut self.texture).err()
             }
             Screen::Linked { console, remote } => {
                 pressed(console, self.down);
-                Some(console.advance_over(remote, ctx, &mut self.texture))
+                match console.advance_over(remote, ctx, &mut self.texture) {
+                    Ok(()) => None,
+                    // The console itself fell over: there is no game to keep.
+                    Err(Trouble::Fault(fault)) => Some(akebia_frontend::describe_fault(fault)),
+                    // The cable ended and the game did not. Going back to the
+                    // list here threw a session away —and everything the game
+                    // had not saved with it— because somebody else closed their
+                    // window. The cable comes out instead.
+                    Err(trouble) => {
+                        cable_ended = Some(trouble.to_string());
+                        None
+                    }
+                }
             }
             Screen::List => None,
         };
-        if let Some(Err(reason)) = outcome {
+        if let Some(reason) = outcome {
             failure = Some(reason.lines().next().unwrap_or_default().to_owned());
+        }
+        if let Some(why) = cable_ended {
+            self.unplug();
+            self.notice = Some(why);
+            return;
         }
         if failure.is_some() {
             self.back_to_list(failure);
@@ -544,8 +614,25 @@ impl eframe::App for Phone {
         let pad = Pad::lay_out(safe);
         let mut inside = ui.new_child(egui::UiBuilder::new().max_rect(pad.screen));
         console.ui(&mut inside, &self.texture);
-        let linked = matches!(self.screen, Screen::Linked { .. }) || self.connecting.is_some();
-        pad.paint(ui.painter(), &self.down, ACCENT, linked);
+        pad.paint(ui.painter(), &self.down, ACCENT, self.cable());
+
+        // Whatever the cable is doing, along the top row and to the left of the
+        // two corner buttons, which is the only strip of the window that belongs
+        // to neither the picture nor a thumb.
+        if let Some(said) = self.link_status() {
+            let strip = egui::Rect::from_min_max(
+                egui::Pos2::new(safe.left() + 12.0, pad.link.top()),
+                egui::Pos2::new(pad.link.left() - 8.0, pad.link.bottom()),
+            );
+            if strip.width() > 60.0 {
+                ui.put(
+                    strip,
+                    egui::Label::new(RichText::new(said).size(13.0).color(ACCENT))
+                        .truncate()
+                        .halign(egui::Align::LEFT),
+                );
+            }
+        }
 
         // The two corner buttons are widgets and not touch regions: they are
         // taps like any other, and egui already knows how to tell a tap from a

@@ -170,7 +170,7 @@ impl Pad {
     }
 
     /// Draws them, lit where a finger is.
-    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32, linked: bool) {
+    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32, cable: Cable) {
         let arm = self.cross.width() / 3.0;
         let centre = self.cross.center();
         let lit = |on: bool| if on { accent } else { FACE };
@@ -200,9 +200,30 @@ impl Pad {
         painter.rect_filled(self.menu, 6.0, FACE);
         strokes(painter, &menu_icon(self.menu), self.menu, LABEL);
 
-        painter.rect_filled(self.link, 6.0, if linked { accent } else { FACE });
-        strokes(painter, &link_icon(self.link), self.link, if linked { FACE } else { LABEL });
+        // Three states and not two. Filled the moment the button was pressed, it
+        // said "connecting" and "trading with somebody" in exactly the same red,
+        // and a link that never came up looked from the outside like one that
+        // had: the button went red at the start and stayed red for ever.
+        let (face, icon) = match cable {
+            Cable::Out => (FACE, LABEL),
+            Cable::Joining => (FACE, accent),
+            Cable::In => (accent, FACE),
+        };
+        painter.rect_filled(self.link, 6.0, face);
+        strokes(painter, &link_icon(self.link), self.link, icon);
     }
+}
+
+/// What the cable button has to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cable {
+    /// Nothing plugged in.
+    Out,
+    /// A connection being made, or made and not yet answered. Either way the
+    /// other console is not trading anything yet.
+    Joining,
+    /// Joined, greeted, and carrying bytes.
+    In,
 }
 
 /// The fingers currently on the glass.

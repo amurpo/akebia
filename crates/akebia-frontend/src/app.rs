@@ -35,7 +35,7 @@ use eframe::egui::{
 };
 
 use crate::args::Args;
-use crate::remote::Remote;
+use crate::remote::{Remote, Trouble};
 use crate::{audio, debug, net, remote, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
@@ -255,6 +255,14 @@ struct App {
     /// the commonest thing to want, and retyping an address is a poor way to
     /// spend the moment before a trade.
     last_address: String,
+    /// The last thing that happened to a link, kept on the menu bar until
+    /// something else happens to one.
+    ///
+    /// A link ends for reasons that are nobody's mistake —the other player put
+    /// their telephone down— and the game carries on, so there is no list to
+    /// leave the message on and no dialog worth stopping the game with. The end
+    /// of the menu bar is where the connection already speaks from.
+    notice: Option<String>,
 }
 
 enum Screen {
@@ -309,6 +317,7 @@ impl App {
             connecting: None,
             address: None,
             last_address: String::new(),
+            notice: None,
         }
     }
 
@@ -324,6 +333,7 @@ impl App {
                 let session = Session::new(gb, path, &self.args, &self.settings);
                 ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
                 self.screen = Screen::Playing(Box::new(session));
+                self.notice = None;
             }
             // Loading can fail because of a mapper not implemented yet or a file
             // that is not a ROM. It is shown in the list and not on stderr:
@@ -427,22 +437,15 @@ impl App {
                         .clicked();
                 });
 
-                // A connection being made says so here, at the far end of the
+                // Whatever the cable is doing says so here, at the far end of the
                 // same row. Until this, the only sign that "Wait for a console"
                 // had done anything at all was the window's title, which is
                 // covered by a full screen, cut short by some window managers
                 // and not looked at by anybody in the middle of a game: what it
                 // came to was choosing it and seeing nothing happen.
-                //
-                // Waiting also has to say where, because the other machine has
-                // to be told an address and this is the end that knows it.
-                if let Some(pending) = &self.connecting {
+                if let Some(said) = self.link_status() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
-                        let said = match &pending.here {
-                            Some(here) => format!("{} — this machine is {here}", pending.what),
-                            None => pending.what.clone(),
-                        };
                         ui.label(RichText::new(said).color(ACCENT));
                     });
                 }
@@ -476,6 +479,7 @@ impl App {
         }
         if give_up {
             self.connecting = None;
+            self.notice = None;
             self.retitle(ctx);
         }
         if unplug {
@@ -483,11 +487,40 @@ impl App {
         }
     }
 
+    /// One line saying where the cable stands, or nothing when there is no
+    /// cable and nothing has happened to one.
+    ///
+    /// A connection has four states worth telling apart and the interface used
+    /// to show one of them. "Connecting" and "connected but the other end has
+    /// not answered yet" look identical from a chair —the game sits there in
+    /// both— and the difference is exactly what a player needs to know before
+    /// deciding the thing is broken.
+    fn link_status(&self) -> Option<String> {
+        // Waiting has to say *where*, because the other machine has to be told
+        // an address and this is the end that knows it.
+        if let Some(pending) = &self.connecting {
+            return Some(match &pending.here {
+                Some(here) => format!("{} — this machine is {here}", pending.what),
+                None => pending.what.clone(),
+            });
+        }
+        if let Screen::Networked(wired) = &self.screen {
+            let peer = wired.remote.peer();
+            return Some(if wired.remote.is_ready() {
+                format!("Linked to {peer}")
+            } else {
+                format!("Connected to {peer} — waiting for it to answer")
+            });
+        }
+        self.notice.clone()
+    }
+
     /// Starts waiting for another machine to connect to this one.
     fn start_waiting(&mut self, ctx: &egui::Context) {
         if !matches!(self.screen, Screen::Playing(_)) {
             return;
         }
+        self.notice = None;
         self.connecting = Some(net::Pending::listen(akebia_core::link::bgb::DEFAULT_PORT));
         self.retitle(ctx);
     }
@@ -497,6 +530,7 @@ impl App {
         if !matches!(self.screen, Screen::Playing(_)) || address.trim().is_empty() {
             return;
         }
+        self.notice = None;
         self.last_address = address.clone();
         self.connecting = Some(net::Pending::connect(address));
         self.retitle(ctx);
@@ -517,10 +551,10 @@ impl App {
         let wire = match result {
             Ok(wire) => wire,
             Err(failure) => {
-                // Back to the game with the reason on the list's warning line
-                // would mean throwing the game away to say it. The title bar is
-                // where a thing that happened *to* the window belongs.
-                ctx.send_viewport_cmd(ViewportCommand::Title(format!("Akebia — {failure}")));
+                // The game is not thrown away to say a connection failed: it
+                // goes on the menu bar, next to where the attempt was announced.
+                self.notice = Some(first_line(&failure.to_string()));
+                self.retitle(ctx);
                 return;
             }
         };
@@ -625,6 +659,7 @@ impl App {
         if !matches!(self.screen, Screen::Linked(_) | Screen::Networked(_)) {
             return;
         }
+        self.notice = None;
         let list = Screen::List(List::new(self.folder.clone()));
         match std::mem::replace(&mut self.screen, list) {
             Screen::Linked(pair) => {
@@ -734,6 +769,7 @@ impl App {
         }
         // A connection half made has nobody left to hand a console to.
         self.connecting = None;
+        self.notice = None;
         let mut list = List::new(self.folder.clone());
         list.warning = warning;
         self.screen = Screen::List(list);
@@ -786,6 +822,10 @@ impl eframe::App for App {
             return;
         }
 
+        // A cable that ended while the game did not. Noted here and acted on
+        // below, once the borrow on the screen is over.
+        let mut cable_ended = None;
+
         // The keyboard is read here and not inside the session because the
         // session no longer knows what a keyboard is. Right before emulating, so
         // that the buttons are set when the game reads the joypad.
@@ -837,11 +877,30 @@ impl eframe::App for App {
                     wired.console.capture();
                 }
                 let Wired { console, remote } = &mut **wired;
-                (console.advance_over(remote, ctx, &mut self.textures[0]), console.frames)
+                let outcome = match console.advance_over(remote, ctx, &mut self.textures[0]) {
+                    Ok(()) => Ok(()),
+                    // The console itself fell over: there is no game to keep.
+                    Err(Trouble::Fault(fault)) => Err(crate::describe_fault(fault)),
+                    // The cable ended and the game did not. Throwing the session
+                    // away here is what sent a player back to the list of ROMs
+                    // because somebody else closed their window — and with it
+                    // went everything the game had not saved. The cable comes
+                    // out instead, and the reason is put where it can be read.
+                    Err(trouble) => {
+                        cable_ended = Some(trouble.to_string());
+                        Ok(())
+                    }
+                };
+                (outcome, console.frames)
             }
             Screen::List(_) => return,
         };
 
+        if let Some(why) = cable_ended {
+            self.unplug(ctx);
+            self.notice = Some(why);
+            return;
+        }
         if let Err(failure) = result {
             self.back_to_list(ctx, Some(first_line(&failure)));
             return;
@@ -1597,12 +1656,17 @@ impl Session {
     /// The wall clock still decides *when* a frame is owed —a link that answers
     /// instantly must not run the game at a thousand frames a second— and the
     /// link decides whether it can be delivered.
+    ///
+    /// The trouble comes back whole rather than as a sentence, because the two
+    /// kinds are not the same news: a console that fell over has no game left to
+    /// go back to, and a cable that ended has the same game it had a moment ago.
+    /// Only the caller knows what to do about each.
     pub fn advance_over(
         &mut self,
         remote: &mut Remote,
         ctx: &egui::Context,
         texture: &mut TextureHandle,
-    ) -> Result<(), String> {
+    ) -> Result<(), Trouble> {
         let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
         let now = Instant::now();
         let mut emulated = 0;
@@ -1626,7 +1690,7 @@ impl Session {
                     break;
                 }
                 Err(trouble) => {
-                    failure = Some(trouble.to_string());
+                    failure = Some(trouble);
                     break;
                 }
             }
