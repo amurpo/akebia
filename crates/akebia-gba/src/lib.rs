@@ -18,18 +18,23 @@
 //!
 //! # Where this is
 //!
-//! The processor runs ARM code: the register file with its banking, the memory
-//! map, and every instruction of the first of the two sets. THUMB says it is
-//! not written rather than decoding a halfword as if it were a word.
+//! The processor is finished: both instruction sets, the register file with its
+//! banking by mode, the whole memory map, and interrupts. A cartridge runs, and
+//! a real BIOS can be handed in and boots one.
 //!
-//! Nothing else exists yet — no picture, no sound, no cartridge, no timing —
-//! and nothing loads a ROM. The next thing worth doing is measuring what is
-//! here against a test ROM, because everything above this depends on the
-//! processor being right and none of it is worth writing on top of a wrong one.
+//! The picture unit sweeps but does not draw. That order is deliberate — the
+//! sweep is what gives a game a sense of time, and without it a cartridge stops
+//! at the first thing it waits for, which is usually the second thing it does.
+//! See [`ppu`].
+//!
+//! Nothing else exists yet: no sound, no direct memory access, no timers, and
+//! no timing worth the name — a step of the processor charges one cycle, which
+//! is a floor and not a measurement.
 
 pub mod bus;
 pub mod cpu;
 pub mod interrupts;
+pub mod ppu;
 
 pub use cpu::{Mode, Registers};
 

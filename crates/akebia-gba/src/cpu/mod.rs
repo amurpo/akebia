@@ -64,16 +64,33 @@ impl Cpu {
     /// or twelve bytes on from the instruction, and is worked out from the
     /// address rather than from the register. See [`arm`].
     ///
-    /// # Timing
+    /// # Timing, and why one
     ///
-    /// Not modelled. Nothing here advances the bus's clock, because what an
-    /// access costs on this machine depends on the region, on whether the
-    /// address follows the last one, and on wait states a cartridge configures
-    /// at runtime — none of which exists yet. Counting a plausible number in
-    /// the meantime would be worse than counting none: it would look like
-    /// timing and be wrong, and every later measurement would be taken against
-    /// it.
+    /// A step charges the bus a single cycle, and that is **not** an estimate
+    /// of what an instruction costs. It is the floor: nothing on this processor
+    /// takes less than one cycle, so a machine driven this way runs everything
+    /// too fast by some factor and never too slow. What an instruction really
+    /// costs depends on the region each access lands in, on whether an address
+    /// follows the one before it, and on wait states a cartridge configures at
+    /// runtime, and none of that is decided here yet.
+    ///
+    /// The alternative was to keep charging nothing, and that turned out to be
+    /// untenable rather than merely incomplete. With a clock that never moves
+    /// the picture unit never sweeps, and with no sweep a game waiting for the
+    /// beam — which is every game, within a few hundred instructions of
+    /// starting — waits for ever. A wrong rate can be corrected against; a
+    /// stopped clock cannot be corrected against anything.
+    ///
+    /// So the shape is the one that survives learning the real numbers: the
+    /// count comes from here and only this line changes. Pinned by a test, so
+    /// that the test is what has to change with it.
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<(), Fault> {
+        // Before anything else, and before the halt below in particular. The
+        // machine goes on whether or not the processor does, and a halted
+        // processor that stopped the clock could never be woken by the picture
+        // unit it halted to wait for.
+        bus.tick(1);
+
         // Asked before the fetch, so the address left in the link register is
         // the instruction that has not run yet rather than the one that just
         // did. The processor's own mask is checked here and not in the
@@ -274,6 +291,65 @@ mod tests {
         mem.interrupts_mut().raise(Source::VBlank);
         cpu.step(&mut mem).unwrap();
         assert_eq!(cpu.regs.pc(), BASE + 4, "awake, and running the next instruction");
+    }
+
+    /// One cycle a step is the floor and not a measurement: nothing costs less,
+    /// and almost everything costs more. Pinned here so that when the real
+    /// numbers arrive this is the test that has to change with them.
+    #[test]
+    fn a_step_charges_the_bus_one_cycle_whatever_the_instruction() {
+        let (mut cpu, mut mem) = machine();
+        assert_eq!(mem.cycles(), 0);
+
+        for step in 1..=8 {
+            cpu.step(&mut mem).unwrap();
+            assert_eq!(mem.cycles(), step, "after {step} instructions");
+        }
+    }
+
+    /// And a halted processor is charged too. It has to be: the thing it is
+    /// waiting for is driven by the clock, so a halt that stopped the clock
+    /// would be a halt nothing could ever end.
+    #[test]
+    fn the_clock_moves_while_the_processor_is_halted() {
+        let (mut cpu, mut mem) = machine();
+        mem.write8(0x0400_0301, 0);
+        assert!(mem.interrupts().halted());
+
+        for _ in 0..10 {
+            cpu.step(&mut mem).unwrap();
+        }
+        assert_eq!(cpu.regs.pc(), BASE, "the processor went nowhere");
+        assert_eq!(mem.cycles(), 10, "and the machine went on regardless");
+    }
+
+    /// The whole reason the clock had to start moving: a game asks to be told
+    /// when the beam reaches the bottom, halts, and is woken by the picture
+    /// unit. Every step of that crosses a boundary in this crate.
+    #[test]
+    fn halting_until_the_beam_reaches_the_bottom_ends_by_itself() {
+        let (mut cpu, mut mem) = machine();
+        cpu.regs.set_cpsr(cpu.regs.cpsr() & !registers::I);
+
+        // Ask the picture unit to report the bottom of the frame, enable that
+        // one interrupt, and stop.
+        mem.write16(0x0400_0004, 1 << 3);
+        mem.write16(0x0400_0200, Source::VBlank.bit());
+        mem.write16(0x0400_0208, 1);
+        mem.write8(0x0400_0301, 0);
+
+        // Long enough for the beam to reach line 160 at a cycle a step, and no
+        // longer, so that a machine which never woke fails here.
+        for _ in 0..crate::ppu::FRAME_CYCLES {
+            cpu.step(&mut mem).unwrap();
+            if !mem.interrupts().halted() {
+                break;
+            }
+        }
+
+        assert!(!mem.interrupts().halted(), "the beam woke it");
+        assert_eq!(mem.ppu().vcount(), 160, "at the line below the screen");
+        assert_eq!(cpu.regs.pc(), 0x18, "and it went to the handler");
     }
 
     /// Waking and being interrupted are different things, and a game that halts

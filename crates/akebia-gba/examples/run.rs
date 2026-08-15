@@ -180,8 +180,13 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
         }
 
         // A branch to its own address. Nothing else can move the counter back
-        // to where it already was, so this is not a guess.
-        if cpu.regs.pc() == before {
+        // to where it already was — except a processor that has been halted,
+        // which fetches nothing and so leaves the counter exactly where a
+        // branch to itself would. Telling the two apart matters: a halt is a
+        // game waiting for the picture unit and about to carry on, and calling
+        // it a finish stops the run three frames into a cartridge that was
+        // working.
+        if cpu.regs.pc() == before && !mem.interrupts().halted() {
             return Outcome::Settled { at: before, steps: step + 1 };
         }
     }
@@ -189,6 +194,7 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
 }
 
 fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
+    let irq = mem.interrupts();
     println!();
     match outcome {
         Outcome::Faulted(fault, steps) => println!("stopped after {steps} steps: {fault}"),
@@ -222,4 +228,31 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
         cpu.regs.mode(),
         if cpu.regs.thumb() { " THUMB" } else { "" },
     );
+
+    // Where the beam got to, which is the difference between a machine that is
+    // waiting for something and one that has stopped. A cartridge sitting in a
+    // loop with the frame count climbing is a cartridge waiting on something
+    // else; with the frame count at zero it is waiting on this.
+    let ppu = mem.ppu();
+    println!();
+    println!(
+        "  frames={}  line={}  mode={}{}  dispstat={:04X}",
+        ppu.frames(),
+        ppu.vcount(),
+        ppu.mode(),
+        if ppu.forced_blank() { " (held blank)" } else { "" },
+        ppu.status(),
+    );
+    println!(
+        "  ie={:04X}  if={:04X}  ime={}{}",
+        irq.enabled(),
+        irq.requested(),
+        u8::from(irq.master()),
+        if irq.halted() { "  halted" } else { "" },
+    );
+    // Where the BIOS jumps when something interrupts: a game leaves the address
+    // of its own handler in the last word of internal RAM. Worth printing
+    // because a wild value there is not a processor bug — it means whatever was
+    // supposed to put the handler in place did not run.
+    println!("  handler={:08X}", mem.peek32(0x0300_7FFC));
 }

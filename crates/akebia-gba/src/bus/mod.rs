@@ -23,13 +23,15 @@
 //!
 //! # What is not here yet
 //!
-//! The I/O registers. Reads of that region come back zero, and the real answer
-//! is not zero — an unmapped address on this machine returns whatever the
-//! processor last fetched, which some games read on purpose. That wants a
-//! pipeline to ask, and there is not one yet.
+//! Most of the I/O registers. The picture unit's four and the interrupt
+//! controller's three are answered; everything else in that region reads back
+//! zero, and the real answer is not zero — an unmapped address on this machine
+//! returns whatever the processor last fetched, which some games read on
+//! purpose. That wants a pipeline to ask, and there is not one yet.
 
 use crate::cpu::Bus;
 use crate::interrupts::Interrupts;
+use crate::ppu::{self, Ppu};
 
 pub const BIOS_LEN: usize = 16 * 1024;
 pub const EWRAM_LEN: usize = 256 * 1024;
@@ -41,11 +43,6 @@ pub const OAM_LEN: usize = 1024;
 pub const ROM_MAX: usize = 32 * 1024 * 1024;
 /// Battery-backed save memory, on an 8-bit bus.
 pub const SRAM_LEN: usize = 64 * 1024;
-
-/// Where video memory stops being backgrounds and starts being sprites, in
-/// tiled modes. In the bitmap modes it is `0x1_4000` instead, and only the
-/// picture unit knows which mode is running — hence the setter.
-pub const OBJ_BASE_TILED: u32 = 0x1_0000;
 
 /// The blocks video memory repeats in: 128 KiB, of which it fills 96.
 const VRAM_BLOCK: u32 = 0x2_0000;
@@ -72,9 +69,9 @@ pub struct Memory {
     sram: Box<[u8; SRAM_LEN]>,
     /// The three registers that decide whether the processor is interrupted.
     irq: Interrupts,
-    /// Where sprites begin in video memory, which decides whether a byte write
-    /// lands or is dropped. See [`Memory::set_obj_base`].
-    obj_base: u32,
+    /// The picture unit, which lives here because that is where a game reaches
+    /// it: its registers are four addresses in this map like any other.
+    ppu: Ppu,
     cycles: u64,
 }
 
@@ -96,7 +93,7 @@ impl Memory {
             rom: Vec::new(),
             sram: Box::new([0; SRAM_LEN]),
             irq: Interrupts::new(),
-            obj_base: OBJ_BASE_TILED,
+            ppu: Ppu::new(),
             cycles: 0,
         }
     }
@@ -119,17 +116,16 @@ impl Memory {
         self.rom.len()
     }
 
-    /// Tells the memory where sprites begin in video memory, which the picture
-    /// unit knows and this does not: `0x1_0000` in the tiled modes and
-    /// `0x1_4000` in the bitmap ones.
-    ///
-    /// It matters for one thing only, and only for writes of a single byte.
-    pub fn set_obj_base(&mut self, base: u32) {
-        self.obj_base = base;
-    }
-
     pub fn cycles(&self) -> u64 {
         self.cycles
+    }
+
+    pub fn ppu(&self) -> &Ppu {
+        &self.ppu
+    }
+
+    pub fn ppu_mut(&mut self) -> &mut Ppu {
+        &mut self.ppu
     }
 
     pub fn interrupts(&self) -> &Interrupts {
@@ -149,6 +145,7 @@ impl Memory {
     fn read_io8(&self, addr: u32) -> u8 {
         let half = |value: u16| (value >> ((addr & 1) * 8)) as u8;
         match addr & !1 {
+            ppu::DISPCNT..=ppu::VCOUNT => self.ppu.read8(addr),
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
@@ -164,6 +161,7 @@ impl Memory {
             (existing & !(0xFFu16 << shift)) | (u16::from(value) << shift)
         };
         match addr & !1 {
+            ppu::DISPCNT..=ppu::VCOUNT => self.ppu.write8(addr, value),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
                 self.irq.set_enabled(updated);
@@ -416,7 +414,7 @@ impl Bus for Memory {
                 self.pram[pair + 1] = value;
             }
             Bank::Vram => {
-                if (offset as u32) < self.obj_base {
+                if (offset as u32) < self.ppu.obj_base() {
                     let pair = offset & !1;
                     self.vram[pair] = value;
                     self.vram[pair + 1] = value;
@@ -433,8 +431,16 @@ impl Bus for Memory {
         self.write_bytes(addr & !3, value, 4);
     }
 
+    /// Moves the clock, and with it the beam.
+    ///
+    /// The picture unit is the only thing here that has anywhere to go, and it
+    /// is driven from this one place rather than from the emulator's loop so
+    /// that it cannot be forgotten. A frontend that runs the processor and
+    /// never advances the picture would produce a machine that halts on the
+    /// first thing it waits for, and would look like a bug in the game.
     fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
+        self.ppu.tick(cycles, &mut self.irq);
     }
 
     fn interrupts(&self) -> &Interrupts {
@@ -459,6 +465,9 @@ mod tests {
     const PRAM: u32 = 0x0500_0000;
     const VRAM: u32 = 0x0600_0000;
     const OAM: u32 = 0x0700_0000;
+    /// Where sprites begin in video memory in the tiled modes, which is where
+    /// the picture unit starts out.
+    const TILED_OBJ: u32 = 0x1_0000;
 
     /// Little-endian, and every width agrees with every other. If this is wrong
     /// nothing else here means anything.
@@ -582,25 +591,27 @@ mod tests {
         // Video doubles it below where sprites begin and drops it above.
         mem.write8(VRAM, 0x7E);
         assert_eq!(mem.read16(VRAM), 0x7E7E, "a background byte lands twice");
-        mem.write16(VRAM + OBJ_BASE_TILED, 0xCAFE);
-        mem.write8(VRAM + OBJ_BASE_TILED, 0x00);
-        assert_eq!(mem.read16(VRAM + OBJ_BASE_TILED), 0xCAFE, "a sprite byte is dropped");
+        mem.write16(VRAM + TILED_OBJ, 0xCAFE);
+        mem.write8(VRAM + TILED_OBJ, 0x00);
+        assert_eq!(mem.read16(VRAM + TILED_OBJ), 0xCAFE, "a sprite byte is dropped");
     }
 
-    /// Where sprites begin moves with the video mode, and only the picture unit
-    /// knows it. Until it says otherwise the tiled boundary is assumed.
+    /// Where sprites begin moves with the video mode, so the same address is
+    /// background in one mode and sprites in another — and a byte written to it
+    /// lands or is dropped accordingly. The memory map has to ask the picture
+    /// unit, which is the only thing that knows.
     #[test]
-    fn the_boundary_a_byte_write_respects_can_be_moved() {
+    fn the_boundary_a_byte_write_respects_moves_with_the_video_mode() {
         let mut mem = Memory::new();
-        let bitmap_base = 0x1_4000;
 
-        mem.write16(VRAM + OBJ_BASE_TILED, 0xCAFE);
-        mem.write8(VRAM + OBJ_BASE_TILED, 0x55);
-        assert_eq!(mem.read16(VRAM + OBJ_BASE_TILED), 0xCAFE, "dropped, at the tiled boundary");
+        mem.write16(VRAM + TILED_OBJ, 0xCAFE);
+        mem.write8(VRAM + TILED_OBJ, 0x55);
+        assert_eq!(mem.read16(VRAM + TILED_OBJ), 0xCAFE, "dropped, in a tiled mode");
 
-        mem.set_obj_base(bitmap_base);
-        mem.write8(VRAM + OBJ_BASE_TILED, 0x55);
-        assert_eq!(mem.read16(VRAM + OBJ_BASE_TILED), 0x5555, "and lands once it is background");
+        // Mode 3, where the picture itself reaches past that address.
+        mem.write16(0x0400_0000, 3);
+        mem.write8(VRAM + TILED_OBJ, 0x55);
+        assert_eq!(mem.read16(VRAM + TILED_OBJ), 0x5555, "and lands once it is background");
     }
 
     /// The two 32-bit RAMs take a byte as a byte, which is the ordinary case
@@ -640,12 +651,13 @@ mod tests {
     /// hardware does - it gives back whatever was last fetched. Pinned here so
     /// that when a pipeline exists to ask, this test is what changes.
     ///
-    /// The cartridge used to be on this list and has come off it, which is the
-    /// list working as intended.
+    /// The cartridge used to be on this list and has come off it, and so has
+    /// the picture unit's first register, which is the list working as intended.
     #[test]
     fn what_is_not_mapped_yet_reads_as_zero() {
         let mut mem = Memory::new();
-        for addr in [0x0400_0000, 0x1000_0000, BIOS_LEN as u32] {
+        // A timer, a sound channel, and the space above the map entirely.
+        for addr in [0x0400_0100, 0x0400_0060, 0x1000_0000, BIOS_LEN as u32] {
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X}");
             mem.write32(addr, 0xFFFF_FFFF);
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X} after a write");
@@ -719,5 +731,41 @@ mod tests {
         mem.tick(3);
         mem.tick(5);
         assert_eq!(mem.cycles(), 8);
+    }
+
+    /// The picture unit's four registers are reachable through the map, which
+    /// is the only way a game can touch them — and the counter a stuck
+    /// cartridge sat reading now answers something other than zero.
+    #[test]
+    fn the_picture_units_registers_are_reachable_through_the_memory_map() {
+        let mut mem = Memory::new();
+
+        mem.write16(0x0400_0000, 0x0403);
+        assert_eq!(mem.read16(0x0400_0000), 0x0403, "what was written to the control register");
+        assert_eq!(mem.ppu().mode(), 3);
+
+        assert_eq!(mem.read16(0x0400_0006), 0, "the beam starts at the top");
+        mem.tick(crate::ppu::FRAME_CYCLES / 2);
+        assert_ne!(mem.read16(0x0400_0006), 0, "and the clock moves it");
+        assert_eq!(mem.read16(0x0400_0006), mem.ppu().vcount());
+    }
+
+    /// The picture unit raises through the same controller everything else
+    /// does, so a game hears it in the ordinary way.
+    #[test]
+    fn the_bottom_of_the_frame_arrives_at_the_interrupt_controller() {
+        let mut mem = Memory::new();
+        // Report the bottom of the frame, and listen for it.
+        mem.write16(0x0400_0004, 1 << 3);
+        mem.write16(0x0400_0200, crate::interrupts::Source::VBlank.bit());
+        mem.write16(0x0400_0208, 1);
+
+        assert!(!mem.interrupts().pending());
+        mem.tick(crate::ppu::FRAME_CYCLES);
+        assert!(mem.interrupts().pending(), "the beam reached the bottom");
+
+        // And the flag it set is retired the way every other one is.
+        mem.write16(0x0400_0202, crate::interrupts::Source::VBlank.bit());
+        assert!(!mem.interrupts().pending());
     }
 }
