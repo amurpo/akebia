@@ -29,6 +29,7 @@
 
 pub mod bus;
 pub mod cpu;
+pub mod interrupts;
 
 pub use cpu::{Mode, Registers};
 

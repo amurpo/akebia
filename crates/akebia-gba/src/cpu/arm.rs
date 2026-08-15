@@ -550,6 +550,32 @@ pub(super) fn software_interrupt(regs: &mut Registers, return_to: u32) {
 /// Where the processor goes on `SWI`, fixed in the hardware.
 const SWI_VECTOR: u32 = 0x08;
 
+/// And where it goes when something interrupts it.
+const IRQ_VECTOR: u32 = 0x18;
+
+/// Interrupts the processor, which is the same door an `SWI` goes through with
+/// a different mode and a different vector.
+///
+/// # Why the way back is four bytes further on than it needs to be
+///
+/// Because a handler returns with `SUBS pc, lr, #4`, and that four is not an
+/// adjustment somebody chose — it is what makes the return work out for an
+/// exception raised by a *failed* access, where the instruction has to be tried
+/// again rather than stepped over. The same return instruction serves both, so
+/// an interrupt has to leave the link register in the shape that instruction
+/// expects.
+pub(super) fn enter_irq(regs: &mut Registers) {
+    let caller = regs.cpsr();
+    let resume_at = regs.pc();
+    regs.set_mode(super::Mode::Irq);
+    regs.set_spsr(caller);
+    regs.set(14, resume_at.wrapping_add(4));
+
+    let status = regs.cpsr();
+    regs.set_cpsr((status | super::registers::I) & !T);
+    regs.set_pc(IRQ_VECTOR);
+}
+
 /// `LDRH`, `STRH`, `LDRSB` and `LDRSH`.
 ///
 /// `kind` is the two bits that pick between them, already known not to be zero.

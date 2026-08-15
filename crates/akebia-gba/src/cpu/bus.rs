@@ -53,6 +53,15 @@ pub trait Bus {
     /// accesses.
     fn tick(&mut self, cycles: u32);
 
+    /// The three registers that decide whether the processor is interrupted.
+    ///
+    /// They live on the bus and not on the processor because that is where the
+    /// game reaches them: they are memory-mapped, and something other than the
+    /// processor — a timer, the picture unit — is what sets them.
+    fn interrupts(&self) -> &crate::interrupts::Interrupts;
+
+    fn interrupts_mut(&mut self) -> &mut crate::interrupts::Interrupts;
+
     /// Reads without advancing the clock or causing side effects.
     ///
     /// For a debugger and a disassembler only. The emulator must never execute

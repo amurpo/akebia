@@ -29,6 +29,7 @@
 //! pipeline to ask, and there is not one yet.
 
 use crate::cpu::Bus;
+use crate::interrupts::Interrupts;
 
 pub const BIOS_LEN: usize = 16 * 1024;
 pub const EWRAM_LEN: usize = 256 * 1024;
@@ -69,6 +70,8 @@ pub struct Memory {
     rom: Vec<u8>,
     /// The cartridge's save memory.
     sram: Box<[u8; SRAM_LEN]>,
+    /// The three registers that decide whether the processor is interrupted.
+    irq: Interrupts,
     /// Where sprites begin in video memory, which decides whether a byte write
     /// lands or is dropped. See [`Memory::set_obj_base`].
     obj_base: u32,
@@ -92,6 +95,7 @@ impl Memory {
             oam: Box::new([0; OAM_LEN]),
             rom: Vec::new(),
             sram: Box::new([0; SRAM_LEN]),
+            irq: Interrupts::new(),
             obj_base: OBJ_BASE_TILED,
             cycles: 0,
         }
@@ -128,6 +132,64 @@ impl Memory {
         self.cycles
     }
 
+    pub fn interrupts(&self) -> &Interrupts {
+        &self.irq
+    }
+
+    pub fn interrupts_mut(&mut self) -> &mut Interrupts {
+        &mut self.irq
+    }
+
+    /// One byte of the I/O registers.
+    ///
+    /// Everything wider is composed from this rather than handled separately,
+    /// because the registers are not all the same width and several are read as
+    /// pairs: `IE` and `IF` sit next to each other and a game reads both in one
+    /// go. Going a byte at a time means the alignment cases need no thought.
+    fn read_io8(&self, addr: u32) -> u8 {
+        let half = |value: u16| (value >> ((addr & 1) * 8)) as u8;
+        match addr & !1 {
+            0x0400_0200 => half(self.irq.enabled()),
+            0x0400_0202 => half(self.irq.requested()),
+            0x0400_0208 => half(u16::from(self.irq.master())),
+            _ => 0,
+        }
+    }
+
+    fn write_io8(&mut self, addr: u32, value: u8) {
+        // A halfword register written a byte at a time: the byte goes into its
+        // half and the other half is kept.
+        let widened = |existing: u16| -> u16 {
+            let shift = (addr & 1) * 8;
+            (existing & !(0xFFu16 << shift)) | (u16::from(value) << shift)
+        };
+        match addr & !1 {
+            0x0400_0200 => {
+                let updated = widened(self.irq.enabled());
+                self.irq.set_enabled(updated);
+            }
+            // Not an ordinary register: the ones written retire requests and
+            // the zeros leave them alone. Composing it through `widened` would
+            // be wrong, because the half not being written must not be cleared.
+            0x0400_0202 => {
+                let shift = (addr & 1) * 8;
+                self.irq.acknowledge(u16::from(value) << shift);
+            }
+            0x0400_0208 => {
+                if addr & 1 == 0 {
+                    self.irq.set_master(value & 1 != 0);
+                }
+            }
+            // Telling the processor to stop until something arrives. The other
+            // bit of this register asks for a deeper sleep that stops the clocks
+            // as well; nothing here has clocks to stop yet, so it is taken as an
+            // ordinary halt and the difference is written down rather than
+            // pretended away.
+            0x0400_0300 if addr & 1 == 1 => self.irq.halt(),
+            _ => {}
+        }
+    }
+
     /// The region an address falls in, and where in that region.
     ///
     /// Returning the offset already folded is what keeps the mirroring in one
@@ -138,6 +200,9 @@ impl Memory {
             // The BIOS does not mirror: everything above it and below external
             // RAM is simply not there.
             0x00 if (addr as usize) < BIOS_LEN => Where::Rom(&self.bios[..], addr as usize),
+            // The registers. Everything the machine has that is not memory is
+            // reached through this window.
+            0x04 => Where::Registers,
             0x02 => Where::Ram(Bank::Ewram, addr as usize & (EWRAM_LEN - 1)),
             0x03 => Where::Ram(Bank::Iwram, addr as usize & (IWRAM_LEN - 1)),
             0x05 => Where::Ram(Bank::Pram, addr as usize & (PRAM_LEN - 1)),
@@ -195,7 +260,7 @@ impl Memory {
             Where::Ram(bank, offset) => Some((bank, offset)),
             // The BIOS and the cartridge are read-only, and unmapped space is
             // not there at all.
-            Where::Rom(..) | Where::Floating | Where::Nowhere => None,
+            Where::Rom(..) | Where::Floating | Where::Registers | Where::Nowhere => None,
         }
     }
 
@@ -217,6 +282,13 @@ impl Memory {
             }
             Where::Ram(bank, offset) => (self.bank(bank), offset),
             Where::Floating => return floating(addr, len),
+            Where::Registers => {
+                let mut value = 0u32;
+                for index in 0..len {
+                    value |= u32::from(self.read_io8(addr + index as u32)) << (index * 8);
+                }
+                return value;
+            }
             Where::Nowhere => return 0,
         };
         let mut value = 0u32;
@@ -227,6 +299,12 @@ impl Memory {
     }
 
     fn write_bytes(&mut self, addr: u32, value: u32, len: usize) {
+        if matches!(self.locate(addr), Where::Registers) {
+            for index in 0..len {
+                self.write_io8(addr + index as u32, (value >> (index * 8)) as u8);
+            }
+            return;
+        }
         let Some((bank, offset)) = self.writable(addr) else {
             return;
         };
@@ -262,6 +340,9 @@ enum Where<'a> {
     /// Cartridge space with no cartridge behind it, which reads as a pattern
     /// made of the address rather than as nothing.
     Floating,
+    /// The I/O registers, which are not backed by an array: reading one can
+    /// have an effect and writing one usually does.
+    Registers,
     /// Not backed by anything.
     Nowhere,
 }
@@ -317,6 +398,10 @@ impl Bus for Memory {
     ///   it the write is dropped.
     /// - Sprite memory drops it always.
     fn write8(&mut self, addr: u32, value: u8) {
+        if matches!(self.locate(addr), Where::Registers) {
+            self.write_io8(addr, value);
+            return;
+        }
         let Some((bank, offset)) = self.writable(addr) else {
             return;
         };
@@ -350,6 +435,14 @@ impl Bus for Memory {
 
     fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
+    }
+
+    fn interrupts(&self) -> &Interrupts {
+        &self.irq
+    }
+
+    fn interrupts_mut(&mut self) -> &mut Interrupts {
+        &mut self.irq
     }
 
     fn peek32(&self, addr: u32) -> u32 {
