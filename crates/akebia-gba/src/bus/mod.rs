@@ -165,7 +165,7 @@ impl Memory {
     fn read_io8(&self, addr: u32) -> u8 {
         let half = |value: u16| (value >> ((addr & 1) * 8)) as u8;
         match addr & !1 {
-            ppu::DISPCNT..=ppu::VCOUNT => self.ppu.read8(addr),
+            ppu::DISPCNT..=ppu::LAST => self.ppu.read8(addr),
             dma::BASE..=dma::LAST => self.dma.read8(addr),
             SOUND_BIAS => half(self.sound_bias),
             0x0400_0200 => half(self.irq.enabled()),
@@ -183,7 +183,7 @@ impl Memory {
             (existing & !(0xFFu16 << shift)) | (u16::from(value) << shift)
         };
         match addr & !1 {
-            ppu::DISPCNT..=ppu::VCOUNT => self.ppu.write8(addr, value),
+            ppu::DISPCNT..=ppu::LAST => self.ppu.write8(addr, value),
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
             SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
             0x0400_0200 => {

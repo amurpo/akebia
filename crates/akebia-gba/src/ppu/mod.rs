@@ -83,14 +83,19 @@ const VBLANK_AT: u16 = SCREEN_HEIGHT as u16;
 /// A whole frame, in cycles. A little under a sixtieth of a second.
 pub const FRAME_CYCLES: u32 = LINE_CYCLES * LINES_PER_FRAME as u32;
 
-/// The first register of the four, and the one that says what is being drawn.
+/// The first register the picture unit answers, and the last. The bus needs
+/// the pair to know what to hand over.
 pub const DISPCNT: u32 = 0x0400_0000;
-/// The last, which is `VCOUNT`. Everything from [`DISPCNT`] to here is this
-/// module's; the bus needs the pair to know what to hand over.
-pub const VCOUNT: u32 = 0x0400_0006;
+pub const LAST: u32 = 0x0400_001F;
 
 const GREEN_SWAP: u32 = 0x0400_0002;
 const DISPSTAT: u32 = 0x0400_0004;
+pub const VCOUNT: u32 = 0x0400_0006;
+
+/// The four backgrounds' control registers, one halfword each, and their
+/// scroll positions, two halfwords each.
+const BG_CONTROL: u32 = 0x0400_0008;
+const BG_SCROLL: u32 = 0x0400_0010;
 
 /// `DISPCNT`'s video mode, and the bit that says the screen is being held
 /// blank whatever the mode.
@@ -119,6 +124,35 @@ const DISPSTAT_WRITABLE: u16 = VBLANK_IRQ | HBLANK_IRQ | VCOUNT_IRQ | 0xFF00;
 /// sprites the rest.
 const OBJ_BASE_TILED: u32 = 0x1_0000;
 const OBJ_BASE_BITMAP: u32 = 0x1_4000;
+
+/// One background's registers.
+///
+/// # Why the scroll cannot be read back
+///
+/// It is write-only on this hardware, and that is not an oversight to be
+/// papered over: a game keeps its own copy of where it has scrolled to, and one
+/// that read the register instead would be reading a number the machine does
+/// not report. Answering with the stored value would make an emulator that runs
+/// code the hardware would not.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Background {
+    pub control: u16,
+    pub hofs: u16,
+    pub vofs: u16,
+}
+
+/// Which background a register address belongs to.
+///
+/// The control registers are a halfword apart and the scroll registers are two,
+/// so the arithmetic differs either side of the boundary between them.
+fn background_of(addr: u32) -> usize {
+    let index = if addr < BG_SCROLL {
+        (addr - BG_CONTROL) / 2
+    } else {
+        (addr - BG_SCROLL) / 4
+    };
+    index as usize & 3
+}
 
 /// Which blanking periods a sweep began.
 ///
@@ -153,6 +187,8 @@ pub struct Ppu {
     vcount: u16,
     /// Cycles into the current line.
     dot: u32,
+    /// The four backgrounds. Which of them exist depends on the mode.
+    pub(super) backgrounds: [Background; 4],
     /// How many frames have been swept. Nothing in the machine can read this;
     /// it is for whatever is driving the emulator to know when a picture is
     /// finished.
@@ -182,6 +218,7 @@ impl Ppu {
             dispstat: 0,
             vcount: 0,
             dot: 0,
+            backgrounds: [Background::default(); 4],
             frames: 0,
             pram: Box::new([0; PRAM_LEN]),
             vram: Box::new([0; VRAM_LEN]),
@@ -294,6 +331,8 @@ impl Ppu {
             GREEN_SWAP => half(self.green_swap),
             DISPSTAT => half(self.status()),
             VCOUNT => half(self.vcount),
+            BG_CONTROL..BG_SCROLL => half(self.backgrounds[background_of(addr)].control),
+            // The scroll positions are write-only. See [`Background`].
             _ => 0,
         }
     }
@@ -312,6 +351,22 @@ impl Ppu {
             // The three reports are the sweep's and a write must not disturb
             // them, which composing the whole halfword would.
             DISPSTAT => self.dispstat = widened(self.dispstat) & DISPSTAT_WRITABLE,
+            BG_CONTROL..BG_SCROLL => {
+                let index = background_of(addr);
+                self.backgrounds[index].control = widened(self.backgrounds[index].control);
+            }
+            BG_SCROLL..=LAST => {
+                let index = background_of(addr);
+                let background = &mut self.backgrounds[index];
+                // Two halfwords each: the across one first, then the down one.
+                // Nine bits are kept of each; a game may write more and the map
+                // it scrolls into is not that wide.
+                if addr & 2 == 0 {
+                    background.hofs = widened(background.hofs) & 0x1FF;
+                } else {
+                    background.vofs = widened(background.vofs) & 0x1FF;
+                }
+            }
             // `VCOUNT` is where the beam is. There is no writing that.
             _ => {}
         }

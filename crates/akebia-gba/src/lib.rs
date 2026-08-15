@@ -22,10 +22,11 @@
 //! banking by mode, the whole memory map, and interrupts. A cartridge runs, and
 //! a real BIOS can be handed in and boots one.
 //!
-//! The picture unit sweeps, and draws the three bitmap modes. The sweep came
-//! first on purpose — it is what gives a game a sense of time, and without it a
-//! cartridge stops at the first thing it waits for. The tiled modes, which is
-//! what games actually draw with, are not written. See [`ppu`].
+//! The picture unit sweeps and draws: the three bitmap modes, and the
+//! scrolling backgrounds of the tiled ones, which is what games are made of.
+//! The sweep came first on purpose — it is what gives a game a sense of time,
+//! and without it a cartridge stops at the first thing it waits for. Sprites
+//! and the backgrounds that rotate are still missing. See [`ppu`].
 //!
 //! The four memory movers work, which is what carries a game's own code and
 //! graphics from the cartridge into the memory it runs them out of. See

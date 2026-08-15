@@ -33,14 +33,26 @@
 //!
 //! # What is here
 //!
-//! The bitmap modes only. The tiled ones are the ones games draw with and they
-//! are a larger piece of work — four backgrounds, two of which can rotate,
-//! sprites on top of all of them, and a priority order between the lot.
+//! The three bitmap modes, and the scrolling backgrounds of the tiled ones —
+//! all four of mode 0's and the two of mode 1's, drawn in priority order with
+//! the further ones showing through wherever the nearer have nothing.
+//!
+//! Not here: the backgrounds that rotate and scale, which are the other half of
+//! modes 1 and 2; sprites, which sit on top of everything; and the windows,
+//! mosaic and blending that the rest of the register block is for.
 //!
 //! An unwritten mode draws the backdrop rather than nothing, which is what the
 //! hardware does and is also honest: a screen in the backdrop colour says the
 //! picture is not being drawn, where leaving the previous frame's pixels would
 //! say nothing at all.
+//!
+//! # Transparency is index zero, everywhere
+//!
+//! In a palette, entry zero is not a colour: it means nothing is there and
+//! whatever is behind shows through. That one rule is what lets four
+//! backgrounds share a screen, and it is why a game can draw over what is
+//! already on screen without clearing it first. The backdrop — the first colour
+//! of the palette — is what shows when nothing at all has anything to say.
 
 use super::{Ppu, PIXELS};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -51,10 +63,44 @@ const WHITE: u16 = 0x7FFF;
 /// Where the second of the two pictures starts, in the modes that have one.
 const SECOND_FRAME: usize = 0xA000;
 
-/// `DISPCNT`'s bit for the second picture, and the one that enables the
-/// background all three bitmap modes are drawn as.
+/// `DISPCNT`'s bit for the second picture, and the four that switch the
+/// backgrounds on. The bitmap modes are all drawn as background 2.
 const FRAME_SELECT: u16 = 1 << 4;
+const BG0_ENABLED: u16 = 1 << 8;
 const BG2_ENABLED: u16 = 1 << 10;
+
+/// A background control register: what it is drawn from, and where it sits.
+const PRIORITY: u16 = 0x0003;
+const TILE_BASE: u16 = 0x000C;
+/// Sixteen colours per tile, or 256 for the whole background.
+const FULL_COLOUR: u16 = 1 << 7;
+const MAP_BASE: u16 = 0x1F00;
+const SIZE: u16 = 0xC000;
+
+/// A map entry: a tile, which way round it goes, and which palette it uses.
+const TILE_NUMBER: u16 = 0x03FF;
+const FLIP_ACROSS: u16 = 1 << 10;
+const FLIP_DOWN: u16 = 1 << 11;
+
+/// The blocks video memory is handed out in: 2 KiB for a map, 16 KiB for a set
+/// of tiles.
+const MAP_BLOCK: usize = 2 * 1024;
+const TILE_BLOCK: usize = 16 * 1024;
+
+/// How much of video memory the backgrounds have in the tiled modes. The rest
+/// belongs to sprites.
+const BACKGROUND_VRAM: usize = 0x1_0000;
+
+/// How big a scrolling background's map is, in pixels. Both are powers of two,
+/// which is what makes scrolling off an edge a mask rather than a comparison.
+fn text_size(control: u16) -> (usize, usize) {
+    match control & SIZE {
+        0x0000 => (256, 256),
+        0x4000 => (512, 256),
+        0x8000 => (256, 512),
+        _ => (512, 512),
+    }
+}
 
 /// Mode 5's picture is smaller than the screen, and what is not covered by it
 /// stays the backdrop colour.
@@ -84,19 +130,148 @@ impl Ppu {
         self.frame[at..at + SCREEN_WIDTH].fill(backdrop);
 
         // All three bitmap modes are drawn as background 2, and a game can turn
-        // that off — in which case the backdrop is the whole picture.
-        if self.dispcnt & BG2_ENABLED == 0 {
-            return;
-        }
+        // that off — in which case the backdrop is the whole picture. This is
+        // the bitmap modes' own condition and not a general one: the tiled
+        // modes have four backgrounds with an enable bit each, and testing
+        // background 2's for them would blank a screen drawn on any of the
+        // other three.
+        let bitmap_on = self.dispcnt & BG2_ENABLED != 0;
 
         match self.mode() {
-            3 => self.draw_direct_line(line, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
-            4 => self.draw_indexed_line(line),
-            5 => self.draw_direct_line(line, self.picture_base(), SMALL_WIDTH, SMALL_HEIGHT),
-            // Modes 0 to 2 are not drawn yet, and 6 and 7 are not modes: the
-            // hardware draws nothing for them either.
+            // The tiled modes, where a screenful of graphics is a small set of
+            // blocks and a map saying where each goes.
+            0..=2 => self.draw_tiled_line(line),
+            3 if bitmap_on => self.draw_direct_line(line, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
+            4 if bitmap_on => self.draw_indexed_line(line),
+            5 if bitmap_on => {
+                self.draw_direct_line(line, self.picture_base(), SMALL_WIDTH, SMALL_HEIGHT)
+            }
+            // Six and seven are not modes: the hardware draws nothing for them
+            // either.
             _ => {}
         }
+    }
+
+    /// A line of the tiled modes: every background that is switched on, drawn
+    /// back to front.
+    ///
+    /// # Why back to front
+    ///
+    /// Because that way nothing has to be asked twice. Each background is drawn
+    /// over what is already there and skips its own transparent pixels, so the
+    /// nearest one that has something to say at a given pixel is the last to
+    /// write it — which is precisely the rule the hardware follows, arrived at
+    /// without comparing anything.
+    ///
+    /// Priority 3 is furthest back. Backgrounds sharing a priority are ordered
+    /// by number, with 0 nearest, so counting both loops downwards puts every
+    /// one of them in the right place.
+    fn draw_tiled_line(&mut self, line: usize) {
+        for priority in (0..4).rev() {
+            for index in (0..4).rev() {
+                if self.background_is_on(index) && self.priority_of(index) == priority {
+                    self.draw_text_background(index, line);
+                }
+            }
+        }
+    }
+
+    /// Whether a background exists in this mode and has been switched on.
+    ///
+    /// Which of the four exist is decided by the mode, and it is not a matter
+    /// of a game simply not using the others: mode 2 has no background 0 or 1
+    /// at all, and the enable bits for them do nothing.
+    fn background_is_on(&self, index: usize) -> bool {
+        if self.dispcnt & (BG0_ENABLED << index) == 0 {
+            return false;
+        }
+        // Only the ones drawn from a map of tiles and a scroll position are
+        // here. Modes 1 and 2 have backgrounds that are rotated and scaled
+        // instead, and those are not drawn yet.
+        match self.mode() {
+            0 => true,
+            1 => index < 2,
+            _ => false,
+        }
+    }
+
+    fn priority_of(&self, index: usize) -> u16 {
+        self.backgrounds[index].control & PRIORITY
+    }
+
+    /// One line of one scrolling background.
+    fn draw_text_background(&mut self, index: usize, line: usize) {
+        let background = self.backgrounds[index];
+        let (width, height) = text_size(background.control);
+        let map_base = usize::from((background.control & MAP_BASE) >> 8) * MAP_BLOCK;
+        let tile_base = usize::from((background.control & TILE_BASE) >> 2) * TILE_BLOCK;
+        let full_colour = background.control & FULL_COLOUR != 0;
+
+        // The map is a torus: scrolling off one edge brings the other edge
+        // round. Both sizes are powers of two, so the wrap is a mask.
+        let y = (line + usize::from(background.vofs)) & (height - 1);
+        let at = line * SCREEN_WIDTH;
+
+        for x in 0..SCREEN_WIDTH {
+            let sx = (x + usize::from(background.hofs)) & (width - 1);
+            let entry = self.map_entry(map_base, sx / 8, y / 8, width);
+
+            // Which pixel of the tile, once the two mirror bits have had their
+            // say. A tile is used many times over and flipped differently each
+            // time, which is most of why a map costs so little.
+            let mut px = sx % 8;
+            let mut py = y % 8;
+            if entry & FLIP_ACROSS != 0 {
+                px = 7 - px;
+            }
+            if entry & FLIP_DOWN != 0 {
+                py = 7 - py;
+            }
+
+            let tile = usize::from(entry & TILE_NUMBER);
+            let colour = if full_colour {
+                // A byte a pixel, and the one palette of 256.
+                self.background_byte(tile_base + tile * 64 + py * 8 + px)
+            } else {
+                // A nibble a pixel, low half first, and one of sixteen palettes
+                // of sixteen chosen per map entry.
+                let pair = self.background_byte(tile_base + tile * 32 + py * 4 + px / 2);
+                let index = if px & 1 == 0 { pair & 0xF } else { pair >> 4 };
+                if index == 0 { 0 } else { (entry >> 12) as u8 * 16 + index }
+            };
+
+            // Index zero is nothing rather than a colour, and what is behind
+            // shows through. It is what lets four backgrounds share a screen.
+            if colour != 0 {
+                self.frame[at + x] = self.colour(colour);
+            }
+        }
+    }
+
+    /// One entry of a background's map: which tile goes at that square, which
+    /// way round, and out of which palette.
+    ///
+    /// # The map is not one rectangle
+    ///
+    /// It is up to four squares of 32 by 32 laid out side by side, each its own
+    /// 2 KiB block, and a wide map's right-hand half is a *different block*
+    /// rather than the far end of a longer row. Treating it as one rectangle
+    /// draws the correct picture for the small size and a scrambled one for
+    /// every other, which is the kind of mistake that only shows up on the
+    /// second background a game happens to make wide.
+    fn map_entry(&self, base: usize, column: usize, row: usize, width: usize) -> u16 {
+        let block = column / 32 + (row / 32) * (width / 256);
+        let at = base + block * MAP_BLOCK + ((row % 32) * 32 + column % 32) * 2;
+        u16::from(self.background_byte(at)) | (u16::from(self.background_byte(at + 1)) << 8)
+    }
+
+    /// A byte of the half of video memory the backgrounds live in.
+    ///
+    /// The top 32 KiB belong to sprites in these modes and a background cannot
+    /// reach them: an address that would is folded back rather than reaching
+    /// something that is not its own.
+    fn background_byte(&self, at: usize) -> u8 {
+        self.vram[at & (BACKGROUND_VRAM - 1)]
     }
 
     /// A line of a picture stored as colours, two bytes each.
@@ -354,6 +529,291 @@ mod tests {
 
         assert_eq!(pixel(&ppu, 0, 0), RED, "drawn while the background was on");
         assert_eq!(pixel(&ppu, 0, 120), GREEN, "and this one after it went off");
+    }
+
+    // --- The tiled modes -------------------------------------------------
+
+    /// Points a background at a set of tiles and a map, and switches it on.
+    fn background(ppu: &mut Ppu, index: usize, control: u16) {
+        let at = crate::ppu::BG_CONTROL + index as u32 * 2;
+        ppu.write8(at, control as u8);
+        ppu.write8(at + 1, (control >> 8) as u8);
+        let on = ppu.dispcnt() | (BG0_ENABLED << index);
+        ppu.write8(DISPCNT + 1, (on >> 8) as u8);
+    }
+
+    fn scroll(ppu: &mut Ppu, index: usize, across: u16, down: u16) {
+        let at = crate::ppu::BG_SCROLL + index as u32 * 4;
+        ppu.write8(at, across as u8);
+        ppu.write8(at + 1, (across >> 8) as u8);
+        ppu.write8(at + 2, down as u8);
+        ppu.write8(at + 3, (down >> 8) as u8);
+    }
+
+    /// Fills a tile with one colour index, four bits a pixel.
+    ///
+    /// Never tile 0 in these tests. A map entry that has not been written is
+    /// zero, which names tile 0, so filling that one covers the whole screen
+    /// with it and every assertion about an empty square measures nothing. It
+    /// is the arrangement games use as well: tile 0 is left blank so that an
+    /// unwritten map is an empty screen.
+    fn fill_tile(ppu: &mut Ppu, base: usize, tile: usize, index: u8) {
+        assert_ne!(tile, 0, "tile 0 is what an unwritten map entry names");
+        let both = index | (index << 4);
+        for byte in 0..32 {
+            ppu.vram_mut()[base + tile * 32 + byte] = both;
+        }
+    }
+
+    /// One square of a map, in whichever of its blocks that square falls.
+    fn set_map(ppu: &mut Ppu, base: usize, column: usize, row: usize, width: usize, entry: u16) {
+        let block = column / 32 + (row / 32) * (width / 256);
+        let at = base + block * MAP_BLOCK + ((row % 32) * 32 + column % 32) * 2;
+        ppu.vram_mut()[at] = entry as u8;
+        ppu.vram_mut()[at + 1] = (entry >> 8) as u8;
+    }
+
+    /// A background out of a map and a set of tiles, which is the arrangement
+    /// nearly every game draws with.
+    #[test]
+    fn a_tiled_background_puts_its_tiles_where_the_map_says() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        // Tiles in the second 16 KiB block, map in the second 2 KiB one.
+        background(&mut ppu, 0, (1 << 2) | (1 << 8));
+        fill_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_map(&mut ppu, MAP_BLOCK, 2, 1, 256, 1);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 16, 8), RED, "the square the map filled");
+        assert_eq!(pixel(&ppu, 23, 15), RED, "and all eight pixels of it");
+        assert_eq!(pixel(&ppu, 24, 8), BLUE, "the square beside it is empty");
+        assert_eq!(pixel(&ppu, 16, 0), BLUE, "and the one above it");
+    }
+
+    /// The mode with one palette of 256 rather than sixteen of sixteen: a byte
+    /// a pixel, and twice the memory per tile.
+    #[test]
+    fn a_background_can_use_one_palette_of_two_hundred_and_fifty_six() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 200, GREEN);
+
+        background(&mut ppu, 0, FULL_COLOUR | (1 << 8));
+        // A byte a pixel, so a tile is 64 bytes and tile 1 begins at 64.
+        for byte in 64..128 {
+            ppu.vram_mut()[byte] = 200;
+        }
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), GREEN, "an index past sixteen was reached");
+        assert_eq!(pixel(&ppu, 7, 7), GREEN);
+    }
+
+    /// Sixteen palettes of sixteen, chosen per square. It is what lets one tile
+    /// be drawn in several colour schemes without a copy of it.
+    #[test]
+    fn a_map_entry_chooses_which_of_the_sixteen_palettes_its_tile_uses() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 1, RED);
+        // The third palette's first colour is entry 2 * 16 + 1.
+        set_colour(&mut ppu, 2 * 16 + 1, GREEN);
+
+        background(&mut ppu, 0, 1 << 8);
+        fill_tile(&mut ppu, 0, 1, 1);
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+        set_map(&mut ppu, MAP_BLOCK, 1, 0, 256, (2 << 12) | 1);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the first palette");
+        assert_eq!(pixel(&ppu, 8, 0), GREEN, "and the same tile in the third");
+    }
+
+    /// A tile can be used either way round, which is most of why a map costs so
+    /// little: a symmetrical picture is stored once.
+    #[test]
+    fn a_tile_can_be_mirrored_either_way() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+        background(&mut ppu, 0, 1 << 8);
+
+        // Tile 1, with its top-left pixel set and nothing else.
+        ppu.vram_mut()[32] = 0x01;
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+        set_map(&mut ppu, MAP_BLOCK, 1, 0, 256, FLIP_ACROSS | 1);
+        set_map(&mut ppu, MAP_BLOCK, 2, 0, 256, FLIP_DOWN | 1);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the corner it was drawn in");
+        assert_eq!(pixel(&ppu, 15, 0), RED, "mirrored across, so the far side");
+        assert_eq!(pixel(&ppu, 8, 0), BLUE, "and not the near one");
+        assert_eq!(pixel(&ppu, 16, 7), RED, "mirrored down, so the bottom");
+        assert_eq!(pixel(&ppu, 16, 0), BLUE);
+    }
+
+    /// The nearer background wins where both have something, and the further
+    /// one shows through where the nearer has nothing.
+    #[test]
+    fn the_nearer_background_covers_the_further_one() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 1, RED);
+        set_colour(&mut ppu, 2, GREEN);
+
+        // Background 1 is nearer despite its higher number, because priority
+        // decides first: 2 is further back than 0.
+        background(&mut ppu, 0, 2 | (1 << 8));
+        background(&mut ppu, 1, 2 << 8);
+        fill_tile(&mut ppu, 0, 1, 1);
+        fill_tile(&mut ppu, 0, 2, 2);
+
+        // The far one covers two squares, the near one only the first.
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+        set_map(&mut ppu, MAP_BLOCK, 1, 0, 256, 1);
+        set_map(&mut ppu, MAP_BLOCK * 2, 0, 0, 256, 2);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), GREEN, "the nearer background");
+        assert_eq!(pixel(&ppu, 8, 0), RED, "and the further one beside it");
+    }
+
+    /// Sharing a priority, the lower-numbered background is nearer. Without
+    /// that rule two backgrounds at the same priority would be undefined
+    /// against each other.
+    #[test]
+    fn backgrounds_at_the_same_priority_are_ordered_by_number() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 1, RED);
+        set_colour(&mut ppu, 2, GREEN);
+
+        background(&mut ppu, 0, 1 << 8);
+        background(&mut ppu, 1, 2 << 8);
+        fill_tile(&mut ppu, 0, 1, 1);
+        fill_tile(&mut ppu, 0, 2, 2);
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+        set_map(&mut ppu, MAP_BLOCK * 2, 0, 0, 256, 2);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "background 0 is in front of 1");
+    }
+
+    /// Scrolling moves the window into the map, and running off an edge brings
+    /// the other edge round rather than running out.
+    #[test]
+    fn scrolling_moves_the_window_and_wraps_at_the_edge() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        background(&mut ppu, 0, 1 << 8);
+        fill_tile(&mut ppu, 0, 1, 1);
+        // One square, at the very top left of a 256 by 256 map.
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+
+        scroll(&mut ppu, 0, 8, 0);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), BLUE, "the square scrolled off the left");
+
+        // Scrolled by a whole map, which brings it back to where it started.
+        scroll(&mut ppu, 0, 256, 0);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "and a whole map round is home again");
+
+        // And one short of that puts its last column in the first pixel.
+        scroll(&mut ppu, 0, 255, 0);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 1, 0), RED, "wrapped round the edge");
+    }
+
+    /// A map wider than 256 pixels is not one long rectangle: its right-hand
+    /// half is a separate 2 KiB block. Treating it as one draws the small size
+    /// correctly and scrambles every other.
+    #[test]
+    fn a_wide_map_keeps_its_second_half_in_the_next_block() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        // 512 by 256, so two blocks side by side.
+        background(&mut ppu, 0, (1 << 8) | 0x4000);
+        fill_tile(&mut ppu, 0, 1, 1);
+        // Column 32 is the first column of the second block.
+        set_map(&mut ppu, MAP_BLOCK, 32, 0, 512, 1);
+
+        scroll(&mut ppu, 0, 256, 0);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the second block was reached");
+
+        scroll(&mut ppu, 0, 0, 0);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), BLUE, "and is not visible from the first");
+    }
+
+    /// The regression that a picture caught and no test would have: the enable
+    /// bit the bitmap modes are drawn through is background 2's, and testing it
+    /// in a tiled mode blanks a screen drawn on any of the other three. Two
+    /// commercial cartridges and two test ROMs came out empty.
+    #[test]
+    fn a_tiled_background_does_not_need_the_bitmap_modes_enable_bit() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 0);
+        set_colour(&mut ppu, 1, RED);
+
+        background(&mut ppu, 0, 1 << 8);
+        assert_eq!(ppu.dispcnt() & BG2_ENABLED, 0, "background 2 is switched off");
+        fill_tile(&mut ppu, 0, 1, 1);
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "and background 0 is drawn regardless");
+    }
+
+    /// Which backgrounds exist is the mode's business. Mode 2 has no
+    /// background 0, and its enable bit does nothing.
+    #[test]
+    fn a_background_the_mode_does_not_have_is_not_drawn() {
+        let mut ppu = Ppu::new();
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+        fill_tile(&mut ppu, 0, 1, 1);
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+
+        ppu.write8(DISPCNT, 0);
+        background(&mut ppu, 0, 1 << 8);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), RED, "mode 0 has background 0");
+
+        ppu.write8(DISPCNT, 2);
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), BLUE, "and mode 2 does not");
+    }
+
+    /// The scroll registers are write-only, and answering with what was stored
+    /// would let code run here that would not run on the hardware.
+    #[test]
+    fn the_scroll_position_cannot_be_read_back() {
+        let mut ppu = Ppu::new();
+        scroll(&mut ppu, 0, 0x1FF, 0x1FF);
+        for offset in 0..4 {
+            assert_eq!(ppu.read8(crate::ppu::BG_SCROLL + offset), 0, "offset {offset}");
+        }
+
+        // The control register beside them does read back, so this is a rule
+        // about those four and not about the block they are in.
+        background(&mut ppu, 0, 0x1234);
+        assert_eq!(ppu.read8(crate::ppu::BG_CONTROL), 0x34);
     }
 
     /// Only the drawn lines are drawn. The beam sweeps 68 more below the screen
