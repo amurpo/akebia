@@ -2,8 +2,21 @@
 //!
 //! ```text
 //! cargo run --release -p akebia-gba --example run -- arm.gba
+//! cargo run --release -p akebia-gba --example run -- game.gba --bios gba_bios.bin
 //! cargo run --release -p akebia-gba --example run -- arm.gba --trace 40
 //! ```
+//!
+//! # Where it starts, and why not at the beginning
+//!
+//! With a BIOS given, `--boot` starts the machine where the hardware does, at
+//! address zero, and lets the sixteen kibibytes run: the logo check, the
+//! animation, the jump into the cartridge. That wants a picture unit and timers
+//! to answer, because the animation waits on them, so it is not the default.
+//!
+//! Without `--boot` the machine starts in the cartridge with the registers the
+//! BIOS would have left. A BIOS given is still loaded and still used — it is
+//! only the *boot* that is skipped, and every `SWI` a game makes from then on
+//! goes to the real handler.
 //!
 //! # What this is for
 //!
@@ -36,22 +49,45 @@ const DEFAULT_STEPS: u64 = 50_000_000;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: run <rom.gba> [--steps N] [--trace N]");
+        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N]");
         return ExitCode::FAILURE;
     };
 
     let mut limit = DEFAULT_STEPS;
     let mut trace = 0u64;
+    let mut bios = None;
+    let mut boot = false;
     while let Some(flag) = args.next() {
-        let value = args.next().and_then(|v| v.parse().ok());
-        match (flag.as_str(), value) {
-            ("--steps", Some(n)) => limit = n,
-            ("--trace", Some(n)) => trace = n,
+        match flag.as_str() {
+            "--boot" => boot = true,
+            "--bios" => match args.next() {
+                Some(path) => bios = Some(path),
+                None => {
+                    eprintln!("--bios wants a file");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--steps" | "--trace" => {
+                let Some(n) = args.next().and_then(|v| v.parse().ok()) else {
+                    eprintln!("{flag} wants a number");
+                    return ExitCode::FAILURE;
+                };
+                if flag == "--steps" {
+                    limit = n;
+                } else {
+                    trace = n;
+                }
+            }
             _ => {
                 eprintln!("unrecognised option: {flag}");
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    if boot && bios.is_none() {
+        eprintln!("--boot wants a BIOS to boot from");
+        return ExitCode::FAILURE;
     }
 
     let image = match std::fs::read(&path) {
@@ -66,6 +102,27 @@ fn main() -> ExitCode {
     mem.load_rom(&image);
     println!("{path}: {} bytes", mem.rom_len());
 
+    if let Some(path) = &bios {
+        match std::fs::read(path) {
+            Ok(image) => {
+                // Sixteen kibibytes exactly. Anything else is not this BIOS and
+                // saying so beats loading a prefix of it and wondering later.
+                if image.len() != akebia_gba::bus::BIOS_LEN {
+                    eprintln!("{path}: {} bytes, expected {}", image.len(), akebia_gba::bus::BIOS_LEN);
+                    return ExitCode::FAILURE;
+                }
+                mem.load_bios(&image);
+                println!("{path}: loaded");
+            }
+            Err(why) => {
+                eprintln!("{path}: {why}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("no BIOS: a call into it will go to an empty vector");
+    }
+
     let mut cpu = Cpu::new();
     // Straight into the cartridge, in the mode and with the stacks the BIOS
     // would have left. A real machine runs sixteen kibibytes of BIOS first; a
@@ -77,7 +134,16 @@ fn main() -> ExitCode {
     cpu.regs.set(13, 0x0300_7FA0);
     cpu.regs.set_mode(akebia_gba::Mode::System);
     cpu.regs.set(13, 0x0300_7F00);
-    cpu.regs.set_pc(ROM_BASE);
+
+    if boot {
+        // Where the hardware starts. Everything above was the BIOS's to set and
+        // it is about to set it again.
+        cpu.regs.set_mode(akebia_gba::Mode::Supervisor);
+        cpu.regs.set_pc(0);
+        println!("booting from the BIOS");
+    } else {
+        cpu.regs.set_pc(ROM_BASE);
+    }
 
     let outcome = run(&mut cpu, &mut mem, limit, trace);
     report(&cpu, &mem, &outcome);
