@@ -88,6 +88,6 @@ impl Cpu {
 
         let instruction = bus.read32(addr);
         self.regs.set_pc(addr.wrapping_add(4));
-        arm::execute(&mut self.regs, addr, instruction)
+        arm::execute(&mut self.regs, bus, addr, instruction)
     }
 }

@@ -29,7 +29,7 @@ use super::alu::{self, Op};
 use super::condition::Condition;
 use super::registers::{Registers, T};
 use super::shift::{self, Kind};
-use super::Fault;
+use super::{Bus, Fault};
 
 /// How far ahead `R15` reads while an instruction executes.
 const PIPELINE: u32 = 8;
@@ -43,7 +43,12 @@ const PIPELINE_SHIFTED: u32 = 12;
 /// `addr` is where it came from, which is not `regs.pc()` — that has already
 /// been moved on to the next one so that anything failing to branch simply
 /// carries on.
-pub fn execute(regs: &mut Registers, addr: u32, instruction: u32) -> Result<(), Fault> {
+pub fn execute(
+    regs: &mut Registers,
+    bus: &mut impl Bus,
+    addr: u32,
+    instruction: u32,
+) -> Result<(), Fault> {
     if !Condition::from_bits(instruction >> 28).passes(regs) {
         // A failed condition costs the fetch and nothing else. In particular no
         // operand is read and no addressing mode writes anything back.
@@ -59,11 +64,26 @@ pub fn execute(regs: &mut Registers, addr: u32, instruction: u32) -> Result<(), 
     }
 
     match (instruction >> 25) & 0b111 {
+        // The second carve-out. Bits 7 and 4 both set, in a space that would
+        // otherwise be a data operation with a register-specified shift, means
+        // one of the instructions that had nowhere else to go: the transfers
+        // narrower than a word, the swap, and the multiplies.
+        0b000 if instruction & 0b1001_0000 == 0b1001_0000 => {
+            narrow_or_swap(regs, bus, addr, instruction)
+        }
+        0b000 | 0b001 => data_processing(regs, addr, instruction),
+        // A register offset with bit 4 set is not a transfer at all: the
+        // architecture reserves it, and a shift amount from a register is the
+        // one thing an address cannot be built with.
+        0b011 if instruction & 0b1_0000 != 0 => Err(Fault::Undefined { addr, instruction }),
+        0b010 | 0b011 => {
+            single_transfer(regs, bus, addr, instruction);
+            Ok(())
+        }
         0b101 => {
             branch(regs, addr, instruction);
             Ok(())
         }
-        0b000 | 0b001 => data_processing(regs, addr, instruction),
         _ => Err(Fault::Undefined { addr, instruction }),
     }
 }
@@ -181,6 +201,214 @@ fn second_operand(regs: &Registers, instruction: u32, pc: u32) -> (u32, bool) {
         shift::by_immediate(kind, (instruction >> 7) & 0x1F, value, regs.c())
     };
     (out.value, out.carry)
+}
+
+/// Where a transfer reads or writes, and what its base register is left
+/// holding.
+///
+/// The two are separate because the order they are applied in matters: a load
+/// whose destination *is* its base has to end up holding what came out of
+/// memory, not the address it came from.
+struct Address {
+    access: u32,
+    /// The base register and its new value, when the addressing mode moves it.
+    writeback: Option<(usize, u32)>,
+}
+
+/// Works out the address from the base, the offset and the four bits that say
+/// how to put them together.
+///
+/// # The two indexing modes
+///
+/// *Pre*-indexed adds the offset and uses the result, optionally keeping it.
+/// *Post*-indexed uses the base as it stands and then moves it, always keeping
+/// it — which is what makes walking an array one instruction per element.
+///
+/// The write-back bit means something else entirely in the post-indexed form,
+/// where the write-back is not optional: there it asks for the access to be
+/// made with a user-mode program's rights from a privileged mode, which is how
+/// an operating system touches memory on behalf of a caller without lending it
+/// its own privileges. This machine has no memory protection, so nothing comes
+/// of it here, and it is named rather than silently ignored.
+fn addressing(instruction: u32, base: usize, base_value: u32, offset: u32) -> Address {
+    let up = instruction & (1 << 23) != 0;
+    let pre = instruction & (1 << 24) != 0;
+
+    let moved = if up { base_value.wrapping_add(offset) } else { base_value.wrapping_sub(offset) };
+    let keeps = if pre { instruction & (1 << 21) != 0 } else { true };
+
+    Address {
+        access: if pre { moved } else { base_value },
+        writeback: if keeps { Some((base, moved)) } else { None },
+    }
+}
+
+/// `LDR` and `STR`: a word or a byte.
+fn single_transfer(regs: &mut Registers, bus: &mut impl Bus, addr: u32, instruction: u32) {
+    let rn = ((instruction >> 16) & 0xF) as usize;
+    let rd = ((instruction >> 12) & 0xF) as usize;
+    let pc = addr.wrapping_add(PIPELINE);
+    let read = |regs: &Registers, index: usize| if index == 15 { pc } else { regs.get(index) };
+
+    // The bit that chooses between a constant and a register offset is the
+    // opposite way round from the one in a data operation: here a set bit means
+    // a register. Two instruction classes, two conventions, one bit position -
+    // and an emulator that carries the data-processing reading over builds
+    // every address out of the wrong thing.
+    let offset = if instruction & (1 << 25) == 0 {
+        instruction & 0xFFF
+    } else {
+        // A shifted register, but the shift amount is always a constant: there
+        // is no room for a second register and no addressing mode wants one.
+        let kind = Kind::from_bits(instruction >> 5);
+        let value = read(regs, (instruction & 0xF) as usize);
+        shift::by_immediate(kind, (instruction >> 7) & 0x1F, value, regs.c()).value
+    };
+
+    let at = addressing(instruction, rn, read(regs, rn), offset);
+    let byte = instruction & (1 << 22) != 0;
+
+    if instruction & (1 << 20) != 0 {
+        // A load. The base moves first so that a load into its own base register
+        // comes out holding what memory gave, which is what the hardware does
+        // and the only reading that is any use.
+        if let Some((index, value)) = at.writeback {
+            regs.set(index, value);
+        }
+        let value = if byte {
+            u32::from(bus.read8(at.access))
+        } else {
+            // The bus reads the aligned word; the rotation on top is the
+            // processor's. An unaligned load does not fetch across the boundary
+            // - it brings back the word the address is inside and turns it so
+            // the addressed byte is at the bottom.
+            bus.read32(at.access).rotate_right((at.access & 3) * 8)
+        };
+        regs.set(rd, value);
+    } else {
+        // A store of `R15` puts down twelve bytes on rather than the eight it
+        // reads as everywhere else. It is a quirk of this processor and not of
+        // the architecture, which leaves it open; nothing sensible relies on
+        // it and test ROMs check it.
+        let value = if rd == 15 { addr.wrapping_add(PIPELINE_SHIFTED) } else { regs.get(rd) };
+        if byte {
+            bus.write8(at.access, value as u8);
+        } else {
+            bus.write32(at.access, value);
+        }
+        if let Some((index, value)) = at.writeback {
+            regs.set(index, value);
+        }
+    }
+}
+
+/// The transfers narrower than a word, and the swap, which share an encoding
+/// carved out of the data-processing space.
+fn narrow_or_swap(
+    regs: &mut Registers,
+    bus: &mut impl Bus,
+    addr: u32,
+    instruction: u32,
+) -> Result<(), Fault> {
+    match (instruction >> 5) & 0b11 {
+        // The multiplies and the swap live here. Only the swap is written yet.
+        0b00 => {
+            if instruction & 0x0FB0_0FF0 == 0x0100_0090 {
+                swap(regs, bus, instruction);
+                Ok(())
+            } else {
+                Err(Fault::Undefined { addr, instruction })
+            }
+        }
+        kind => {
+            narrow_transfer(regs, bus, addr, instruction, kind);
+            Ok(())
+        }
+    }
+}
+
+/// `LDRH`, `STRH`, `LDRSB` and `LDRSH`.
+///
+/// `kind` is the two bits that pick between them, already known not to be zero.
+fn narrow_transfer(
+    regs: &mut Registers,
+    bus: &mut impl Bus,
+    addr: u32,
+    instruction: u32,
+    kind: u32,
+) {
+    let rn = ((instruction >> 16) & 0xF) as usize;
+    let rd = ((instruction >> 12) & 0xF) as usize;
+    let pc = addr.wrapping_add(PIPELINE);
+    let read = |regs: &Registers, index: usize| if index == 15 { pc } else { regs.get(index) };
+
+    // A constant offset is split across the instruction in two nibbles, because
+    // the bits in between were already spoken for by the register form.
+    let offset = if instruction & (1 << 22) != 0 {
+        ((instruction >> 4) & 0xF0) | (instruction & 0xF)
+    } else {
+        read(regs, (instruction & 0xF) as usize)
+    };
+
+    let at = addressing(instruction, rn, read(regs, rn), offset);
+
+    if instruction & (1 << 20) == 0 {
+        // The only store among them: a halfword. There is no signed store,
+        // signedness being a question about how a value is widened and a store
+        // widening nothing.
+        let value = if rd == 15 { addr.wrapping_add(PIPELINE_SHIFTED) } else { regs.get(rd) };
+        bus.write16(at.access, value as u16);
+        if let Some((index, value)) = at.writeback {
+            regs.set(index, value);
+        }
+        return;
+    }
+
+    if let Some((index, value)) = at.writeback {
+        regs.set(index, value);
+    }
+
+    let value = match kind {
+        // Unsigned halfword. From an odd address the hardware does something
+        // that looks like nothing anybody wanted: it reads the halfword
+        // underneath and rotates the whole word by eight, so the answer has the
+        // addressed byte at the bottom and the other one up at the top.
+        0b01 => u32::from(bus.read16(at.access)).rotate_right((at.access & 1) * 8),
+        // Signed byte.
+        0b10 => bus.read8(at.access) as i8 as u32,
+        // Signed halfword - except from an odd address, where it is not a
+        // halfword load at all. The processor gives up on the halfword and
+        // sign-extends the single byte there instead, which is the strangest
+        // documented behaviour in the instruction set and exactly what a test
+        // ROM will ask about.
+        _ if at.access & 1 != 0 => bus.read8(at.access) as i8 as u32,
+        _ => bus.read16(at.access) as i16 as u32,
+    };
+    regs.set(rd, value);
+}
+
+/// `SWP`: read a word or a byte, put another in its place, and hand back what
+/// was there.
+///
+/// On hardware the two accesses are one indivisible operation, which is the
+/// whole point of it - it is how a lock is taken. Here nothing else can run in
+/// between anyway, so the atomicity costs nothing to honour.
+fn swap(regs: &mut Registers, bus: &mut impl Bus, instruction: u32) {
+    let address = regs.get(((instruction >> 16) & 0xF) as usize);
+    let rd = ((instruction >> 12) & 0xF) as usize;
+    let source = regs.get((instruction & 0xF) as usize);
+
+    if instruction & (1 << 22) != 0 {
+        let was = bus.read8(address);
+        bus.write8(address, source as u8);
+        regs.set(rd, u32::from(was));
+    } else {
+        // The load rotates the same way any other unaligned word load does, and
+        // the store goes to the aligned address underneath.
+        let was = bus.read32(address).rotate_right((address & 3) * 8);
+        bus.write32(address, source);
+        regs.set(rd, was);
+    }
 }
 
 /// `MRS` and `MSR`: reading and writing the status registers.
@@ -563,6 +791,278 @@ mod tests {
         let (mut cpu, mut mem) = machine(&[mov_imm(0, 1)]);
         cpu.regs.set_thumb(true);
         assert_eq!(cpu.step(&mut mem).unwrap_err(), Fault::Thumb { addr: BASE });
+    }
+
+    /// Somewhere to load from and store to, well away from the code.
+    const DATA: u32 = BASE + 0x400;
+
+    #[test]
+    fn a_word_goes_out_to_memory_and_comes_back() {
+        // MOV r1,#<DATA offset> is awkward as a constant, so the base is set by
+        // hand and the program is the two transfers alone.
+        // STR r0,[r1] / LDR r2,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE581_0000, 0xE591_2000]);
+        cpu.regs.set(0, 0x1234_5678);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), 0x1234_5678, "the store landed");
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x1234_5678, "and came back");
+    }
+
+    /// A byte transfer moves one byte and widens with zeros.
+    #[test]
+    fn a_byte_transfer_touches_one_byte_and_widens_with_zeros() {
+        // STRB r0,[r1] / LDRB r2,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE5C1_0000, 0xE5D1_2000]);
+        mem.write32(DATA, 0xFFFF_FFFF);
+        cpu.regs.set(0, 0x1234_5678);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), 0xFFFF_FF78, "one byte and no other");
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x78, "and no sign came with it");
+    }
+
+    /// The bit that chooses a constant or a register offset is the opposite way
+    /// round from the one in a data operation. Carrying that reading over builds
+    /// every address out of the wrong thing.
+    #[test]
+    fn the_offset_bit_means_the_opposite_of_what_it_does_in_a_data_operation() {
+        // LDR r2,[r1,#4] - bit 25 clear, so the twelve bits are the offset.
+        let (mut cpu, mut mem) = machine(&[0xE591_2004]);
+        mem.write32(DATA + 4, 0xCAFE);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xCAFE);
+
+        // LDR r2,[r1,r3] - bit 25 set, so the offset is a register.
+        let (mut cpu, mut mem) = machine(&[0xE791_2003]);
+        mem.write32(DATA + 8, 0xBEEF);
+        cpu.regs.set(1, DATA);
+        cpu.regs.set(3, 8);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xBEEF);
+    }
+
+    /// A register offset goes through the shifter, which is how an array of
+    /// words is indexed in one instruction.
+    #[test]
+    fn a_register_offset_passes_through_the_shifter() {
+        // LDR r2,[r1,r3,LSL #2]
+        let (mut cpu, mut mem) = machine(&[0xE791_2103]);
+        mem.write32(DATA + 12, 0xF00D);
+        cpu.regs.set(1, DATA);
+        cpu.regs.set(3, 3);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xF00D, "three words on");
+    }
+
+    /// Down as well as up: the same offset, subtracted.
+    #[test]
+    fn an_offset_can_go_downwards() {
+        // LDR r2,[r1,#-4]
+        let (mut cpu, mut mem) = machine(&[0xE511_2004]);
+        mem.write32(DATA - 4, 0xABCD);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xABCD);
+    }
+
+    /// Pre-indexed with write-back moves the base and uses the moved value.
+    /// Post-indexed uses the base and then moves it. Between them they are how
+    /// an array is walked one instruction per element.
+    #[test]
+    fn the_two_indexing_modes_differ_in_which_address_is_used() {
+        mem_pair(0xE5B1_2004, DATA + 4, "pre-indexed uses the moved address");
+        mem_pair(0xE491_2004, DATA, "post-indexed uses the base as it stands");
+    }
+
+    /// Both of the above leave the base moved by four.
+    fn mem_pair(instruction: u32, expected_at: u32, why: &str) {
+        let (mut cpu, mut mem) = machine(&[instruction]);
+        mem.write32(expected_at, 0x5A5A);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x5A5A, "{why}");
+        assert_eq!(cpu.regs.get(1), DATA + 4, "{why}: and the base moved");
+    }
+
+    /// Pre-indexed *without* write-back leaves the base alone, which is the
+    /// ordinary way a structure field is reached.
+    #[test]
+    fn an_offset_without_write_back_leaves_the_base_where_it_was() {
+        // LDR r2,[r1,#4]
+        let (mut cpu, mut mem) = machine(&[0xE591_2004]);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(1), DATA, "untouched");
+    }
+
+    /// A load into its own base register has to come out holding what memory
+    /// gave, not the address it came from. The order the two writes happen in
+    /// is the whole of it.
+    #[test]
+    fn a_load_into_its_own_base_keeps_what_memory_gave() {
+        // LDR r1,[r1],#4 - post-indexed, so the base would move to DATA+4.
+        let (mut cpu, mut mem) = machine(&[0xE491_1004]);
+        mem.write32(DATA, 0xD0D0_D0D0);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(1), 0xD0D0_D0D0, "the load won, not the write-back");
+    }
+
+    /// An unaligned load does not fetch across the boundary. It brings back the
+    /// word its address is inside and turns it so the addressed byte is at the
+    /// bottom - which is the processor's doing, not the memory's.
+    #[test]
+    fn an_unaligned_word_load_comes_back_rotated() {
+        for (skew, wanted) in
+            [(0u32, 0x1122_3344u32), (1, 0x4411_2233), (2, 0x3344_1122), (3, 0x2233_4411)]
+        {
+            // LDR r2,[r1]
+            let (mut cpu, mut mem) = machine(&[0xE591_2000]);
+            mem.write32(DATA, 0x1122_3344);
+            cpu.regs.set(1, DATA + skew);
+            cpu.step(&mut mem).unwrap();
+            assert_eq!(cpu.regs.get(2), wanted, "skewed by {skew}");
+        }
+    }
+
+    /// A halfword, and the odd-address behaviour that looks like nothing
+    /// anybody wanted: the whole word rotates by eight.
+    #[test]
+    fn a_halfword_loads_and_stores_and_rotates_when_the_address_is_odd() {
+        // STRH r0,[r1] / LDRH r2,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE1C1_00B0, 0xE1D1_20B0]);
+        mem.write32(DATA, 0xFFFF_FFFF);
+        cpu.regs.set(0, 0x1234_5678);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), 0xFFFF_5678, "two bytes and no more");
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x5678, "and came back widened with zeros");
+
+        // From an odd address: the halfword underneath, rotated by eight.
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20B0]);
+        mem.write32(DATA, 0x0000_ABCD);
+        cpu.regs.set(1, DATA + 1);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xCD00_00AB, "the whole word turned by eight");
+    }
+
+    /// A signed byte is widened by its top bit, which is what makes it signed.
+    #[test]
+    fn a_signed_byte_arrives_widened_by_its_own_sign() {
+        // LDRSB r2,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20D0]);
+        mem.write32(DATA, 0xFF);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xFFFF_FFFF, "-1 and not 255");
+
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20D0]);
+        mem.write32(DATA, 0x7F);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x7F, "and a positive one is left alone");
+    }
+
+    /// A signed halfword from an *odd* address is not a halfword load at all:
+    /// the processor gives up and sign-extends the single byte there. It is the
+    /// strangest documented behaviour in the instruction set.
+    #[test]
+    fn a_signed_halfword_from_an_odd_address_is_a_signed_byte_instead() {
+        // LDRSH r2,[r1], aligned: a halfword, widened by its sign.
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20F0]);
+        mem.write32(DATA, 0x0000_8123);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xFFFF_8123, "the halfword, sign-extended");
+
+        // The same instruction one byte on: the byte at DATA+1, which is 0x81.
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20F0]);
+        mem.write32(DATA, 0x0000_8123);
+        cpu.regs.set(1, DATA + 1);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xFFFF_FF81, "one byte, sign-extended, not a halfword");
+    }
+
+    /// A halfword transfer sits in the space a data operation with a
+    /// register-specified shift would occupy, and has to be caught before it.
+    #[test]
+    fn a_halfword_transfer_is_not_mistaken_for_a_data_operation() {
+        let (mut cpu, mut mem) = machine(&[0xE1D1_20B0]);
+        mem.write32(DATA, 0xBEEF);
+        cpu.regs.set(1, DATA);
+        cpu.regs.set(2, 0xDEAD);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0xBEEF, "it loaded rather than computing");
+    }
+
+    /// Storing `R15` puts down twelve bytes on, not the eight it reads as
+    /// everywhere else. A quirk of this processor, which the architecture
+    /// leaves open.
+    #[test]
+    fn storing_the_counter_puts_down_twelve_bytes_on() {
+        // STR pc,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE581_F000]);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.read32(DATA), BASE + 12);
+    }
+
+    /// And using it as a *base* reads the ordinary eight, which is how a
+    /// constant too wide for an instruction is fetched from just after the code.
+    #[test]
+    fn loading_through_the_counter_reads_the_ordinary_eight() {
+        // LDR r0,[pc,#0] - the word two instructions on.
+        let (mut cpu, mut mem) = machine(&[0xE59F_0000, 0, 0x1234_5678]);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(0), 0x1234_5678);
+    }
+
+    /// A failed condition writes nothing back, which matters because the
+    /// addressing mode has a side effect of its own.
+    #[test]
+    fn a_transfer_that_does_not_happen_does_not_move_its_base_either() {
+        // LDREQ r2,[r1],#4 with Z clear.
+        let (mut cpu, mut mem) = machine(&[0x0491_2004]);
+        cpu.regs.set(1, DATA);
+        cpu.regs.set_z(false);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(1), DATA, "the base did not move");
+    }
+
+    /// `SWP` reads and writes in one go, which is how a lock is taken.
+    #[test]
+    fn a_swap_hands_back_what_was_there_and_leaves_the_new_value() {
+        // SWP r2,r0,[r1]
+        let (mut cpu, mut mem) = machine(&[0xE101_2090]);
+        mem.write32(DATA, 0x1111_1111);
+        cpu.regs.set(0, 0x2222_2222);
+        cpu.regs.set(1, DATA);
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.get(2), 0x1111_1111, "what was there came back");
+        assert_eq!(mem.read32(DATA), 0x2222_2222, "and the new value went in");
+    }
+
+    /// Walking an array, which is what post-indexing exists for: three loads
+    /// and one register that moves itself.
+    #[test]
+    fn an_array_is_walked_one_instruction_per_element() {
+        // LDR r2,[r1],#4 three times over, adding into r3.
+        let program = [0xE491_2004, 0xE083_3002, 0xE491_2004, 0xE083_3002, 0xE491_2004, 0xE083_3002];
+        let (mut cpu, mut mem) = machine(&program);
+        for (index, value) in [10u32, 20, 30].iter().enumerate() {
+            mem.write32(DATA + index as u32 * 4, *value);
+        }
+        cpu.regs.set(1, DATA);
+        for _ in 0..program.len() {
+            cpu.step(&mut mem).unwrap();
+        }
+        assert_eq!(cpu.regs.get(3), 60, "ten and twenty and thirty");
+        assert_eq!(cpu.regs.get(1), DATA + 12, "and the base walked all three");
     }
 
     /// Something end to end: counting down to zero, which needs the ALU, the
