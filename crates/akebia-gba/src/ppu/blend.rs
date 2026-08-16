@@ -44,13 +44,12 @@
 //! If there is no second target under such a sprite there is nothing to mix it
 //! with, and it falls back to whatever `BLDCNT` was going to do anyway.
 //!
-//! # What is missing
+//! # Where it does not happen
 //!
-//! The windows. On hardware each window carries a bit saying whether blending
-//! happens inside it, so a game can fade one part of the screen and leave the
-//! rest alone. Nothing here draws windows yet, so blending happens everywhere —
-//! which is right for every game that does not use them, and too much for one
-//! that does.
+//! Inside a window that says not to. Each region of the screen carries a bit
+//! for the colour effects, which is how a game fades the world to black and
+//! leaves its text box unfaded — so this is asked before anything else here is
+//! decided. See [`window`](super::window).
 
 use super::Ppu;
 
@@ -131,6 +130,13 @@ impl Ppu {
     /// sprites overlapping are one layer as far as the hardware is concerned,
     /// and one blended with the other is not an effect that exists.
     pub(super) fn put(&mut self, x: usize, pixel: Pixel) {
+        // A layer a window does not allow here never happened. Dropping it
+        // rather than covering it is the whole of what a window is, and doing
+        // it in this one place is what makes every layer obey without any of
+        // them knowing windows exist.
+        if !self.allows(x, pixel.layer) {
+            return;
+        }
         if self.top[x].layer != pixel.layer {
             self.below[x] = self.top[x];
         }
@@ -140,6 +146,13 @@ impl Ppu {
     /// What a pixel finally is, once what is over it and what is under it are
     /// both known.
     pub(super) fn blended(&self, x: usize) -> u16 {
+        // A region can switch the effects off, which is how a game fades the
+        // world to black and leaves its text box unfaded. It covers the
+        // declared sprite as well: that one ignores the mode, not the window.
+        if !self.effects_at(x) {
+            return self.top[x].colour;
+        }
+
         let (top, below) = (self.top[x], self.below[x]);
         // The second set is the same six bits eight places up, so it has to
         // come down before a layer's bit means anything against it.

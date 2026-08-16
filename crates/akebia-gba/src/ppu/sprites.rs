@@ -40,6 +40,7 @@
 //! picks the one its tools produce.
 
 use super::blend::{self, Pixel};
+use super::window::Target;
 use super::{Ppu, OBJ_BASE_BITMAP, OBJ_BASE_TILED, VRAM_LEN};
 use crate::SCREEN_WIDTH;
 
@@ -151,6 +152,10 @@ struct Sprite {
     /// that does not come out of a register: such a sprite is always mixed with
     /// what is under it, whatever `BLDCNT` was set to.
     translucent: bool,
+    /// Graphics mode 2: not a picture at all, but the shape of the third
+    /// window region. It is never drawn — its pixels mark where that region
+    /// is, and its colours are never looked at. See [`crate::ppu::window`].
+    cuts_window: bool,
 }
 
 impl Sprite {
@@ -160,9 +165,6 @@ impl Sprite {
         let half = |offset: usize| u16::from(oam[at + offset]) | (u16::from(oam[at + offset + 1]) << 8);
         let (attr0, attr1, attr2) = (half(0), half(2), half(4));
 
-        if attr0 & GRAPHICS == WINDOW {
-            return None;
-        }
         let kind = match attr0 & KIND {
             PLAIN => Kind::Plain,
             TRANSFORMED => Kind::Turned,
@@ -194,6 +196,7 @@ impl Sprite {
             palette: ((attr2 & PALETTE) >> 12) as u8,
             priority: (attr2 & PRIORITY) >> 10,
             translucent: attr0 & GRAPHICS == SEMI_TRANSPARENT,
+            cuts_window: attr0 & GRAPHICS == WINDOW,
         })
     }
 
@@ -258,24 +261,73 @@ impl Ppu {
             let Some(sprite) = Sprite::read(&self.oam[..], entry) else {
                 continue;
             };
-            if sprite.priority != priority {
+            // The ones that cut a window are not pictures and have no
+            // priority worth honouring: they were walked before the line
+            // started, into the mask that decided where everything else is
+            // allowed.
+            if sprite.cuts_window || sprite.priority != priority {
                 continue;
             }
             let Some(row) = sprite.row_on(line) else {
                 continue;
             };
-            match sprite.kind {
-                Kind::Plain => self.draw_plain_sprite(&sprite, row),
-                Kind::Turned | Kind::TurnedInDoubleArea => {
-                    self.draw_transformed_sprite(&sprite, row)
-                }
+            self.draw_sprite(&sprite, row, Target::Picture);
+        }
+    }
+
+    /// Walks the sprites that cut the third window region, marking where they
+    /// cover this line.
+    ///
+    /// It has to happen before anything is drawn, because what it marks is what
+    /// decides whether the other layers are allowed at all. And it ignores
+    /// priority entirely: this is not a sprite going in front of or behind
+    /// anything, it is a shape.
+    pub(super) fn mark_window_sprites(&mut self, line: usize) {
+        if self.dispcnt & OBJ_ENABLED == 0 {
+            return;
+        }
+        for entry in (0..SPRITES).rev() {
+            let Some(sprite) = Sprite::read(&self.oam[..], entry) else {
+                continue;
+            };
+            if !sprite.cuts_window {
+                continue;
             }
+            let Some(row) = sprite.row_on(line) else {
+                continue;
+            };
+            self.draw_sprite(&sprite, row, Target::WindowMask);
+        }
+    }
+
+    /// One sprite, however it is shaped, into whichever of the two things a
+    /// covered pixel becomes.
+    fn draw_sprite(&mut self, sprite: &Sprite, row: usize, target: Target) {
+        match sprite.kind {
+            Kind::Plain => self.draw_plain_sprite(sprite, row, target),
+            Kind::Turned | Kind::TurnedInDoubleArea => {
+                self.draw_transformed_sprite(sprite, row, target)
+            }
+        }
+    }
+
+    /// What a covered pixel does: become a colour, or mark the window.
+    ///
+    /// A sprite that cuts a window is walked for its *shape* and never for its
+    /// colours — the palette entry says only whether the pixel is covered.
+    fn cover(&mut self, sprite: &Sprite, x: usize, colour: u8, target: Target) {
+        match target {
+            Target::Picture => {
+                let pixel = self.sprite_layer(sprite, colour);
+                self.put(x, pixel);
+            }
+            Target::WindowMask => self.obj_window[x] = true,
         }
     }
 
     /// A sprite that is only somewhere, not turned: its pixels go straight
     /// across, mirrored if the entry asked for it.
-    fn draw_plain_sprite(&mut self, sprite: &Sprite, row: usize) {
+    fn draw_plain_sprite(&mut self, sprite: &Sprite, row: usize, target: Target) {
         for column in 0..sprite.width {
             // Across the screen wraps at 512, which is what puts a sprite with
             // a large coordinate off the left-hand edge instead of the right.
@@ -286,8 +338,7 @@ impl Ppu {
             let (px, py) = sprite.pixel_at(column, row);
             let colour = self.sprite_pixel(sprite, px, py);
             if colour != 0 {
-                let pixel = self.sprite_layer(sprite, colour);
-                self.put(screen_x, pixel);
+                self.cover(sprite, screen_x, colour, target);
             }
         }
     }
@@ -301,7 +352,7 @@ impl Ppu {
     /// here is measured from a centre rather than from a corner — a sprite
     /// rotating in place has to stay in place, and turning about its top-left
     /// corner would swing it around the screen instead.
-    fn draw_transformed_sprite(&mut self, sprite: &Sprite, row: usize) {
+    fn draw_transformed_sprite(&mut self, sprite: &Sprite, row: usize, target: Target) {
         let (pa, pb, pc, pd) = self.transform(sprite.group);
         let (area_width, area_height) = sprite.area();
 
@@ -330,8 +381,7 @@ impl Ppu {
 
             let colour = self.sprite_pixel(sprite, px as usize, py as usize);
             if colour != 0 {
-                let pixel = self.sprite_layer(sprite, colour);
-                self.put(screen_x, pixel);
+                self.cover(sprite, screen_x, colour, target);
             }
         }
     }

@@ -49,9 +49,11 @@
 //! becomes a picture once at the end — see [`blend`](super::blend) for why
 //! nothing else would do.
 //!
-//! Not here: the windows and the mosaic that the rest of the register block is
-//! for. The windows are the one of those that games miss: a layer a game
-//! restricted to a rectangle is drawn over the whole screen instead.
+//! Layers are clipped before they are put down, so a background restricted to
+//! a rectangle stays in it. That is [`window`](super::window), and it is asked
+//! once per line before anything is drawn.
+//!
+//! Not here: the mosaic, which nothing has yet been seen to ask for.
 //!
 //! An unwritten mode draws the backdrop rather than nothing, which is what the
 //! hardware does and is also honest: a screen in the backdrop colour says the
@@ -148,6 +150,11 @@ impl Ppu {
         // The backdrop is the bottom, so a pixel showing it has nothing behind
         // it to be mixed with; a second copy of it down there would let the
         // backdrop blend with itself.
+        // Which layers are allowed where, before any of them is drawn. It has
+        // to come first: the sprites that cut the third region decide where
+        // everything else may go, so they are walked before anything else is.
+        self.prepare_windows(line);
+
         let backdrop = Pixel::new(self.colour(0), blend::BACKDROP);
         self.top.fill(backdrop);
         self.below.fill(Pixel::NONE);

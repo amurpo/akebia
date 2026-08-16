@@ -27,7 +27,8 @@
 //! and the sprites over them. The sweep came first on purpose: it is what gives
 //! a game a sense of time, and without it a cartridge stops at the first thing
 //! it waits for. It mixes them too, which is every fade between two screens in
-//! every game. What is left there is the windows and the mosaic. See [`ppu`].
+//! every game, and it clips them to the rectangles a game restricted them to.
+//! What is left there is the mosaic. See [`ppu`].
 //!
 //! The four memory movers work, which is what carries a game's own code and
 //! graphics from the cartridge into the memory it runs them out of. See
@@ -49,7 +50,7 @@
 //!
 //! What does not exist at all is timing worth the name — a step of the
 //! processor charges one cycle, which is a floor and not a measurement — and
-//! the two effects the picture unit does last: windows and mosaic.
+//! the mosaic.
 
 pub mod bus;
 pub mod console;

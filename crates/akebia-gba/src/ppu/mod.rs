@@ -50,6 +50,7 @@
 pub mod blend;
 pub mod render;
 mod sprites;
+pub mod window;
 
 use blend::Pixel;
 
@@ -288,6 +289,17 @@ pub struct Ppu {
     /// covered, and by then it has been painted over. See [`blend`].
     top: Box<[Pixel; SCREEN_WIDTH]>,
     below: Box<[Pixel; SCREEN_WIDTH]>,
+    /// The two windows' edges, and what each region contains. See [`window`].
+    win_h: [u16; 2],
+    win_v: [u16; 2],
+    winin: u16,
+    winout: u16,
+    /// Which layers each column of this line may show, worked out once before
+    /// the line is drawn.
+    allowed: Box<[u16; SCREEN_WIDTH]>,
+    /// Where the sprites that cut a region of their own cover this line. Only
+    /// filled when a game asks for that region.
+    obj_window: Box<[bool; SCREEN_WIDTH]>,
 }
 
 impl Default for Ppu {
@@ -316,6 +328,12 @@ impl Ppu {
             bldy: 0,
             top: Box::new([Pixel::NONE; SCREEN_WIDTH]),
             below: Box::new([Pixel::NONE; SCREEN_WIDTH]),
+            win_h: [0; 2],
+            win_v: [0; 2],
+            winin: 0,
+            winout: 0,
+            allowed: Box::new([window::EVERYTHING; SCREEN_WIDTH]),
+            obj_window: Box::new([false; SCREEN_WIDTH]),
         }
     }
 
@@ -437,6 +455,7 @@ impl Ppu {
             DISPSTAT => half(self.status()),
             VCOUNT => half(self.vcount),
             BG_CONTROL..BG_SCROLL => half(self.backgrounds[background_of(addr)].control),
+            window::WIN0H..=window::WINOUT => self.read_window8(addr),
             blend::BLDCNT..=blend::BLDY => self.read_blend8(addr),
             // The scroll positions are write-only. See [`Background`].
             _ => 0,
@@ -461,6 +480,7 @@ impl Ppu {
                 let index = background_of(addr);
                 self.backgrounds[index].control = widened(self.backgrounds[index].control);
             }
+            window::WIN0H..=window::WINOUT => self.write_window8(addr, value),
             blend::BLDCNT..=blend::BLDY => self.write_blend8(addr, value),
             // The transformation, all of it write-only like the scroll.
             BG_AFFINE..BLEND => {
