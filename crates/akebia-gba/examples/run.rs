@@ -49,6 +49,7 @@ use std::process::ExitCode;
 
 use akebia_gba::bus::Memory;
 use akebia_gba::cpu::{Bus, Cpu, Fault};
+use akebia_gba::keypad::Button;
 
 /// Where a cartridge is mapped, and so where a machine with one starts.
 const ROM_BASE: u32 = 0x0800_0000;
@@ -60,7 +61,9 @@ const DEFAULT_STEPS: u64 = 50_000_000;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--from N] [--ppm FILE]");
+        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--from N]");
+        eprintln!("                       [--press BUTTONS] [--press-at N] [--ppm FILE]");
+        eprintln!("  BUTTONS: comma-separated, from a b select start right left up down r l");
         return ExitCode::FAILURE;
     };
 
@@ -72,6 +75,10 @@ fn main() -> ExitCode {
     let mut bios = None;
     let mut ppm = None;
     let mut boot = false;
+    // Which buttons to press, and when. A title screen waits for a person, and
+    // without this there is no way to be one.
+    let mut press: Vec<Button> = Vec::new();
+    let mut press_at = 0u64;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--boot" => boot = true,
@@ -88,7 +95,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--steps" | "--trace" | "--from" => {
+            "--steps" | "--trace" | "--from" | "--press-at" => {
                 let Some(n) = args.next().and_then(|v| v.parse().ok()) else {
                     eprintln!("{flag} wants a number");
                     return ExitCode::FAILURE;
@@ -96,7 +103,23 @@ fn main() -> ExitCode {
                 match flag.as_str() {
                     "--steps" => limit = n,
                     "--trace" => trace = n,
-                    _ => from = n,
+                    "--from" => from = n,
+                    _ => press_at = n,
+                }
+            }
+            "--press" => {
+                let Some(names) = args.next() else {
+                    eprintln!("--press wants a button or a comma-separated list of them");
+                    return ExitCode::FAILURE;
+                };
+                for name in names.split(',') {
+                    match button_named(name) {
+                        Some(button) => press.push(button),
+                        None => {
+                            eprintln!("no button called {name:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 }
             }
             _ => {
@@ -166,7 +189,7 @@ fn main() -> ExitCode {
         cpu.regs.set_pc(ROM_BASE);
     }
 
-    let outcome = run(&mut cpu, &mut mem, limit, from, trace);
+    let outcome = run(&mut cpu, &mut mem, limit, from, trace, &press, press_at);
     report(&cpu, &mem, &outcome);
 
     if let Some(path) = &ppm {
@@ -198,8 +221,50 @@ enum Outcome {
     RanOn,
 }
 
-fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, from: u64, trace: u64) -> Outcome {
+/// How long a press lasts, in steps: about ten frames' worth.
+///
+/// A button held for ever is not a person, and a game that reads one is a game
+/// that never sees it come up again — a title screen waiting for Start would
+/// take it and then find Start still down on the menu behind it. A pulse is
+/// what a person is.
+const PRESS_STEPS: u64 = 280_896 * 10;
+
+/// The button a name means, for the command line.
+fn button_named(name: &str) -> Option<Button> {
+    Some(match name {
+        "a" => Button::A,
+        "b" => Button::B,
+        "select" => Button::Select,
+        "start" => Button::Start,
+        "right" => Button::Right,
+        "left" => Button::Left,
+        "up" => Button::Up,
+        "down" => Button::Down,
+        "r" => Button::R,
+        "l" => Button::L,
+        _ => return None,
+    })
+}
+
+fn run(
+    cpu: &mut Cpu,
+    mem: &mut Memory,
+    limit: u64,
+    from: u64,
+    trace: u64,
+    press: &[Button],
+    press_at: u64,
+) -> Outcome {
     for step in 0..limit {
+        // Down at the given step, up ten frames later. Both edges matter: a
+        // game watches for the button coming up as often as for it going down.
+        if !press.is_empty() && (step == press_at || step == press_at + PRESS_STEPS) {
+            let down = step == press_at;
+            for button in press {
+                mem.keypad_mut().set(*button, down);
+            }
+        }
+
         let before = cpu.regs.pc();
 
         if step >= from && step < from + trace {
@@ -353,6 +418,11 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
     // because a wild value there is not a processor bug — it means whatever was
     // supposed to put the handler in place did not run.
     println!("  handler={:08X}", mem.peek32(0x0300_7FFC));
+    // The word beside it, which is how a sleeping game is told it may wake.
+    // `IntrWait` halts and then asks *this*, not `IF`: the handler is expected
+    // to set the bit for whatever it dealt with. A game asleep for ever with
+    // its handler plainly running is this word staying zero.
+    println!("  biosif={:04X}", mem.peek32(0x0300_7FF8) & 0xFFFF);
 
     // How much of each video memory has been filled in. Nothing here can say
     // whether a picture is *right*, but it can say whether there is one to

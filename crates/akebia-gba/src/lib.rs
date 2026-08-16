@@ -22,15 +22,21 @@
 //! banking by mode, the whole memory map, and interrupts. A cartridge runs, and
 //! a real BIOS can be handed in and boots one.
 //!
-//! The picture unit sweeps and draws: the three bitmap modes, and the
-//! scrolling backgrounds of the tiled ones, which is what games are made of.
-//! The sweep came first on purpose — it is what gives a game a sense of time,
-//! and without it a cartridge stops at the first thing it waits for. Sprites
-//! and the backgrounds that rotate are still missing. See [`ppu`].
+//! The picture unit sweeps and draws: the three bitmap modes, both kinds of
+//! tiled background — the ones that scroll and the two that rotate and scale —
+//! and the sprites over them. The sweep came first on purpose: it is what gives
+//! a game a sense of time, and without it a cartridge stops at the first thing
+//! it waits for. What is left there is effects — windows, mosaic, blending.
+//! See [`ppu`].
 //!
 //! The four memory movers work, which is what carries a game's own code and
 //! graphics from the cartridge into the memory it runs them out of. See
 //! [`dma`].
+//!
+//! The buttons are read, which is less obvious a requirement than it sounds:
+//! the register reports a held button as a zero, so a machine that answers zero
+//! for addresses it does not know is a machine reporting every button held for
+//! ever. A cartridge sat on its title screen over it. See [`keypad`].
 //!
 //! Nothing else exists yet: no sound bar the one register the BIOS insists on
 //! reading back, no timers, and no timing worth the name — a step of the
@@ -40,6 +46,7 @@ pub mod bus;
 pub mod cpu;
 pub mod dma;
 pub mod interrupts;
+pub mod keypad;
 pub mod ppu;
 
 pub use cpu::{Mode, Registers};

@@ -23,15 +23,23 @@
 //!
 //! # What is not here yet
 //!
-//! Most of the I/O registers. The picture unit's four and the interrupt
-//! controller's three are answered; everything else in that region reads back
-//! zero, and the real answer is not zero — an unmapped address on this machine
-//! returns whatever the processor last fetched, which some games read on
-//! purpose. That wants a pipeline to ask, and there is not one yet.
+//! Most of the I/O registers. The picture unit's, the memory movers', the
+//! interrupt controller's three and the buttons' two are answered; everything
+//! else in that region reads back zero, and the real answer is not zero — an
+//! unmapped address on this machine returns whatever the processor last
+//! fetched, which some games read on purpose. That wants a pipeline to ask, and
+//! there is not one yet.
+//!
+//! Answering zero is not the harmless default it looks like, and the buttons
+//! are the proof: `KEYINPUT` reports a held button as a zero, so for as long as
+//! it was missing this map was telling every game that all ten were held down.
+//! One sat on its title screen because of it. A register whose resting value is
+//! not zero cannot be left to the fallback.
 
 use crate::cpu::Bus;
 use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
+use crate::keypad::{self, Keypad};
 use crate::ppu::{self, Ppu};
 
 pub const BIOS_LEN: usize = 16 * 1024;
@@ -77,6 +85,9 @@ pub struct Memory {
     /// in [`Memory::run_transfers`], because moving them means reaching the
     /// whole map — which is this and not them.
     dma: Dma,
+    /// The buttons. They live here for the same reason the picture unit does:
+    /// a game reaches them at an address in this map.
+    keypad: Keypad,
     /// The one sound register that exists, and the reason it does.
     ///
     /// There is no sound here at all, and this changes that not one bit: it
@@ -111,6 +122,7 @@ impl Memory {
             irq: Interrupts::new(),
             ppu: Ppu::new(),
             dma: Dma::new(),
+            keypad: Keypad::new(),
             // What the hardware holds after a reset: the level sitting at the
             // midpoint of its range.
             sound_bias: SOUND_BIAS_AT_RESET,
@@ -148,6 +160,15 @@ impl Memory {
         &mut self.ppu
     }
 
+    pub fn keypad(&self) -> &Keypad {
+        &self.keypad
+    }
+
+    /// How a frontend presses a button: the only input this machine has.
+    pub fn keypad_mut(&mut self) -> &mut Keypad {
+        &mut self.keypad
+    }
+
     pub fn interrupts(&self) -> &Interrupts {
         &self.irq
     }
@@ -171,6 +192,7 @@ impl Memory {
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
+            keypad::KEYINPUT..=keypad::LAST => self.keypad.read8(addr),
             _ => 0,
         }
     }
@@ -185,6 +207,7 @@ impl Memory {
         match addr & !1 {
             ppu::DISPCNT..=ppu::LAST => self.ppu.write8(addr, value),
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
+            keypad::KEYINPUT..=keypad::LAST => self.keypad.write8(addr, value),
             SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
@@ -496,6 +519,11 @@ impl Bus for Memory {
         let crossed = self.ppu.tick(cycles, &mut self.irq);
         self.dma.at_blanking(crossed);
         self.run_transfers();
+        // The buttons are compared against what the game asked to watch here
+        // rather than where a button is pressed, because the hardware compares
+        // them continuously: it is a level and not an edge, and a game that
+        // starts watching a button already held expects to hear about it.
+        self.keypad.poll(&mut self.irq);
     }
 
     fn interrupts(&self) -> &Interrupts {
@@ -514,6 +542,7 @@ impl Bus for Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keypad::Button;
 
     const EWRAM: u32 = 0x0200_0000;
     const IWRAM: u32 = 0x0300_0000;
@@ -717,6 +746,45 @@ mod tests {
             mem.write32(addr, 0xFFFF_FFFF);
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X} after a write");
         }
+    }
+
+    /// The buttons are reachable at their address, and a machine with nobody
+    /// touching it answers with every bit set.
+    ///
+    /// This is the register whose absence was worth a test of its own: unmapped
+    /// I/O answers zero, and zero here is not "no buttons" but *every button
+    /// held down*, which is what left a cartridge unable to get off its title
+    /// screen. The list above is what must never be allowed to swallow it.
+    #[test]
+    fn the_buttons_are_reachable_and_rest_with_every_bit_set() {
+        let mut mem = Memory::new();
+        assert_eq!(mem.read16(keypad::KEYINPUT), 0x03FF, "nobody is touching it");
+
+        mem.keypad_mut().set(Button::Start, true);
+        assert_eq!(mem.read16(keypad::KEYINPUT), 0x03FF & !0x0008, "Start is bit 3");
+
+        // And a game cannot press its own buttons through the map either.
+        mem.write16(keypad::KEYINPUT, 0);
+        assert_eq!(mem.read16(keypad::KEYINPUT), 0x03FF & !0x0008, "unchanged by the write");
+
+        // The control register beside it does take a write, so this is a rule
+        // about the one address and not about the pair.
+        mem.write16(keypad::KEYCNT, 0x4001);
+        assert_eq!(mem.read16(keypad::KEYCNT), 0x4001);
+    }
+
+    /// And the interrupt reaches the processor from there, which is the only
+    /// interrupt on this machine whose source is a person.
+    #[test]
+    fn the_buttons_can_interrupt_through_the_clock() {
+        let mut mem = Memory::new();
+        mem.write16(keypad::KEYCNT, 0x4000 | 0x0008);
+        mem.tick(1);
+        assert_eq!(mem.interrupts().requested(), 0, "nothing held");
+
+        mem.keypad_mut().set(Button::Start, true);
+        mem.tick(1);
+        assert_ne!(mem.interrupts().requested(), 0, "and now it is");
     }
 
     #[test]
