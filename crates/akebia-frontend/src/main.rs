@@ -26,7 +26,8 @@ use akebia_core::GameBoy;
 
 use akebia_frontend::args::{self, Args, Command};
 use akebia_frontend::{
-    app, debug, describe_fault, drain_audio, drain_serial, load, open_audio, remember_dir, save,
+    app, console, debug, describe_fault, drain_audio, drain_serial, load, load_console,
+    open_audio, remember_dir, save,
 };
 
 fn main() -> ExitCode {
@@ -63,7 +64,17 @@ fn run(args: Args) -> Result<(), String> {
             Ok(())
         }
         Command::Trace { instructions } => trace(&mut load_from_args(&args)?, instructions),
-        Command::Dump { frames } => dump(&mut load_from_args(&args)?, frames, &args),
+        Command::Dump { frames } => {
+            // Both machines can be dumped, and only one of them through the
+            // older core. An Advance has no mapper, no serial port and no sound
+            // to take along, so its path is the short one: run the frames, keep
+            // the picture.
+            let path = args.rom.clone().ok_or("--dump needs a ROM")?;
+            match load_console(&path, &args)? {
+                console::Console::Gb(mut gb) => dump(&mut gb, frames, &args),
+                console::Console::Gba(mut gba) => dump_advance(&mut gba, frames, &args),
+            }
+        }
     }
 }
 
@@ -231,6 +242,42 @@ fn dump(gb: &mut GameBoy, frames: u64, args: &Args) -> Result<(), String> {
         for x in 0..akebia_core::SCREEN_WIDTH {
             let [r, g, b] = sink.pixels[y * akebia_core::SCREEN_WIDTH + x].to_rgb888();
             // Perceptual luminance, in integers: 30 % red, 59 % green, 11 % blue.
+            let luma = (r as u32 * 30 + g as u32 * 59 + b as u32 * 11) / 100;
+            row.push(RAMP[3 - (luma * 4 / 256) as usize]);
+        }
+        row.push(b'\n');
+        let _ = out.write_all(&row);
+    }
+    out.flush().map_err(|e| e.to_string())
+}
+
+/// The same for an Advance, which is the same idea with less attached to it.
+///
+/// Its picture is 15-bit colour already, in the format the PPM writer takes, so
+/// there is nothing to convert on the way out — where the older machine's has
+/// to come through a sink.
+fn dump_advance(gba: &mut akebia_gba::Gba, frames: u64, args: &Args) -> Result<(), String> {
+    for _ in 0..frames {
+        gba.run_frame().map_err(|stopped| stopped.to_string())?;
+    }
+
+    let (width, height) = gba.screen_size();
+    let pixels: Vec<akebia_core::Rgb555> =
+        gba.frame().iter().map(|&c| akebia_core::Rgb555::from_bits(c)).collect();
+
+    if let Some(path) = &args.ppm {
+        return debug::write_ppm(path, width, height, &pixels);
+    }
+
+    /// Character ramp, from lightest to darkest.
+    const RAMP: [u8; 4] = *b" .+#";
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut row = Vec::with_capacity(width + 1);
+    for y in 0..height {
+        row.clear();
+        for x in 0..width {
+            let [r, g, b] = pixels[y * width + x].to_rgb888();
             let luma = (r as u32 * 30 + g as u32 * 59 + b as u32 * 11) / 100;
             row.push(RAMP[3 - (luma * 4 / 256) as usize]);
         }

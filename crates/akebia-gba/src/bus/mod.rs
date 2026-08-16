@@ -111,6 +111,7 @@ pub struct Memory {
     /// because *reading it back* is the whole of what the BIOS needs.
     sound_bias: u16,
     cycles: u64,
+    bios_loaded: bool,
 }
 
 impl Default for Memory {
@@ -137,6 +138,7 @@ impl Memory {
             // midpoint of its range.
             sound_bias: SOUND_BIAS_AT_RESET,
             cycles: 0,
+            bios_loaded: false,
         }
     }
 
@@ -145,6 +147,19 @@ impl Memory {
     pub fn load_bios(&mut self, image: &[u8]) {
         let len = image.len().min(BIOS_LEN);
         self.bios[..len].copy_from_slice(&image[..len]);
+        self.bios_loaded = len > 0;
+    }
+
+    /// Whether a BIOS was handed in. An empty one reads as zeros, which decode
+    /// to something, so nothing else can tell the difference.
+    pub fn has_bios(&self) -> bool {
+        self.bios_loaded
+    }
+
+    /// One byte, without the borrow a bus access needs. For looking at memory
+    /// rather than running against it.
+    pub fn peek8(&self, addr: u32) -> u8 {
+        self.read_bytes(addr, 1) as u8
     }
 
     /// Puts a cartridge in. Anything past the 32 MiB the address space allows

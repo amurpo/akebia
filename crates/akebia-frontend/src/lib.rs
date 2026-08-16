@@ -16,6 +16,7 @@
 //! What stays behind in the binary is what a telephone has no use for: parsing
 //! arguments, drawing in the terminal and the diagnostic commands.
 
+pub mod console;
 pub mod app;
 pub mod args;
 pub mod audio;
@@ -50,6 +51,36 @@ pub fn load(path: &Path, args: &Args) -> Result<GameBoy, String> {
     // same audio that would have been played.
     gb.set_speaker_filter(!args.raw_audio);
     Ok(gb)
+}
+
+/// Loads whichever machine the file is for.
+///
+/// The extension decides, which is what a file manager and a person both go by.
+/// An Advance cartridge that is misnamed will be handed to the Game Boy and
+/// rejected there, and that is the right way round: a wrong name is a mistake
+/// worth reporting rather than quietly working around.
+pub fn load_console(path: &Path, args: &Args) -> Result<console::Console, String> {
+    if !console::is_advance(path) {
+        return load(path, args).map(|gb| console::Console::Gb(Box::new(gb)));
+    }
+
+    let rom = std::fs::read(path)
+        .map_err(|e| format!("could not read {}: {e}{}", path.display(), suggestions(path)))?;
+    let mut gba = akebia_gba::Gba::new();
+    gba.load_rom(&rom);
+
+    // A real BIOS if one was given, and the cartridge entered directly if not.
+    // Games call BIOS routines constantly, so having the real one matters —
+    // but requiring a file the player has to find would mean an emulator that
+    // mostly does not run.
+    if let Some(path) = &args.bios {
+        match std::fs::read(path) {
+            Ok(image) => gba.load_bios(&image),
+            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        }
+    }
+    gba.reset();
+    Ok(console::Console::Gba(Box::new(gba)))
 }
 
 /// Notes which folder the ROM came from, so the list opens there next time.

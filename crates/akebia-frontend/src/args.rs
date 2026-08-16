@@ -62,6 +62,13 @@ pub struct Args {
     pub no_save: bool,
     /// Dump the PPU registers line by line to stderr.
     pub debug: bool,
+    /// Path to a Game Boy Advance BIOS image.
+    ///
+    /// Optional, and worth saying why. An Advance cartridge is entered directly
+    /// without one, in the state the BIOS would have left the registers, and
+    /// most games run that way — but they call BIOS routines constantly, and
+    /// the real thing answers where an empty vector does not.
+    pub bios: Option<PathBuf>,
 }
 
 /// Default window scale: 160×144 is tiny on a modern display.
@@ -88,6 +95,7 @@ Options:
   --ppm <FILE>          With --dump, write the frame as a colour PPM image
   --wav <FILE>          With --dump, write the generated audio as WAV
   --save <FILE>         Path to the saved game (default: the ROM with .sav)
+  --bios <FILE>         Game Boy Advance BIOS image (optional)
   --no-save             Do not load or write the saved game
   --frames <N>          Stop after N frames
   --narrow              With --tui, draw at 80 columns instead of 160
@@ -139,6 +147,7 @@ impl Args {
         let mut save = None;
         let mut no_save = false;
         let mut debug = false;
+        let mut bios = None;
         let mut roms_dir = None;
 
         let mut it = argv.into_iter();
@@ -181,6 +190,9 @@ impl Args {
                 "--debug" => debug = true,
                 "--save" => {
                     save = Some(PathBuf::from(it.next().ok_or("--save needs a path")?));
+                }
+                "--bios" => {
+                    bios = Some(PathBuf::from(it.next().ok_or("--bios needs a path")?));
                 }
                 "--roms" => {
                     roms_dir = Some(PathBuf::from(it.next().ok_or("--roms needs a folder")?));
@@ -229,6 +241,7 @@ impl Args {
             raw_audio,
             wav,
             save,
+            bios,
             no_save,
             debug,
         })))
@@ -337,6 +350,18 @@ mod tests {
 
         assert!(parse(&["--no-save", "game.gb"]).unwrap().no_save);
         assert!(parse(&["game.gb", "--save"]).is_err(), "--save needs a path");
+    }
+
+    /// The Advance BIOS is optional, because requiring a file the player has to
+    /// find would mean an emulator that mostly does not run.
+    #[test]
+    fn the_advance_bios_is_optional_and_takes_a_path() {
+        assert!(parse(&["game.gba"]).unwrap().bios.is_none());
+
+        let a = parse(&["--bios", "gba_bios.bin", "game.gba"]).unwrap();
+        assert_eq!(a.bios, Some(PathBuf::from("gba_bios.bin")));
+
+        assert!(parse(&["game.gba", "--bios"]).is_err(), "--bios needs a path");
     }
 
     #[test]

@@ -28,7 +28,8 @@ use akebia_core::cartridge::CgbSupport;
 use akebia_core::gameboy::FRAMES_PER_SECOND;
 use akebia_core::link::{self, LinkFault, Side};
 use akebia_core::ports::{Palette, VideoOutput};
-use akebia_core::{Button, FrameBuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use akebia_core::{FrameBuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::console::{Console, Pad};
 use eframe::egui::{
     self, Align, Color32, ColorImage, Key, Label, Layout, RichText, Sense, TextureHandle,
     TextureOptions, UiBuilder, Vec2, ViewportCommand,
@@ -73,15 +74,22 @@ const MAX_CATCH_UP: u32 = 4;
 
 /// Joypad keys. The layout is the usual one in emulators: the d-pad on the
 /// arrows and the action buttons under the left hand.
-const KEYS: [(Key, Button); 8] = [
-    (Key::ArrowUp, Button::Up),
-    (Key::ArrowDown, Button::Down),
-    (Key::ArrowLeft, Button::Left),
-    (Key::ArrowRight, Button::Right),
-    (Key::Z, Button::A),
-    (Key::X, Button::B),
-    (Key::Enter, Button::Start),
-    (Key::Backspace, Button::Select),
+///
+/// The two shoulders are here for the Advance and do nothing on a Game Boy,
+/// which is what a Game Boy does when a button it has not got is pressed. One
+/// list for both machines is the point: a person does not want the keys to move
+/// when the cartridge does.
+const KEYS: [(Key, Pad); 10] = [
+    (Key::ArrowUp, Pad::Up),
+    (Key::ArrowDown, Pad::Down),
+    (Key::ArrowLeft, Pad::Left),
+    (Key::ArrowRight, Pad::Right),
+    (Key::Z, Pad::A),
+    (Key::X, Pad::B),
+    (Key::Enter, Pad::Start),
+    (Key::Backspace, Pad::Select),
+    (Key::A, Pad::L),
+    (Key::S, Pad::R),
 ];
 
 /// Opens the window and does not return until it is closed.
@@ -103,9 +111,9 @@ pub fn run_with(args: Args, limit: Option<u64>, base: eframe::NativeOptions) -> 
     // like that of any other command, not inside a window.
     let initial = match &args.rom {
         Some(path) => {
-            let gb = crate::load(path, &args)?;
+            let console = crate::load_console(path, &args)?;
             crate::remember_dir(path);
-            Some(Session::new(gb, path.clone(), &args, &settings))
+            Some(Session::new(console, path.clone(), &args, &settings))
         }
         None => None,
     };
@@ -172,9 +180,20 @@ impl Settings {
     }
 }
 
-/// The window that leaves the console's screen at exactly `scale`.
+/// The window that leaves a screen of that size at exactly `scale`.
+///
+/// The size is passed in rather than assumed: the two machines are 160×144 and
+/// 240×160, and a window built for the wrong one either wastes half its width
+/// or shrinks the picture to fit.
+fn window_size_for(screen: (usize, usize), scale: f32) -> Vec2 {
+    let (width, height) = screen;
+    Vec2::new(width as f32 * scale, height as f32 * scale + MENU_BAR_ROOM)
+}
+
+/// The window for the older machine, which is what the list and an empty
+/// window are sized to.
 fn window_size(scale: f32) -> Vec2 {
-    Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale + MENU_BAR_ROOM)
+    window_size_for((SCREEN_WIDTH, SCREEN_HEIGHT), scale)
 }
 
 /// Gap left between two linked screens. Without it the two pictures read as one
@@ -324,16 +343,20 @@ impl App {
     /// Loads the chosen ROM and starts playing, or leaves the warning in the
     /// list.
     fn play(&mut self, ctx: &egui::Context, path: PathBuf) {
-        match crate::load(&path, &self.args) {
-            Ok(gb) => {
+        match crate::load_console(&path, &self.args) {
+            Ok(console) => {
                 crate::remember_dir(&path);
                 if let Some(dir) = path.parent() {
                     self.folder = dir.to_owned();
                 }
-                let session = Session::new(gb, path, &self.args, &self.settings);
+                let session = Session::new(console, path, &self.args, &self.settings);
                 ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
                 self.screen = Screen::Playing(Box::new(session));
                 self.notice = None;
+                // The window follows the machine. Starting an Advance in a Game
+                // Boy-shaped window would letterbox a picture that has a window
+                // of its own to be shown in.
+                self.resize_for(ctx, false);
             }
             // Loading can fail because of a mapper not implemented yet or a file
             // that is not a ROM. It is shown in the list and not on stderr:
@@ -568,7 +591,15 @@ impl App {
         }
         let aside = Screen::List(List::new(self.folder.clone()));
         if let Screen::Playing(mut session) = std::mem::replace(&mut self.screen, aside) {
-            let remote = Remote::new(wire, session.console_mut(), role);
+            // The cable is the older machine's. Nothing should have offered it
+            // for anything else, and if something did, the game carries on
+            // rather than the connection taking it away.
+            let Some(gb) = session.gb_mut() else {
+                self.notice = Some("only a Game Boy has a link cable".to_string());
+                self.screen = Screen::Playing(session);
+                return;
+            };
+            let remote = Remote::new(wire, gb, role);
             self.screen = Screen::Networked(Box::new(Wired { console: *session, remote }));
             self.retitle(ctx);
         }
@@ -690,8 +721,19 @@ impl App {
         if scale == 0 {
             return;
         }
-        let size =
-            if linked { linked_window_size(scale as f32) } else { window_size(scale as f32) };
+        // A linked pair is two Game Boys, so its size is the older machine's
+        // twice over. Otherwise the window is sized to whatever is playing —
+        // and to the older machine when nothing is.
+        let size = if linked {
+            linked_window_size(scale as f32)
+        } else {
+            let screen = match &self.screen {
+                Screen::Playing(session) => session.console().screen_size(),
+                Screen::Networked(wired) => wired.console.console().screen_size(),
+                _ => (SCREEN_WIDTH, SCREEN_HEIGHT),
+            };
+            window_size_for(screen, scale as f32)
+        };
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
     }
 
@@ -1520,7 +1562,10 @@ impl Browser {
 
 /// Everything that lasts as long as a play session does.
 pub struct Session {
-    gb: GameBoy,
+    /// Which machine this is. Everything below that is the older machine's
+    /// alone — the cable, the saved game, the sound — asks this for a Game Boy
+    /// and does nothing when there is not one.
+    console: Console,
     pub title: String,
     /// The file this console was loaded from. Kept because the saved game's name
     /// is derived from it, and a linked pair may have to derive a second one.
@@ -1547,25 +1592,33 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(mut gb: GameBoy, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
-        gb.set_trace_enabled(args.debug);
-        gb.set_write_log_enabled(args.debug);
+    pub fn new(mut console: Console, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
+        if let Some(gb) = console.gameboy_mut() {
+            gb.set_trace_enabled(args.debug);
+            gb.set_write_log_enabled(args.debug);
+        }
 
-        let save = if args.no_save {
-            None
-        } else {
-            let path = args.save.clone().unwrap_or_else(|| save::default_path(&rom));
-            save::SaveFile::open(&mut gb, path)
+        // Only the older machine has a mapper with battery-backed memory in it.
+        // The Advance's saved games live in flash or an EEPROM that this
+        // emulator does not have yet, so an Advance session keeps nothing —
+        // which is worth knowing before a long play rather than after one.
+        let save = match (args.no_save, console.gameboy_mut()) {
+            (false, Some(gb)) => {
+                let path = args.save.clone().unwrap_or_else(|| save::default_path(&rom));
+                save::SaveFile::open(gb, path)
+            }
+            _ => None,
         };
-        let title = gb.header().title.clone();
+        let title = console.title();
+        let (width, height) = console.screen_size();
 
         let mut session = Self {
-            gb,
+            console,
             title,
             rom,
             save,
             audio: None,
-            pixels: vec![Color32::BLACK; SCREEN_WIDTH * SCREEN_HEIGHT],
+            pixels: vec![Color32::BLACK; width * height],
             next: Instant::now(),
             frames: 0,
             trace: args.debug.then(debug::LiveTrace::new),
@@ -1593,7 +1646,9 @@ impl Session {
     /// games are the same save, with the same team in it. What it does not copy
     /// is where that save is written: see [`save::linked_path`].
     fn duplicate(&self, args: &Args, settings: &Settings) -> Self {
-        let gb = self.gb.clone();
+        // Only a Game Boy gets here: the cable is the older machine's alone and
+        // the menu entry that leads here is greyed out for anything else.
+        let gb = self.gb().expect("only a Game Boy has a link cable").clone();
         let save = self.save.as_ref().and_then(|_| {
             let path = save::linked_path(&self.rom);
             eprintln!("the second console saves to {}", path.display());
@@ -1601,7 +1656,7 @@ impl Session {
         });
 
         let mut copy = Self {
-            gb,
+            console: Console::Gb(Box::new(gb)),
             title: self.title.clone(),
             rom: self.rom.clone(),
             save,
@@ -1635,20 +1690,49 @@ impl Session {
 
     /// Pushes the menu's settings into the running console.
     pub fn apply(&mut self, settings: &Settings) {
-        self.gb.set_dmg_shades(settings.palette().shades);
-        self.gb.set_speaker_filter(settings.speaker_filter);
-        match (settings.sound && !self.muted, self.audio.is_some()) {
+        // Every setting there is belongs to the older machine: the shades are
+        // a DMG palette and the filter stands in for its speaker. The Advance
+        // has neither, and has no sound here at all, so an Advance session
+        // takes none of this rather than being given a silent stand-in.
+        let sound = settings.sound && !self.muted;
+        let filter = settings.speaker_filter;
+        let shades = settings.palette().shades;
+        let Some(gb) = self.console.gameboy_mut() else {
+            self.audio = None;
+            return;
+        };
+        gb.set_dmg_shades(shades);
+        gb.set_speaker_filter(filter);
+        match (sound, self.audio.is_some()) {
             // Dropping the output stops the stream, and from then on the frame's
             // samples are discarded instead of piling up.
             (false, true) => self.audio = None,
-            (true, false) => self.audio = crate::open_audio(&mut self.gb, true),
+            (true, false) => self.audio = crate::open_audio(gb, true),
             _ => {}
         }
     }
 
     /// The console itself, for whoever has to ask it the time or step it aside.
-    pub fn console_mut(&mut self) -> &mut GameBoy {
-        &mut self.gb
+    pub fn console_mut(&mut self) -> &mut Console {
+        &mut self.console
+    }
+
+    pub fn console(&self) -> &Console {
+        &self.console
+    }
+
+    /// The Game Boy inside, if this is one.
+    ///
+    /// Everything that reaches through this is the older machine's alone: the
+    /// link cable, the mapper's saved game, the sound, the debug captures. None
+    /// of it exists on the Advance yet, and where it does not, the answer is
+    /// nothing rather than a stand-in.
+    fn gb(&self) -> Option<&GameBoy> {
+        self.console.gameboy()
+    }
+
+    fn gb_mut(&mut self) -> Option<&mut GameBoy> {
+        self.console.gameboy_mut()
     }
 
     /// Emulates whatever is due, with the far end of a cable saying how far.
@@ -1667,14 +1751,17 @@ impl Session {
         ctx: &egui::Context,
         texture: &mut TextureHandle,
     ) -> Result<(), Trouble> {
-        let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
+        let period = self.frame_period();
         let now = Instant::now();
         let mut emulated = 0;
         let mut stalled = false;
         let mut failure = None;
 
         while self.next <= now && emulated < MAX_CATCH_UP {
-            match remote.run_frame(&mut self.gb, &mut FrameSink { pixels: &mut self.pixels }) {
+            let Some(gb) = self.console.gameboy_mut() else {
+                break;
+            };
+            match remote.run_frame(gb, &mut FrameSink { pixels: &mut self.pixels }) {
                 Ok(true) => {
                     self.after_frame();
                     self.next += period;
@@ -1700,7 +1787,7 @@ impl Session {
         }
         if emulated > 0 {
             texture.set(
-                ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], self.pixels.clone()),
+                ColorImage::new(self.screen_size(), self.pixels.clone()),
                 TextureOptions::NEAREST,
             );
         }
@@ -1734,8 +1821,8 @@ impl Session {
     /// console is not to know which. Whoever calls this must do so **before**
     /// [`Session::advance`], so the buttons are already set when the game reads
     /// 0xFF00 during VBlank.
-    pub fn press(&mut self, button: Button, down: bool) {
-        self.gb.set_button(button, down);
+    pub fn press(&mut self, button: Pad, down: bool) {
+        self.console.press(button, down);
     }
 
     /// Emulates whatever is due and uploads the result to the texture.
@@ -1744,7 +1831,7 @@ impl Session {
         ctx: &egui::Context,
         texture: &mut TextureHandle,
     ) -> Result<(), String> {
-        let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
+        let period = self.frame_period();
         let now = Instant::now();
         let mut emulated = 0;
         let mut failure = None;
@@ -1764,7 +1851,7 @@ impl Session {
 
         if emulated > 0 {
             texture.set(
-                ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], self.pixels.clone()),
+                ColorImage::new(self.screen_size(), self.pixels.clone()),
                 TextureOptions::NEAREST,
             );
         }
@@ -1779,12 +1866,29 @@ impl Session {
         }
     }
 
+    /// One frame of whichever machine this is.
+    ///
+    /// The two arrive at a picture differently — the older core pushes a
+    /// finished frame into a sink, the Advance draws into a buffer of its own
+    /// and hands it over — so this is where the difference lives and the only
+    /// place it does.
     fn frame(&mut self) -> Result<(), String> {
-        // `gb` and `pixels` are distinct fields, so both borrows coexist; the
-        // sink only exists during this call.
-        let result = self.gb.run_frame(&mut FrameSink { pixels: &mut self.pixels });
+        let result = match &mut self.console {
+            // `console` and `pixels` are distinct fields, so both borrows
+            // coexist; the sink only exists during this call.
+            Console::Gb(gb) => gb
+                .run_frame(&mut FrameSink { pixels: &mut self.pixels })
+                .map_err(crate::describe_fault),
+            Console::Gba(gba) => {
+                let outcome = gba.run_frame().map_err(|stopped| stopped.to_string());
+                for (target, &colour) in self.pixels.iter_mut().zip(gba.frame()) {
+                    *target = from_rgb555(colour);
+                }
+                outcome
+            }
+        };
         self.after_frame();
-        result.map_err(crate::describe_fault)
+        result
     }
 
     /// One frame of a linked pair.
@@ -1794,10 +1898,19 @@ impl Session {
     /// what the other did on its last, so they cannot be advanced one after the
     /// other. [`link::run_frame`] interleaves them instruction by instruction.
     fn linked_frame(a: &mut Self, b: &mut Self) -> Result<(), String> {
+        // Both sides are Game Boys: the cable is theirs and the menu offers it
+        // for nothing else.
+        let (Some(_), Some(_)) = (a.gb(), b.gb()) else {
+            return Err("only a Game Boy has a link cable".to_string());
+        };
+        let [ga, gb_console] = [&mut a.console, &mut b.console];
+        let (Console::Gb(ga), Console::Gb(gbb)) = (ga, gb_console) else {
+            unreachable!("checked just above")
+        };
         let result = link::run_frame(
-            &mut a.gb,
+            ga,
             &mut FrameSink { pixels: &mut a.pixels },
-            &mut b.gb,
+            gbb,
             &mut FrameSink { pixels: &mut b.pixels },
         );
         a.after_frame();
@@ -1817,17 +1930,24 @@ impl Session {
     /// The housekeeping an emulated frame owes, however it was emulated: audio
     /// out, serial out, autosave and trace.
     fn after_frame(&mut self) {
-        crate::drain_audio(&mut self.gb, self.audio.as_ref());
-        crate::drain_serial(&mut self.gb, self.serial);
+        self.frames += 1;
+        // All of this is the older machine's: sound, the serial port, the
+        // mapper's saved game and the debug capture. The Advance has none of
+        // them here yet, and doing nothing is the honest answer.
+        let (audio, serial) = (self.audio.as_ref(), self.serial);
+        let Some(gb) = self.console.gameboy_mut() else {
+            return;
+        };
+        crate::drain_audio(gb, audio);
+        crate::drain_serial(gb, serial);
         if let Some(save) = self.save.as_mut() {
-            save.tick(&self.gb);
+            save.tick(gb);
         }
         // It has to be drained every frame even if nothing is printed: otherwise
         // the core's capture would pile up 144 lines per frame without end.
         if let Some(trace) = self.trace.as_mut() {
-            trace.frame(self.gb.take_frame_trace());
+            trace.frame(gb.take_frame_trace());
         }
-        self.frames += 1;
     }
 
     /// Dumps the frame and the VRAM as images, with `--debug`.
@@ -1837,7 +1957,11 @@ impl Session {
         }
         self.captures += 1;
         // The captures go to the current directory, not next to the ROM.
-        match debug::snapshot(&self.gb, Path::new("."), self.captures) {
+        let Some(gb) = self.gb() else {
+            eprintln!("warning: captures are a Game Boy's, and this is not one");
+            return;
+        };
+        match debug::snapshot(gb, Path::new("."), self.captures) {
             Ok(path) => eprintln!("capture written to {}", path.display()),
             Err(e) => eprintln!("warning: {e}"),
         }
@@ -1846,9 +1970,29 @@ impl Session {
     /// Writes the saved game. Called on leaving for the list and on closing the
     /// window.
     pub fn close(&mut self) {
-        if let Some(save) = self.save.as_mut() {
-            save.flush_final(&self.gb);
+        if let (Some(save), Some(gb)) = (self.save.as_mut(), self.console.gameboy()) {
+            save.flush_final(gb);
         }
+    }
+
+    /// How long one of this machine's frames is owed to last.
+    ///
+    /// Asked of the console rather than assumed, because the two rates are not
+    /// the same. Running one machine at the other's rate is a game that is
+    /// slightly the wrong speed all the time — which is harder to notice, and
+    /// worse, than one that is obviously broken.
+    fn frame_period(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.console.frames_per_second())
+    }
+
+    /// How big this machine's screen is, as `egui` wants it.
+    ///
+    /// Asked rather than assumed: the two machines are 160×144 and 240×160, and
+    /// a texture built to the wrong one either crops the picture or pads it
+    /// with whatever was in memory.
+    pub fn screen_size(&self) -> [usize; 2] {
+        let (width, height) = self.console.screen_size();
+        [width, height]
     }
 
     /// The screen, centred and with integer scaling.
@@ -1868,11 +2012,13 @@ impl Session {
         // The factor is rounded down so that a Game Boy pixel is an exact N×N
         // square. With a fractional factor, some rows of pixels would come out
         // one thickness and others another.
-        let scale = (area.width() / SCREEN_WIDTH as f32)
-            .min(area.height() / SCREEN_HEIGHT as f32)
+        let [width, height] = self.screen_size();
+        let (width, height) = (width as f32, height as f32);
+        let scale = (area.width() / width)
+            .min(area.height() / height)
             .floor()
             .max(1.0);
-        let size = Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale);
+        let size = Vec2::new(width * scale, height * scale);
         let picture = egui::Rect::from_center_size(area.center(), size);
 
         ui.painter().image(
@@ -1901,7 +2047,9 @@ impl Wired {
     /// Pulls the cable out and gives the console back on its own.
     fn split(mut self) -> Session {
         self.remote.close();
-        self.console.gb.set_link_connected(false);
+        if let Some(gb) = self.console.gb_mut() {
+            gb.set_link_connected(false);
+        }
         self.console
     }
 }
@@ -1930,7 +2078,12 @@ pub struct Pair {
 
 impl Pair {
     fn new(mut a: Session, mut b: Session, settings: &Settings) -> Self {
-        link::connect(&mut a.gb, &mut b.gb);
+        if let (Some(_), Some(_)) = (a.gb(), b.gb()) {
+            let [ca, cb] = [&mut a.console, &mut b.console];
+            if let (Console::Gb(ga), Console::Gb(gbb)) = (ca, cb) {
+                link::connect(ga, gbb);
+            }
+        }
         // Only one console is heard; see `Session::muted`.
         b.set_muted(true, settings);
         Self { consoles: [a, b], focus: 0, next: Instant::now() }
@@ -1998,7 +2151,9 @@ impl Pair {
         left.close();
         // Without this the console kept would sit waiting for an answer from an
         // end that no longer exists the next time its game tried to transfer.
-        kept.gb.set_link_connected(false);
+        if let Some(gb) = kept.console.gameboy_mut() {
+            gb.set_link_connected(false);
+        }
         // On its own again there is nobody left to share the speakers with.
         kept.set_muted(false, settings);
         kept
@@ -2031,7 +2186,7 @@ impl Pair {
         if emulated > 0 {
             for (console, texture) in self.consoles.iter().zip(textures.iter_mut()) {
                 texture.set(
-                    ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], console.pixels.clone()),
+                    ColorImage::new(console.screen_size(), console.pixels.clone()),
                     TextureOptions::NEAREST,
                 );
             }
@@ -2080,6 +2235,19 @@ struct FrameSink<'a> {
     pixels: &'a mut Vec<Color32>,
 }
 
+/// One 15-bit colour, as the texture wants it.
+///
+/// Both machines draw in the same five-bits-a-channel format — the one thing
+/// they do share — so this is the whole of the difference between what a core
+/// produces and what the screen takes.
+fn from_rgb555(colour: u16) -> Color32 {
+    let (r, g, b) = (colour & 0x1F, (colour >> 5) & 0x1F, (colour >> 10) & 0x1F);
+    // Five bits to eight by repeating the top three, so that 0x1F comes out as
+    // 0xFF rather than 0xF8 and white is actually white.
+    let widen = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    Color32::from_rgb(widen(r), widen(g), widen(b))
+}
+
 impl VideoOutput for FrameSink<'_> {
     fn present(&mut self, frame: &FrameBuffer) {
         for (target, &color) in self.pixels.iter_mut().zip(frame.as_slice()) {
@@ -2092,6 +2260,81 @@ impl VideoOutput for FrameSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Advance cartridge that paints one red pixel and stops.
+    ///
+    /// Hand-assembled, because the point is to check that a picture drawn by
+    /// the Advance core arrives in the frontend's pixels, and any ROM that
+    /// draws something known will do. Mode 3 is the one where a pixel is a
+    /// colour at an address, with no tiles or palettes in between.
+    fn red_pixel_rom() -> Vec<u8> {
+        let program: [u32; 7] = [
+            0xE3A0_0301, // MOV r0, #0x04000000   - the registers
+            0xE3A0_1003, // MOV r1, #3            - video mode 3
+            0xE381_1B01, // ORR r1, r1, #0x400    - and background 2 switched on
+            0xE580_1000, // STR r1, [r0]          - into DISPCNT
+            0xE3A0_0406, // MOV r0, #0x06000000   - video memory
+            0xE3A0_101F, // MOV r1, #0x1F         - red, five bits a channel
+            0xE1C0_10B0, // STRH r1, [r0]         - the very first pixel
+        ];
+        let mut rom: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // `B .` — a branch to itself, so the beam sweeps on with the picture
+        // standing still.
+        rom.extend_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom.resize(0x200, 0);
+        rom
+    }
+
+    fn advance_session() -> Session {
+        let gba = akebia_gba::Gba::with_rom(&red_pixel_rom());
+        let args = match Args::parse(["game.gba".to_owned()]).unwrap() {
+            crate::args::Parsed::Run(args) => *args,
+            crate::args::Parsed::Help => unreachable!("a path is not --help"),
+        };
+        Session::new(
+            Console::Gba(Box::new(gba)),
+            PathBuf::from("game.gba"),
+            &args,
+            &Settings::from_args(&args),
+        )
+    }
+
+    /// The whole point of the frontend change, in one test: an Advance session
+    /// holds a screenful of the Advance's size, and what the core drew arrives
+    /// in it.
+    #[test]
+    fn an_advance_session_draws_the_advances_picture() {
+        let mut session = advance_session();
+        assert_eq!(session.screen_size(), [240, 160], "the Advance's screen");
+        assert_eq!(session.pixels.len(), 240 * 160, "and a buffer to match");
+
+        // Two frames: the first is whatever was already partly swept when the
+        // machine started, the second is drawn with the picture in place.
+        for _ in 0..2 {
+            session.frame().expect("a cartridge that paints and stops");
+        }
+
+        assert_eq!(session.pixels[0], Color32::from_rgb(255, 0, 0), "the pixel it painted");
+        assert_eq!(session.pixels[1], Color32::BLACK, "and nothing beside it");
+    }
+
+    /// An Advance keeps no saved game, because the flash and EEPROM its
+    /// cartridges use are not written yet. Pretending otherwise would lose a
+    /// player's afternoon quietly.
+    #[test]
+    fn an_advance_session_keeps_no_saved_game() {
+        let session = advance_session();
+        assert!(session.save.is_none());
+        assert!(session.gb().is_none(), "and there is no Game Boy in it");
+    }
+
+    /// The two machines run at their own rates. One at the other's is a game
+    /// that is subtly the wrong speed the whole time.
+    #[test]
+    fn each_machine_is_paced_at_its_own_rate() {
+        let advance = advance_session().frame_period();
+        assert!(advance.as_secs_f64() > 0.0 && advance.as_secs_f64() < 0.02, "{advance:?}");
+    }
 
     fn list(names: &[&str]) -> List {
         List {

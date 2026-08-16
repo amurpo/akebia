@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use akebia_core::cartridge::{CgbSupport, Header};
 
-/// Extensions considered to be ROMs.
-const EXTENSIONS: [&str; 2] = ["gb", "gbc"];
+/// Extensions considered to be ROMs. Both machines, in one list, because a
+/// person keeps their games in one folder and does not sort them by console.
+const EXTENSIONS: [&str; 3] = ["gb", "gbc", "gba"];
 
 /// A ROM found in the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,14 @@ pub fn scan(dir: &Path) -> Vec<Entry> {
 /// dozens of multi-megabyte ROMs and the list has to appear instantly.
 fn describe(path: &Path) -> (String, CgbSupport) {
     use std::io::Read;
+
+    // An Advance cartridge has a header of its own with none of this in it: no
+    // mapper family, and the colour question does not arise. Saying so is
+    // better than reading the older machine's fields out of bytes that mean
+    // something else entirely.
+    if crate::console::is_advance(path) {
+        return ("Advance".to_owned(), CgbSupport::None);
+    }
 
     // A ROM too short to have a header is not going to boot, but it is listed
     // all the same and flagged: the user sees the file in their file manager,
@@ -294,6 +303,21 @@ mod tests {
         let roms = scan(&dir);
         assert_eq!(roms.len(), 1, "it is listed all the same: the user sees the file");
         assert_eq!(roms[0].mapper, "?");
+    }
+
+    /// Both machines appear in one list, and an Advance cartridge is named as
+    /// one rather than having the older machine's header read out of it.
+    #[test]
+    fn advance_cartridges_are_listed_and_named() {
+        let dir = temporary("advance");
+        std::fs::write(dir.join("alpha.gba"), [0u8; 512]).unwrap();
+        std::fs::write(dir.join("beta.gb"), rom(0x00, 0x00)).unwrap();
+
+        let roms = scan(&dir);
+        assert_eq!(roms.len(), 2, "both machines, one list");
+        assert_eq!(roms[0].name, "alpha");
+        assert_eq!(roms[0].mapper, "Advance");
+        assert_eq!(roms[1].mapper, "ROM ONLY");
     }
 
     #[test]

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 cpal = "0.18.1"
 akebia-core.workspace = true
+akebia-gba.workspace = true
 # Without the default features, which pull in `wgpu`. To stretch a 160×144
 # texture OpenGL is more than enough, and `glow` asks for less: fewer crates, a
 # smaller binary and no Vulkan/DX12 on the machine that runs it. `x11` and

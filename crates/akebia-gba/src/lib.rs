@@ -43,6 +43,7 @@
 //! processor charges one cycle, which is a floor and not a measurement.
 
 pub mod bus;
+pub mod console;
 pub mod cpu;
 pub mod dma;
 pub mod interrupts;
@@ -51,7 +52,9 @@ pub mod ppu;
 pub mod sound;
 pub mod timers;
 
+pub use console::Gba;
 pub use cpu::{Mode, Registers};
+pub use keypad::Button;
 
 /// Frequency of the master clock, in Hz: four times the Game Boy's.
 pub const CLOCK_HZ: u32 = 16_777_216;
