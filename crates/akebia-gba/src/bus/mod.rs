@@ -41,6 +41,7 @@ use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
 use crate::keypad::{self, Keypad};
 use crate::ppu::{self, Ppu};
+use crate::save::Save;
 use crate::sound::{self, Sound};
 use crate::timers::{self, Timers};
 
@@ -52,8 +53,9 @@ pub const IWRAM_LEN: usize = 32 * 1024;
 pub use crate::ppu::{OAM_LEN, PRAM_LEN, VRAM_LEN};
 /// The most cartridge ROM the address space has room for.
 pub const ROM_MAX: usize = 32 * 1024 * 1024;
-/// Battery-backed save memory, on an 8-bit bus.
-pub const SRAM_LEN: usize = 64 * 1024;
+/// The window the cartridge's save chip is seen through, which is twice the
+/// largest chip that sits in it. See [`crate::save`].
+pub const SAVE_WINDOW: usize = 64 * 1024;
 
 /// The blocks video memory repeats in: 128 KiB, of which it fills 96.
 const VRAM_BLOCK: u32 = 0x2_0000;
@@ -71,8 +73,9 @@ pub struct Memory {
     /// rather than padded to the 32 MiB the address space allows, because
     /// reading past the end is not reading zeros — see [`Memory::read_bytes`].
     rom: Vec<u8>,
-    /// The cartridge's save memory.
-    sram: Box<[u8; SRAM_LEN]>,
+    /// The chip on the cartridge board that keeps the saved game. Which of the
+    /// three it is comes from the cartridge, so it is replaced when one goes in.
+    save: Save,
     /// The three registers that decide whether the processor is interrupted.
     irq: Interrupts,
     /// The picture unit, which lives here because that is where a game reaches
@@ -108,7 +111,7 @@ impl Memory {
             ewram: Box::new([0; EWRAM_LEN]),
             iwram: Box::new([0; IWRAM_LEN]),
             rom: Vec::new(),
-            sram: Box::new([0; SRAM_LEN]),
+            save: Save::default(),
             irq: Interrupts::new(),
             ppu: Ppu::new(),
             dma: Dma::new(),
@@ -137,18 +140,33 @@ impl Memory {
     /// One byte, without the borrow a bus access needs. For looking at memory
     /// rather than running against it.
     pub fn peek8(&self, addr: u32) -> u8 {
-        self.read_bytes(addr, 1) as u8
+        self.peek_bytes(addr, 1) as u8
     }
 
     /// Puts a cartridge in. Anything past the 32 MiB the address space allows
     /// is not reachable and is dropped.
+    ///
+    /// The save chip comes with the cartridge and is replaced along with it: it
+    /// is a chip on that board and not a part of the machine, and which of the
+    /// three kinds it is has to be read out of the ROM. A cartridge swapped for
+    /// another one and left with the first one's chip would answer a different
+    /// game's driver.
     pub fn load_rom(&mut self, image: &[u8]) {
         self.rom.clear();
         self.rom.extend_from_slice(&image[..image.len().min(ROM_MAX)]);
+        self.save = Save::for_rom(&self.rom);
     }
 
     pub fn rom_len(&self) -> usize {
         self.rom.len()
+    }
+
+    pub fn save(&self) -> &Save {
+        &self.save
+    }
+
+    pub fn save_mut(&mut self) -> &mut Save {
+        &mut self.save
     }
 
     pub fn cycles(&self) -> u64 {
@@ -302,6 +320,13 @@ impl Memory {
             // through one and its data through another. Nothing here can tell
             // them apart yet because nothing here counts cycles.
             0x08..=0x0D => {
+                // A serial EEPROM lives in the top of this window and nothing
+                // else does. It has to be asked before the ROM is, because on a
+                // small cartridge the whole of the third window is the chip's
+                // and the ROM's mirror would otherwise answer first.
+                if self.save.claims(addr, self.rom.len()) {
+                    return Where::Save;
+                }
                 let offset = (addr as usize) & (0x0200_0000 - 1);
                 if offset < self.rom.len() {
                     Where::Rom(&self.rom[..], offset)
@@ -314,7 +339,7 @@ impl Memory {
                     Where::Floating
                 }
             }
-            0x0E | 0x0F => Where::Ram(Bank::Sram, addr as usize & (SRAM_LEN - 1)),
+            0x0E | 0x0F => Where::Save,
             _ => Where::Nowhere,
         }
     }
@@ -326,7 +351,6 @@ impl Memory {
             Bank::Pram => self.ppu.pram(),
             Bank::Vram => self.ppu.vram(),
             Bank::Oam => self.ppu.oam(),
-            Bank::Sram => &self.sram[..],
         }
     }
 
@@ -337,7 +361,6 @@ impl Memory {
             Bank::Pram => self.ppu.pram_mut(),
             Bank::Vram => self.ppu.vram_mut(),
             Bank::Oam => self.ppu.oam_mut(),
-            Bank::Sram => &mut self.sram[..],
         }
     }
 
@@ -346,28 +369,38 @@ impl Memory {
     fn writable(&mut self, addr: u32) -> Option<(Bank, usize)> {
         match self.locate(addr) {
             Where::Ram(bank, offset) => Some((bank, offset)),
-            // The BIOS and the cartridge are read-only, and unmapped space is
-            // not there at all.
-            Where::Rom(..) | Where::Floating | Where::Registers | Where::Nowhere => None,
+            // The BIOS and the cartridge are read-only, unmapped space is not
+            // there at all, and the save chip is not an array to be indexed.
+            Where::Rom(..) | Where::Floating | Where::Registers | Where::Save | Where::Nowhere => {
+                None
+            }
         }
     }
 
-    fn read_bytes(&self, addr: u32, len: usize) -> u32 {
+    /// A read the machine is making, which the save chip may answer differently
+    /// the next time it is asked.
+    ///
+    /// This is why reading takes a mutable borrow at all. Everything else here
+    /// is memory and could be read through a shared one, but a flash chip that
+    /// has been asked its name answers its name, and every bit taken out of an
+    /// EEPROM moves it on to the next. See [`Memory::peek_bytes`] for the
+    /// version that must not do that.
+    fn read_bytes(&mut self, addr: u32, len: usize) -> u32 {
+        if matches!(self.locate(addr), Where::Save) {
+            return self.save.read(addr, len);
+        }
+        self.peek_bytes(addr, len)
+    }
+
+    /// The same read, with nothing changed by it.
+    ///
+    /// It answers zero for the save chip rather than asking it, because asking
+    /// is the thing it must not do: a debugger that peeked at an EEPROM would
+    /// eat the bit the game was about to be given.
+    fn peek_bytes(&self, addr: u32, len: usize) -> u32 {
         let (bytes, offset) = match self.locate(addr) {
             Where::Rom(bytes, offset) => (bytes, offset),
-            Where::Ram(Bank::Sram, offset) => {
-                // Save memory sits on an eight-bit bus, so a wider read does
-                // not fetch more: it fetches the one byte and hands back copies
-                // of it. A game that reads its save file a word at a time gets
-                // four of the first byte, which is what the hardware gives and
-                // not what a plain array would.
-                let byte = u32::from(self.sram[offset]);
-                return match len {
-                    1 => byte,
-                    2 => byte * 0x0101,
-                    _ => byte * 0x0101_0101,
-                };
-            }
+            Where::Save => return self.save.peek(addr, len),
             Where::Ram(bank, offset) => (self.bank(bank), offset),
             Where::Floating => return floating(addr, len),
             Where::Registers => {
@@ -387,21 +420,22 @@ impl Memory {
     }
 
     fn write_bytes(&mut self, addr: u32, value: u32, len: usize) {
-        if matches!(self.locate(addr), Where::Registers) {
-            for index in 0..len {
-                self.write_io8(addr + index as u32, (value >> (index * 8)) as u8);
+        match self.locate(addr) {
+            Where::Registers => {
+                for index in 0..len {
+                    self.write_io8(addr + index as u32, (value >> (index * 8)) as u8);
+                }
+                return;
             }
-            return;
+            Where::Save => {
+                self.save.write(addr, value);
+                return;
+            }
+            _ => {}
         }
         let Some((bank, offset)) = self.writable(addr) else {
             return;
         };
-        if bank == Bank::Sram {
-            // Eight bits wide going out as well: only the bottom byte lands,
-            // wherever in the word it was written from.
-            self.sram[offset] = value as u8;
-            return;
-        }
         let bytes = self.bank_mut(bank);
         for index in 0..len {
             bytes[offset + index] = (value >> (index * 8)) as u8;
@@ -418,13 +452,15 @@ enum Bank {
     Pram,
     Vram,
     Oam,
-    Sram,
 }
 
 enum Where<'a> {
     /// Readable and not writable.
     Rom(&'a [u8], usize),
     Ram(Bank, usize),
+    /// The cartridge's save chip, which is not an array and in two cases out of
+    /// three is not memory either. See [`crate::save`].
+    Save,
     /// Cartridge space with no cartridge behind it, which reads as a pattern
     /// made of the address rather than as nothing.
     Floating,
@@ -486,17 +522,26 @@ impl Bus for Memory {
     ///   it the write is dropped.
     /// - Sprite memory drops it always.
     fn write8(&mut self, addr: u32, value: u8) {
-        if matches!(self.locate(addr), Where::Registers) {
-            self.write_io8(addr, value);
-            return;
+        match self.locate(addr) {
+            Where::Registers => {
+                self.write_io8(addr, value);
+                return;
+            }
+            // The save chip is the one place a byte is the *natural* width: its
+            // bus is eight bits wide and a byte is all it can ever take. It is
+            // also how every command reaches a flash chip, so dropping this
+            // would leave a cartridge unable to save at all.
+            Where::Save => {
+                self.save.write(addr, u32::from(value));
+                return;
+            }
+            _ => {}
         }
         let Some((bank, offset)) = self.writable(addr) else {
             return;
         };
         match bank {
-            // Save memory is the one region a byte is the *natural* width for:
-            // its bus is eight bits wide and a byte is all it can ever take.
-            Bank::Ewram | Bank::Iwram | Bank::Sram => self.bank_mut(bank)[offset] = value,
+            Bank::Ewram | Bank::Iwram => self.bank_mut(bank)[offset] = value,
             Bank::Oam => {}
             Bank::Pram => {
                 let pair = offset & !1;
@@ -563,7 +608,7 @@ impl Bus for Memory {
     }
 
     fn peek32(&self, addr: u32) -> u32 {
-        self.read_bytes(addr & !3, 4)
+        self.peek_bytes(addr & !3, 4)
     }
 }
 
@@ -577,6 +622,18 @@ mod tests {
     const PRAM: u32 = 0x0500_0000;
     const VRAM: u32 = 0x0600_0000;
     const OAM: u32 = 0x0700_0000;
+    /// The cartridge's third window, which is the only place an EEPROM is.
+    const EEPROM: u32 = 0x0D00_0000;
+    /// Where every other save chip is.
+    const SAVE: u32 = 0x0E00_0000;
+
+    /// A cartridge carrying the fingerprint a save library leaves in it, at an
+    /// aligned offset as a linker would put it.
+    fn rom_saying(signature: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x400];
+        rom[0x200..0x200 + signature.len()].copy_from_slice(signature);
+        rom
+    }
     /// Where sprites begin in video memory in the tiled modes, which is where
     /// the picture unit starts out.
     const TILED_OBJ: u32 = 0x1_0000;
@@ -963,6 +1020,99 @@ mod tests {
         mem.write32(0x0E00_0010, 0x1234_5678);
         assert_eq!(mem.read8(0x0E00_0010), 0x78);
         assert_eq!(mem.read8(0x0E00_0011), 0, "and the neighbour was not touched");
+    }
+
+    /// A cartridge whose ROM names a flash library gets a flash chip, and the
+    /// chip answers the handshake every such game opens with.
+    ///
+    /// This is the exact path the reported failure took: the driver asks for the
+    /// identifier, hears zero, and puts *"the sub-circuit board is not
+    /// installed"* on the screen instead of a menu. A byte write is how every
+    /// one of these commands arrives, so this also pins that a byte write to the
+    /// save window is not dropped.
+    #[test]
+    fn a_cartridge_that_names_flash_gets_a_chip_that_answers() {
+        let mut mem = Memory::new();
+        mem.load_rom(&rom_saying(b"FLASH1M_V103"));
+        assert_eq!(mem.save().kind(), crate::save::Kind::Flash128);
+
+        mem.write8(SAVE + 0x5555, 0xAA);
+        mem.write8(SAVE + 0x2AAA, 0x55);
+        mem.write8(SAVE + 0x5555, 0x90);
+        assert_eq!(mem.read8(SAVE), 0x62, "the manufacturer");
+        assert_eq!(mem.read8(SAVE + 1), 0x13, "and the part");
+    }
+
+    /// The chip belongs to the cartridge, so putting another cartridge in gets
+    /// another chip. Keeping the first one's would answer a different game's
+    /// driver with a part it does not recognise.
+    #[test]
+    fn the_save_chip_comes_and_goes_with_the_cartridge() {
+        let mut mem = Memory::new();
+        assert_eq!(mem.save().kind(), crate::save::Kind::Sram, "nothing in, plain RAM");
+
+        mem.load_rom(&rom_saying(b"FLASH_V126"));
+        assert_eq!(mem.save().kind(), crate::save::Kind::Flash64);
+
+        mem.load_rom(&rom_saying(b"EEPROM_V124"));
+        assert_eq!(mem.save().kind(), crate::save::Kind::Eeprom);
+    }
+
+    /// The whole of a conversation with an EEPROM, driven the way a game drives
+    /// one: a memory mover pushing the request down the line a bit at a time,
+    /// and a second one pulling the answer back.
+    ///
+    /// It cannot be done any other way. Sixty-eight bus accesses have to arrive
+    /// without a gap, which is what the movers are for — so this is as much a
+    /// test of the wiring between them as of the chip.
+    #[test]
+    fn a_mover_talks_to_an_eeprom_a_bit_at_a_time() {
+        let mut mem = Memory::new();
+        mem.load_rom(&rom_saying(b"EEPROM_V124"));
+
+        // A read request for the first block of the small chip: `11`, six
+        // address bits, and the bit that ends it.
+        for (index, bit) in [1u32, 1, 0, 0, 0, 0, 0, 0, 0].iter().enumerate() {
+            mem.write16(EWRAM + index as u32 * 2, *bit as u16);
+        }
+        mem.write32(0x0400_00D4, EWRAM);
+        mem.write32(0x0400_00D8, EEPROM);
+        mem.write16(0x0400_00DC, 9);
+        mem.write16(0x0400_00DE, 0x8000);
+        mem.tick(1);
+
+        // And sixty-eight halfwords back: four to be thrown away, then the
+        // block, which on a chip nobody has written to is all ones.
+        mem.write32(0x0400_00D4, EEPROM);
+        mem.write32(0x0400_00D8, EWRAM + 0x100);
+        mem.write16(0x0400_00DC, 68);
+        mem.write16(0x0400_00DE, 0x8000);
+        mem.tick(1);
+
+        let bit = |mem: &mut Memory, at: u32| mem.read16(EWRAM + 0x100 + at * 2) & 1;
+        assert_eq!(bit(&mut mem, 0), 0, "the padding");
+        assert_eq!(bit(&mut mem, 3), 0);
+        assert_eq!(bit(&mut mem, 4), 1, "and then the cells, erased to ones");
+        assert_eq!(bit(&mut mem, 67), 1);
+    }
+
+    /// On a cartridge of 16 MiB or less the chip has the whole of the third
+    /// window; a larger one needs all but the last 256 bytes of it for the game
+    /// itself. Getting that wrong on a large cartridge is not a broken saved
+    /// game — it is a hole through the middle of the game's own code.
+    #[test]
+    fn a_large_cartridge_keeps_its_own_code_where_a_small_ones_eeprom_would_be() {
+        let mut rom = rom_saying(b"EEPROM_V124");
+        // The third window shows the cartridge from sixteen megabytes in, so
+        // that is the only offset this can be checked at.
+        let shown_at = 16 * 1024 * 1024;
+        rom.resize(shown_at + 0x100, 0);
+        rom[shown_at..shown_at + 4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let mut mem = Memory::new();
+        mem.load_rom(&rom);
+        assert_eq!(mem.read32(EEPROM), 0xDEAD_BEEF, "the game's own code, not the chip");
+        assert_eq!(mem.read16(0x0DFF_FFFE) & 1, 1, "and the chip in the corner it was pushed to");
     }
 
     #[test]

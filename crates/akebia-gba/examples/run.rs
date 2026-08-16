@@ -165,6 +165,10 @@ fn main() -> ExitCode {
     let mut mem = Memory::new();
     mem.load_rom(&image);
     println!("{path}: {} bytes", mem.rom_len());
+    // Which save chip was found, because a cartridge answered by the wrong one
+    // fails in a way that looks nothing like saving: it says on screen that the
+    // board is not installed and never reaches a menu.
+    println!("  save: {}", mem.save().kind());
 
     if let Some(path) = &bios {
         match std::fs::read(path) {

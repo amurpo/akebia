@@ -1,16 +1,105 @@
-//! Persistence of the battery-backed SRAM into a `.sav` file.
+//! Persistence of the cartridge's saved game into a `.sav` file.
 //!
-//! The core does not touch the disk: it exposes the SRAM with
-//! [`GameBoy::save_ram`] and restores it with [`GameBoy::load_save_ram`]. All
-//! the I/O lives here, like the rest of this crate's adapters.
+//! Neither core touches the disk: each hands over the bytes its cartridge keeps
+//! and takes them back again. All the I/O lives here, like the rest of this
+//! crate's adapters.
 //!
 //! Only play mode uses the `.sav`. `--trace` and `--dump` neither read nor write
 //! it on purpose: they are debugging tools and their output has to depend on the
 //! ROM alone, or it would stop being comparable between runs.
+//!
+//! # Why a trait and not two of these
+//!
+//! What the two machines keep a saved game *in* has nothing in common. The Game
+//! Boy has battery-backed RAM behind its mapper and, on some cartridges, a
+//! clock; the Advance has one of three chips, two of which are devices with
+//! command sets rather than memory. But what a *file* needs of them is the same
+//! four things — hand over the bytes, take them back, and the same for the clock
+//! if there is one — and everything below that is the core's business.
+//!
+//! So the file knows about [`Battery`] and not about either machine, and the
+//! whole of the difference is two implementations at the bottom of this module.
+//! The alternative was a second copy of the autosave timer, the atomic write and
+//! the refusal to overwrite a save that does not fit, which is the part worth
+//! not having twice.
 
 use std::path::{Path, PathBuf};
 
 use akebia_core::GameBoy;
+
+use crate::console::Console;
+
+/// A cartridge that keeps something between sessions.
+pub trait Battery {
+    /// The bytes to write out, or nothing if this cartridge keeps none.
+    fn save_data(&self) -> Option<&[u8]>;
+
+    /// Puts a saved game back, and says whether it fitted this cartridge.
+    fn load_save(&mut self, data: &[u8]) -> bool;
+
+    /// The cartridge clock's state, for the cartridges that have one. It goes
+    /// behind the saved game in the same file, which is where the other
+    /// emulators put it.
+    fn clock_data(&self, _now: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn load_clock(&mut self, _data: &[u8], _now: u64) -> bool {
+        false
+    }
+}
+
+impl Battery for GameBoy {
+    fn save_data(&self) -> Option<&[u8]> {
+        self.save_ram()
+    }
+
+    fn load_save(&mut self, data: &[u8]) -> bool {
+        self.load_save_ram(data)
+    }
+
+    fn clock_data(&self, now: u64) -> Option<Vec<u8>> {
+        self.rtc_save(now).map(|clock| clock.to_vec())
+    }
+
+    fn load_clock(&mut self, data: &[u8], now: u64) -> bool {
+        self.rtc_load(data, now)
+    }
+}
+
+impl Battery for Console {
+    fn save_data(&self) -> Option<&[u8]> {
+        match self {
+            Self::Gb(gb) => gb.save_ram(),
+            // Always something: a cartridge that names no save library is taken
+            // to be using plain RAM, which is the one that needs no library.
+            Self::Gba(gba) => Some(gba.save_data()),
+        }
+    }
+
+    fn load_save(&mut self, data: &[u8]) -> bool {
+        match self {
+            Self::Gb(gb) => gb.load_save_ram(data),
+            Self::Gba(gba) => gba.load_save(data),
+        }
+    }
+
+    /// Only the older machine's cartridges carry a clock. The Advance's have
+    /// one too — a few of them — and nothing here drives it yet.
+    fn clock_data(&self, now: u64) -> Option<Vec<u8>> {
+        match self {
+            Self::Gb(gb) => gb.rtc_save(now).map(|clock| clock.to_vec()),
+            Self::Gba(_) => None,
+        }
+    }
+
+    fn load_clock(&mut self, data: &[u8], now: u64) -> bool {
+        match self {
+            Self::Gb(gb) => gb.rtc_load(data, now),
+            Self::Gba(_) => false,
+        }
+    }
+}
 
 /// How many frames pass between checks for SRAM changes.
 ///
@@ -58,8 +147,8 @@ impl SaveFile {
     /// **not** degrade into "start from scratch and overwrite": if there is a
     /// `.sav` we do not understand, it most likely is a real saved game, and
     /// losing it is far worse than playing one session without saving.
-    pub fn open(gb: &mut GameBoy, path: PathBuf) -> Option<Self> {
-        let expected = gb.save_ram()?.len();
+    pub fn open<B: Battery>(cart: &mut B, path: PathBuf) -> Option<Self> {
+        let expected = cart.save_data()?.len();
 
         let previous = match std::fs::read(&path) {
             Ok(data) => data,
@@ -72,10 +161,10 @@ impl SaveFile {
             }
         };
 
-        // With no previous file, the starting point is the blank SRAM. That way
-        // no `.sav` full of zeros is created next to every ROM opened for a
-        // moment: the file appears when the game actually writes something.
-        let mut written = gb.save_ram()?.to_vec();
+        // With no previous file, the starting point is the untouched chip. That
+        // way no `.sav` full of nothing is created next to every ROM opened for
+        // a moment: the file appears when the game actually writes something.
+        let mut written = cart.save_data()?.to_vec();
         if !previous.is_empty() {
             let (data, trailer) = fit(previous, expected).or_else(|| {
                 eprintln!(
@@ -85,12 +174,12 @@ impl SaveFile {
                 eprintln!("warning: the game will not be saved, so as not to overwrite it");
                 None
             })?;
-            if !gb.load_save_ram(&data) {
+            if !cart.load_save(&data) {
                 eprintln!("warning: the cartridge rejected {}", path.display());
                 return None;
             }
             // The trailer `fit` clipped is the clock state, if there is one.
-            if !trailer.is_empty() && gb.rtc_load(&trailer, now()) {
+            if !trailer.is_empty() && cart.load_clock(&trailer, now()) {
                 eprintln!("cartridge clock restored from {}", path.display());
             }
             // We have just loaded it, so the file is already up to date.
@@ -108,17 +197,17 @@ impl SaveFile {
     /// autosave happened to have written last.
     ///
     /// [`open`]: Self::open
-    pub fn copied(gb: &GameBoy, path: PathBuf) -> Option<Self> {
-        gb.save_ram()?;
+    pub fn copied<B: Battery>(cart: &B, path: PathBuf) -> Option<Self> {
+        cart.save_data()?;
         // Nothing written yet as far as this file is concerned, so the first
         // autosave creates it even if the game has not touched the SRAM since.
         Some(Self { path, written: Vec::new(), frames: 0, warned: false })
     }
 
-    /// Bytes to be written: the SRAM and, after it, the cartridge clock.
-    fn contents(gb: &GameBoy) -> Option<Vec<u8>> {
-        let mut data = gb.save_ram()?.to_vec();
-        if let Some(clock) = gb.rtc_save(now()) {
+    /// Bytes to be written: the saved game and, after it, the cartridge clock.
+    fn contents<B: Battery>(cart: &B) -> Option<Vec<u8>> {
+        let mut data = cart.save_data()?.to_vec();
+        if let Some(clock) = cart.clock_data(now()) {
             data.extend_from_slice(&clock);
         }
         Some(data)
@@ -141,49 +230,50 @@ impl SaveFile {
         self.written.clear();
     }
 
-    pub fn tick(&mut self, gb: &GameBoy) {
+    pub fn tick<B: Battery>(&mut self, cart: &B) {
         self.frames += 1;
         if self.frames % AUTOSAVE_EVERY == 0 {
-            self.flush(gb);
+            self.flush(cart);
         }
     }
 
-    /// Writes if the SRAM changed since the last time.
+    /// Writes if the saved game changed since the last time.
     ///
-    /// The comparison looks at **the SRAM only**, not the whole file: the
+    /// The comparison looks at **the saved game only**, not the whole file: the
     /// clock's timestamp changes every second and comparing it would rewrite the
     /// `.sav` on every autosave even if the game had touched nothing.
-    pub fn flush(&mut self, gb: &GameBoy) {
-        let Some(current) = gb.save_ram() else { return };
+    pub fn flush<B: Battery>(&mut self, cart: &B) {
+        let Some(current) = cart.save_data() else { return };
         if current == self.written {
             return;
         }
-        self.write(gb);
+        self.write(cart);
     }
 
-    /// Writes on shutdown, even if the SRAM did not change.
+    /// Writes on shutdown, even if the saved game did not change.
     ///
     /// On a cartridge with a clock it is needed: the game may have halted or
-    /// adjusted it without touching the SRAM, and without refreshing the
+    /// adjusted it without touching the memory, and without refreshing the
     /// timestamp the next load would advance the clock from a stale state.
-    pub fn flush_final(&mut self, gb: &GameBoy) {
-        if gb.rtc_save(0).is_some() {
-            self.write(gb);
+    pub fn flush_final<B: Battery>(&mut self, cart: &B) {
+        if cart.clock_data(0).is_some() {
+            self.write(cart);
         } else {
-            self.flush(gb);
+            self.flush(cart);
         }
     }
 
-    fn write(&mut self, gb: &GameBoy) {
-        let Some(data) = Self::contents(gb) else {
+    fn write<B: Battery>(&mut self, cart: &B) {
+        let Some(data) = Self::contents(cart) else {
             return;
         };
         match write_atomic(&self.path, &data) {
             Ok(()) => {
-                // Only the SRAM is remembered, which is what gets compared.
-                let sram = gb.save_ram().unwrap_or(&[]);
+                // Only the saved game is remembered, which is what gets
+                // compared.
+                let saved = cart.save_data().unwrap_or(&[]);
                 self.written.clear();
-                self.written.extend_from_slice(sram);
+                self.written.extend_from_slice(saved);
             }
             Err(e) if !self.warned => {
                 eprintln!("warning: could not save to {}: {e}", self.path.display());
@@ -399,6 +489,51 @@ mod tests {
 
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(before, after, "the file was not even touched");
+    }
+
+    /// An Advance cartridge with a 64 KiB flash chip on it, named the way a
+    /// save library names itself.
+    fn advance(signature: &[u8]) -> Console {
+        let mut rom = vec![0u8; 0x400];
+        rom[0..4].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // `B .`
+        rom[0x200..0x200 + signature.len()].copy_from_slice(signature);
+        Console::Gba(Box::new(akebia_gba::Gba::with_rom(&rom)))
+    }
+
+    /// The Advance's saved game goes through this same file, which is the whole
+    /// reason [`Battery`] exists. What differs is only how big it is and which
+    /// chip it came out of, and neither is this module's business.
+    #[test]
+    fn an_advance_cartridge_saves_and_restores() {
+        let path = temporary("advance");
+        let _ = std::fs::remove_file(&path);
+
+        let mut console = advance(b"FLASH_V126");
+        let mut save = SaveFile::open(&mut console, path.clone()).unwrap();
+        assert!(!path.exists(), "an untouched chip is not a saved game");
+
+        console.load_save(&vec![0x42; 64 * 1024]);
+        save.flush(&console);
+        assert_eq!(std::fs::read(&path).unwrap().len(), 64 * 1024, "the size of the chip");
+
+        // And a fresh console reads it back, with no clock trailer to clip.
+        let mut other = advance(b"FLASH_V126");
+        assert!(SaveFile::open(&mut other, path).is_some());
+        assert!(other.save_data().unwrap().iter().all(|&b| b == 0x42));
+    }
+
+    /// The size comes from the chip, so a file written by one cartridge does not
+    /// fit another — and is left alone rather than stretched over. On this
+    /// machine that matters more than on the older one: the four chips are four
+    /// different sizes, and every one of them is somebody's real saved game.
+    #[test]
+    fn an_advance_sav_of_another_chips_size_is_not_overwritten() {
+        let path = temporary("advance-mismatch");
+        std::fs::write(&path, vec![0x11; 32 * 1024]).unwrap();
+
+        let mut console = advance(b"FLASH1M_V103");
+        assert!(SaveFile::open(&mut console, path.clone()).is_none(), "not saved this session");
+        assert_eq!(std::fs::read(&path).unwrap().len(), 32 * 1024, "and the file is intact");
     }
 
     #[test]

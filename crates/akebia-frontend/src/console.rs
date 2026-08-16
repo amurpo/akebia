@@ -10,11 +10,12 @@
 //! the call site.
 //!
 //! And the differences are real. One console is 160×144 and the other 240×160.
-//! One has eight buttons and the other ten. One has a link port, a mapper, a
-//! saved game and four sound channels that work; the other has none of that
-//! yet. Hiding those behind a uniform interface would mean inventing answers —
-//! a link cable for a machine with no link port — where saying "this machine
-//! does not do that" is both true and shorter.
+//! One has eight buttons and the other ten. One has a link port and a mapper;
+//! the other has neither, and keeps its saved game in one of three chips that
+//! are nothing like a mapper's battery-backed RAM. Hiding those behind a
+//! uniform interface would mean inventing answers — a link cable for a machine
+//! with no link port — where saying "this machine does not do that" is both
+//! true and shorter.
 //!
 //! # The buttons are the frontend's, not either core's
 //!
@@ -192,7 +193,7 @@ impl Console {
     }
 
     /// The Game Boy inside, for everything that is the older machine's alone:
-    /// the link cable, the saved game, the sound, the debug captures.
+    /// the link cable, the serial port, the debug captures.
     pub fn gameboy(&self) -> Option<&GameBoy> {
         match self {
             Self::Gb(gb) => Some(gb),

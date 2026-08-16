@@ -33,6 +33,7 @@ use crate::bus::Memory;
 use crate::cpu::{Cpu, Fault};
 use crate::keypad::Button;
 use crate::ppu::FRAME_CYCLES;
+use crate::save;
 use crate::sound::StereoSample;
 use crate::{Mode, SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -225,6 +226,32 @@ impl Gba {
     /// How many frames have been swept since the machine started.
     pub fn frames(&self) -> u64 {
         self.mem.ppu().frames()
+    }
+
+    /// Which save chip this cartridge carries, which is worked out from the ROM
+    /// and not declared anywhere in its header. See [`crate::save`].
+    pub fn save_kind(&self) -> save::Kind {
+        self.mem.save().kind()
+    }
+
+    /// The saved game as it stands, for whoever writes it to a file.
+    ///
+    /// Always something, because every cartridge is given a chip — a ROM that
+    /// names no save library is taken to be using plain RAM, which is the one
+    /// that needs no library. Whether any of it has been *written* is the
+    /// caller's to notice, and worth noticing: a file created next to every ROM
+    /// that was opened for a moment is a mess nobody asked for.
+    pub fn save_data(&self) -> &[u8] {
+        self.mem.save().data()
+    }
+
+    /// Restores one, and says whether it fitted.
+    ///
+    /// A file of the wrong length is refused rather than stretched. It is far
+    /// more likely to be another cartridge's saved game than a damaged one, and
+    /// the cost of guessing wrong is overwriting a real save.
+    pub fn load_save(&mut self, data: &[u8]) -> bool {
+        self.mem.save_mut().load(data)
     }
 
     pub fn memory(&self) -> &Memory {

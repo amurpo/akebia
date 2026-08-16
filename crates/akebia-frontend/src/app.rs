@@ -1605,17 +1605,15 @@ impl Session {
             gb.set_write_log_enabled(args.debug);
         }
 
-        // Only the older machine has a mapper with battery-backed memory in it.
-        // The Advance's saved games live in flash or an EEPROM that this
-        // emulator does not have yet, so an Advance session keeps nothing —
-        // which is worth knowing before a long play rather than after one.
-        let save = match (args.no_save, console.gameboy_mut()) {
-            (false, Some(gb)) => {
+        // Both machines keep a saved game, in memories that have nothing in
+        // common; what they agree on is a file, which is all this needs. See
+        // [`save::Battery`].
+        let save = (!args.no_save)
+            .then(|| {
                 let path = args.save.clone().unwrap_or_else(|| save::default_path(&rom));
-                save::SaveFile::open(gb, path)
-            }
-            _ => None,
-        };
+                save::SaveFile::open(&mut console, path)
+            })
+            .flatten();
         let title = console.title();
         let (width, height) = console.screen_size();
 
@@ -1957,18 +1955,20 @@ impl Session {
         // rather than out of a Game Boy. It has to happen whether or not there
         // is a sound card: uncollected samples pile up for the whole session.
         crate::drain_audio(&mut self.console, self.audio.as_ref());
+        // Both machines keep a saved game, so this comes out of the console too
+        // and not out of a Game Boy.
+        if let Some(save) = self.save.as_mut() {
+            save.tick(&self.console);
+        }
 
-        // The rest is the older machine's: the serial port, the mapper's saved
-        // game and the debug capture. The Advance has none of them here yet,
-        // and doing nothing is the honest answer.
+        // The rest is the older machine's: the serial port and the debug
+        // capture. The Advance has neither here yet, and doing nothing is the
+        // honest answer.
         let serial = self.serial;
         let Some(gb) = self.console.gameboy_mut() else {
             return;
         };
         crate::drain_serial(gb, serial);
-        if let Some(save) = self.save.as_mut() {
-            save.tick(gb);
-        }
         // It has to be drained every frame even if nothing is printed: otherwise
         // the core's capture would pile up 144 lines per frame without end.
         if let Some(trace) = self.trace.as_mut() {
@@ -1996,8 +1996,8 @@ impl Session {
     /// Writes the saved game. Called on leaving for the list and on closing the
     /// window.
     pub fn close(&mut self) {
-        if let (Some(save), Some(gb)) = (self.save.as_mut(), self.console.gameboy()) {
-            save.flush_final(gb);
+        if let Some(save) = self.save.as_mut() {
+            save.flush_final(&self.console);
         }
     }
 
@@ -2313,10 +2313,15 @@ mod tests {
 
     fn advance_session() -> Session {
         let gba = akebia_gba::Gba::with_rom(&red_pixel_rom());
-        let args = match Args::parse(["game.gba".to_owned()]).unwrap() {
+        let mut args = match Args::parse(["game.gba".to_owned()]).unwrap() {
             crate::args::Parsed::Run(args) => *args,
             crate::args::Parsed::Help => unreachable!("a path is not --help"),
         };
+        // Opening a session reads the saved game, so it is pointed somewhere
+        // that is not the working directory: a test must not depend on what
+        // happens to be lying next to it, nor leave anything there.
+        args.save =
+            Some(std::env::temp_dir().join(format!("akebia-advance-{}.sav", std::process::id())));
         Session::new(
             Console::Gba(Box::new(gba)),
             PathBuf::from("game.gba"),
@@ -2344,14 +2349,16 @@ mod tests {
         assert_eq!(session.pixels[1], Color32::BLACK, "and nothing beside it");
     }
 
-    /// An Advance keeps no saved game, because the flash and EEPROM its
-    /// cartridges use are not written yet. Pretending otherwise would lose a
-    /// player's afternoon quietly.
+    /// An Advance keeps its saved game, in whichever of three chips its
+    /// cartridge carries, and in the same `.sav` the older machine uses. This
+    /// test used to assert the opposite, which was the honest answer while the
+    /// chips did not exist — and the reason it was worth having is that a
+    /// machine that quietly keeps nothing loses a player's afternoon.
     #[test]
-    fn an_advance_session_keeps_no_saved_game() {
+    fn an_advance_session_keeps_its_saved_game() {
         let session = advance_session();
-        assert!(session.save.is_none());
-        assert!(session.gb().is_none(), "and there is no Game Boy in it");
+        assert!(session.save.is_some());
+        assert!(session.gb().is_none(), "and there is still no Game Boy in it");
     }
 
     /// The two machines run at their own rates. One at the other's is a game

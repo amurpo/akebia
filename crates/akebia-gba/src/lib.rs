@@ -38,10 +38,14 @@
 //! for addresses it does not know is a machine reporting every button held for
 //! ever. A cartridge sat on its title screen over it. See [`keypad`].
 //!
-//! The four counters run, and so does half the sound: the two queues a game
-//! posts its own mixed-down music into, and a mixer that plays them. What is
-//! missing there is the four channels this machine inherited from the older
-//! one, which is a voice or two per tune rather than the tune. See [`sound`].
+//! The four counters run, and so does the sound: the two queues a game posts
+//! its own mixed-down music into, the four channels this machine inherited from
+//! the older one, and the mixer that puts them together. See [`sound`].
+//!
+//! And a game keeps what it saves. There are three different chips a cartridge
+//! might carry for that and they have nothing in common with each other; which
+//! one a cartridge has is worked out from a string its save library left in the
+//! ROM. See [`save`].
 //!
 //! What does not exist at all is timing worth the name — a step of the
 //! processor charges one cycle, which is a floor and not a measurement — and
@@ -54,6 +58,7 @@ pub mod dma;
 pub mod interrupts;
 pub mod keypad;
 pub mod ppu;
+pub mod save;
 pub mod sound;
 pub mod timers;
 
