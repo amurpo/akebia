@@ -127,12 +127,21 @@ impl Timers {
         Self::default()
     }
 
-    /// Moves every running counter on by that many machine cycles.
+    /// Moves every running counter on by that many machine cycles, and says
+    /// which of them came round: a bit per timer.
+    ///
+    /// Coming round is reported whether or not an interrupt was asked for,
+    /// because the interrupt is not the only thing that watches. The sound
+    /// queues are drained by a timer that deliberately asks for no interrupt at
+    /// all — the overflow itself is the sample clock, and telling only the
+    /// interrupt controller about it would hide the very timers that matter
+    /// most.
     ///
     /// In order, and that matters: a cascading timer counts the one below it
     /// coming round, so the one below has to have been moved first. Going the
     /// other way would delay every cascade by a tick.
-    pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) {
+    pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) -> u8 {
+        let mut came_round_bits = 0u8;
         let mut from_below = 0;
         for (index, (timer, source)) in self.channels.iter_mut().zip(SOURCES).enumerate() {
             if !timer.enabled() {
@@ -153,11 +162,15 @@ impl Timers {
             };
 
             let came_round = timer.advance(steps);
-            if came_round > 0 && timer.control & IRQ_ENABLED != 0 {
-                irq.raise(source);
+            if came_round > 0 {
+                came_round_bits |= 1 << index;
+                if timer.control & IRQ_ENABLED != 0 {
+                    irq.raise(source);
+                }
             }
             from_below = came_round;
         }
+        came_round_bits
     }
 
     pub fn read8(&self, addr: u32) -> u8 {
@@ -235,6 +248,12 @@ mod tests {
         let mut irq = Interrupts::new();
         timers.tick(cycles, &mut irq);
         irq
+    }
+
+    /// Which timers came round, whatever they asked for.
+    fn overflows(timers: &mut Timers, cycles: u32) -> u8 {
+        let mut irq = Interrupts::new();
+        timers.tick(cycles, &mut irq)
     }
 
     #[test]
@@ -467,6 +486,27 @@ mod tests {
         // every cycle that reaches the bottom.
         tick(&mut timers, 4);
         assert_eq!(read16(&timers, at(3)), 0xFFFF, "the top came round too");
+    }
+
+    /// Coming round is reported even when no interrupt was asked for. The
+    /// sound queues are drained by exactly such a timer, so reporting only the
+    /// ones that interrupt would hide the ones that matter most.
+    #[test]
+    fn coming_round_is_reported_even_with_no_interrupt_asked_for() {
+        let mut timers = Timers::new();
+        write16(&mut timers, at(0), 0xFFFF);
+        write16(&mut timers, at(0) + 2, control(0, ENABLED));
+
+        assert_eq!(overflows(&mut timers, 1), 1 << 0, "it came round and said so");
+        let irq = tick(&mut timers, 1);
+        assert_eq!(irq.requested(), 0, "and still raised nothing");
+    }
+
+    #[test]
+    fn a_timer_that_did_not_come_round_is_not_reported() {
+        let mut timers = Timers::new();
+        write16(&mut timers, at(0) + 2, control(0, ENABLED));
+        assert_eq!(overflows(&mut timers, 5), 0);
     }
 
     #[test]

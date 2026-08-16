@@ -33,11 +33,15 @@
 //!
 //! # What is not here
 //!
-//! The two start conditions that are not a blanking period: sound wants a
-//! channel to run when a queue empties, and there is no sound; the video
-//! capture mode wants one per line of an external feed there is no hardware
-//! for. A channel asking for either is switched on and then never triggered,
-//! which is at least a silence rather than a wrong picture.
+//! The video capture mode, which wants a channel to run per line of an external
+//! feed there is no hardware for. A channel asking for it is switched on and
+//! then never triggered, which is at least a silence rather than a wrong
+//! picture.
+//!
+//! Sound used to be on that list and has come off it: a channel can now be
+//! triggered by a sound queue falling half empty, which is how a tune is played
+//! at all. See [`crate::sound`] for the three pieces that arrangement needs and
+//! why the queue is the one in the middle.
 //!
 //! Nor do the transfers cost anything. On hardware the processor is stopped for
 //! the duration, and here the whole copy happens between two instructions. The
@@ -46,6 +50,7 @@
 //! yet count.
 
 use crate::interrupts::{Interrupts, Source};
+use crate::sound;
 use crate::ppu::Crossed;
 
 /// The first byte of the four channels' registers, and the last.
@@ -72,6 +77,16 @@ const ENABLE: u16 = 1 << 15;
 const IMMEDIATELY: u16 = 0 << 12;
 const AT_VBLANK: u16 = 1 << 12;
 const AT_HBLANK: u16 = 2 << 12;
+/// The fourth means a different thing on each channel: feeding a sound queue on
+/// channels 1 and 2, and a video feed on channel 3 that this machine has no
+/// hardware for. On channel 0 it means nothing at all.
+const SPECIAL: u16 = 3 << 12;
+
+/// A sound transfer is always this, whatever the count and width registers
+/// hold: four words, to an address that does not move because it is the mouth
+/// of a queue rather than a place in memory.
+const FIFO_UNITS: u32 = 4;
+const FIFO_WIDTH: u32 = 4;
 
 /// How an address moves after each unit.
 const STEP_UP: u16 = 0;
@@ -185,11 +200,32 @@ impl Dma {
             let due = match channel.start() {
                 AT_VBLANK => crossed.vblank,
                 AT_HBLANK => crossed.hblank,
-                // Immediately, which already ran, or one of the two conditions
-                // this machine cannot produce yet.
+                // Immediately, which already ran, or the special mode, which is
+                // not a blanking period and arrives through `at_fifo`.
                 _ => false,
             };
             if due {
+                self.pending |= 1 << index;
+            }
+        }
+    }
+
+    /// Tells the channels a sound queue wants refilling.
+    ///
+    /// Which queue a channel feeds is not in its control register: it is
+    /// wherever the game pointed the channel. So a channel in the special mode
+    /// is a sound channel *because its destination is a queue*, and one pointed
+    /// anywhere else is left alone rather than guessed at.
+    ///
+    /// Only channels 1 and 2 can do this. The special mode on channel 0 means
+    /// nothing, and on channel 3 it means the video feed there is no hardware
+    /// for.
+    pub fn at_fifo(&mut self, hungry: [bool; 2]) {
+        for index in 0..4 {
+            let Some(which) = self.queue_fed_by(index) else {
+                continue;
+            };
+            if hungry[which] {
                 self.pending |= 1 << index;
             }
         }
@@ -204,6 +240,19 @@ impl Dma {
     /// can move the bytes without holding a borrow on this.
     pub fn job(&self, index: usize) -> Job {
         let channel = &self.channels[index];
+        if self.queue_fed_by(index).is_some() {
+            // Fixed at four words to a fixed address. The count register is not
+            // consulted at all — a game leaves whatever was last in it — and
+            // neither is the width, since a queue takes words.
+            return Job {
+                source: channel.src_now,
+                dest: channel.dst_now,
+                units: FIFO_UNITS,
+                width: FIFO_WIDTH,
+                source_step: FIFO_WIDTH,
+                dest_step: 0,
+            };
+        }
         let width = if channel.wide() { 4 } else { 2 };
         Job {
             source: channel.src_now,
@@ -227,6 +276,13 @@ impl Dma {
             irq.raise(SOURCES[index]);
         }
 
+        // A sound channel is kept running by the repeat bit like any other, and
+        // a game must set it: one refill is sixteen samples, and a channel that
+        // switched itself off after them would play a millisecond and a half of
+        // the tune and then stop. Nothing here special-cases that — the machine
+        // does what it is told, and being told wrongly is audible rather than
+        // hidden.
+        //
         // A channel started immediately has nothing left to wait for, so
         // repeating it would mean running for ever. Hardware treats the
         // combination as a one-off and so does this.
@@ -240,6 +296,31 @@ impl Dma {
         }
     }
 }
+
+impl Dma {
+    /// Which sound queue a channel is set up to feed, if any.
+    ///
+    /// Three things have to hold, and this is the only place that says so:
+    /// the channel must be running, it must be one of the two that can do this
+    /// at all, and it must be in the special mode pointed at a queue. Which
+    /// queue is not in any register — it is wherever the game pointed the
+    /// channel — so the destination is what answers.
+    fn queue_fed_by(&self, index: usize) -> Option<usize> {
+        let channel = &self.channels[index];
+        if !channel.enabled() || !(1..=2).contains(&index) || channel.start() != SPECIAL {
+            return None;
+        }
+        match channel.dest & !3 {
+            sound::FIFO_A => Some(0),
+            SECOND_FIFO => Some(1),
+            _ => None,
+        }
+    }
+}
+
+/// The second queue's address. [`sound::FIFO_B`] is the *last* byte of the
+/// pair, so the address a channel is pointed at is four on from the first.
+const SECOND_FIFO: u32 = sound::FIFO_A + 4;
 
 /// A transfer, as a value: everything needed to move the bytes and nothing
 /// that borrows the channel it came from.
@@ -312,6 +393,153 @@ mod tests {
         dma.write8(at + COUNT_AT + 1, (count >> 8) as u8);
         dma.write8(at + CONTROL_AT, control as u8);
         dma.write8(at + CONTROL_AT + 1, (control >> 8) as u8);
+    }
+
+    /// Channel 1, which is one of the two that can feed a sound queue.
+    const ONE: u32 = BASE + STRIDE;
+    const TWO: u32 = BASE + STRIDE * 2;
+
+    const NEITHER: [bool; 2] = [false, false];
+    const A_WANTS: [bool; 2] = [true, false];
+    const B_WANTS: [bool; 2] = [false, true];
+
+    // --- Feeding a sound queue --------------------------------------------
+
+    /// A channel pointed at a queue goes when that queue asks, and not before.
+    #[test]
+    fn a_channel_pointed_at_a_queue_goes_when_the_queue_asks() {
+        let mut dma = Dma::new();
+        arm(&mut dma, ONE, 0x0200_0000, sound::FIFO_A, 0, ENABLE | REPEAT | SPECIAL | WIDE);
+        assert_eq!(dma.next_ready(), None, "nothing is playing yet");
+
+        dma.at_fifo(NEITHER);
+        assert_eq!(dma.next_ready(), None);
+
+        dma.at_fifo(B_WANTS);
+        assert_eq!(dma.next_ready(), None, "that is the other queue");
+
+        dma.at_fifo(A_WANTS);
+        assert_eq!(dma.next_ready(), Some(1));
+    }
+
+    /// Which queue a channel feeds is not in its control register — it is
+    /// wherever the game pointed it. So the destination is what decides.
+    #[test]
+    fn the_destination_decides_which_queue_a_channel_feeds() {
+        let mut dma = Dma::new();
+        arm(&mut dma, ONE, 0x0200_0000, sound::FIFO_A + 4, 0, ENABLE | REPEAT | SPECIAL | WIDE);
+
+        dma.at_fifo(A_WANTS);
+        assert_eq!(dma.next_ready(), None, "it is pointed at the second queue");
+        dma.at_fifo(B_WANTS);
+        assert_eq!(dma.next_ready(), Some(1));
+    }
+
+    /// Pointing at a queue is not on its own enough: a channel waiting for a
+    /// blanking period is waiting for that and nothing else, however a queue
+    /// happens to be doing. Both halves have to hold, and this is the half the
+    /// destination check would otherwise hide.
+    #[test]
+    fn a_channel_pointed_at_a_queue_in_another_mode_is_not_a_sound_channel() {
+        for mode in [IMMEDIATELY, AT_VBLANK, AT_HBLANK] {
+            let mut dma = Dma::new();
+            arm(&mut dma, ONE, 0x0200_0000, sound::FIFO_A, 4, ENABLE | REPEAT | mode | WIDE);
+            // Clear whatever arming in the immediate mode already queued.
+            let mut irq = Interrupts::new();
+            if let Some(index) = dma.next_ready() {
+                let job = dma.job(index);
+                dma.finished(index, job.source, job.dest, &mut irq);
+            }
+
+            dma.at_fifo([true, true]);
+            assert_eq!(dma.next_ready(), None, "mode {mode:04X}");
+        }
+    }
+
+    /// A channel in the special mode pointed anywhere else is not a sound
+    /// channel and is left alone rather than guessed at.
+    #[test]
+    fn a_special_channel_pointed_elsewhere_is_never_triggered() {
+        let mut dma = Dma::new();
+        arm(&mut dma, ONE, 0x0200_0000, 0x0600_0000, 4, ENABLE | REPEAT | SPECIAL | WIDE);
+        dma.at_fifo([true, true]);
+        assert_eq!(dma.next_ready(), None);
+    }
+
+    /// Only channels 1 and 2 can do this. On channel 0 the special mode means
+    /// nothing, and on channel 3 it means a video feed there is no hardware for.
+    #[test]
+    fn only_the_middle_two_channels_can_feed_a_queue() {
+        for at in [BASE, BASE + STRIDE * 3] {
+            let mut dma = Dma::new();
+            arm(&mut dma, at, 0x0200_0000, sound::FIFO_A, 0, ENABLE | REPEAT | SPECIAL | WIDE);
+            dma.at_fifo([true, true]);
+            assert_eq!(dma.next_ready(), None, "channel at 0x{at:08X}");
+        }
+    }
+
+    /// A sound transfer is four words to an address that does not move, whatever
+    /// the count and width registers happen to hold. A game leaves whatever was
+    /// last in them, so consulting them would post an arbitrary amount.
+    #[test]
+    fn a_sound_transfer_is_four_words_to_a_fixed_address() {
+        let mut dma = Dma::new();
+        // A deliberately silly count and the narrow width, both to be ignored.
+        arm(&mut dma, TWO, 0x0200_0000, sound::FIFO_A, 999, ENABLE | REPEAT | SPECIAL);
+        dma.at_fifo(A_WANTS);
+
+        let job = dma.job(2);
+        assert_eq!(job.units, 4, "always four");
+        assert_eq!(job.width, 4, "and always words");
+        assert_eq!(job.dest_step, 0, "the mouth of a queue does not move");
+        assert_eq!(job.source_step, 4, "the tune does");
+    }
+
+    /// A sound channel keeps its place in the tune across refills, and is asked
+    /// again every time the queue falls. Sixteen samples is a millisecond and a
+    /// half, so one refill is not a tune.
+    #[test]
+    fn a_sound_channel_stays_on_and_walks_its_source() {
+        let mut dma = Dma::new();
+        let mut irq = Interrupts::new();
+        arm(&mut dma, ONE, 0x0200_0000, sound::FIFO_A, 0, ENABLE | REPEAT | SPECIAL | WIDE);
+
+        dma.at_fifo(A_WANTS);
+        let job = dma.job(1);
+        dma.finished(1, job.source + 16, job.dest, &mut irq);
+
+        assert_eq!(dma.next_ready(), None, "it is not ready until asked again");
+        dma.at_fifo(A_WANTS);
+        assert_eq!(dma.next_ready(), Some(1), "and it is still switched on");
+        assert_eq!(dma.job(1).source, 0x0200_0010, "carrying on through the tune");
+        assert_eq!(dma.job(1).dest, sound::FIFO_A, "into the same mouth");
+
+        // And on, for as long as the tune lasts.
+        for round in 2..8u32 {
+            let job = dma.job(1);
+            dma.finished(1, job.source + 16, job.dest, &mut irq);
+            dma.at_fifo(A_WANTS);
+            assert_eq!(dma.next_ready(), Some(1), "round {round}");
+            assert_eq!(dma.job(1).source, 0x0200_0000 + round * 16, "round {round}");
+        }
+    }
+
+    /// Keeping it running is the repeat bit's job, here as anywhere else. A
+    /// game that leaves it clear gets one refill and silence, which is what the
+    /// hardware gives it and is at least audible rather than hidden.
+    #[test]
+    fn a_sound_channel_without_the_repeat_bit_stops_after_one_refill() {
+        let mut dma = Dma::new();
+        let mut irq = Interrupts::new();
+        arm(&mut dma, ONE, 0x0200_0000, sound::FIFO_A, 0, ENABLE | SPECIAL | WIDE);
+
+        dma.at_fifo(A_WANTS);
+        assert_eq!(dma.next_ready(), Some(1), "the first refill happens");
+        let job = dma.job(1);
+        dma.finished(1, job.source + 16, job.dest, &mut irq);
+
+        dma.at_fifo(A_WANTS);
+        assert_eq!(dma.next_ready(), None, "and there is no second");
     }
 
     /// Each channel's twelve bytes, and no channel able to reach another's.

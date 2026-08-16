@@ -41,6 +41,7 @@ use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
 use crate::keypad::{self, Keypad};
 use crate::ppu::{self, Ppu};
+use crate::sound::{self, Sound};
 use crate::timers::{self, Timers};
 
 pub const BIOS_LEN: usize = 16 * 1024;
@@ -92,6 +93,9 @@ pub struct Memory {
     /// The four counters, which are the only clock a game has that is not the
     /// beam.
     timers: Timers,
+    /// The two queues digital sound is played out of. There is no sound; the
+    /// queues are here because the memory movers are triggered by them.
+    sound: Sound,
     /// The one sound register that exists, and the reason it does.
     ///
     /// There is no sound here at all, and this changes that not one bit: it
@@ -128,6 +132,7 @@ impl Memory {
             dma: Dma::new(),
             keypad: Keypad::new(),
             timers: Timers::new(),
+            sound: Sound::new(),
             // What the hardware holds after a reset: the level sitting at the
             // midpoint of its range.
             sound_bias: SOUND_BIAS_AT_RESET,
@@ -165,6 +170,12 @@ impl Memory {
         &mut self.ppu
     }
 
+    /// The sound queues. Nothing plays them yet; this is how a test — and one
+    /// day a mixer — reads what has come out of them.
+    pub fn sound(&self) -> &Sound {
+        &self.sound
+    }
+
     pub fn keypad(&self) -> &Keypad {
         &self.keypad
     }
@@ -199,6 +210,7 @@ impl Memory {
             0x0400_0208 => half(u16::from(self.irq.master())),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.read8(addr),
             timers::BASE..=timers::LAST => self.timers.read8(addr),
+            sound::CONTROL | sound::FIFO_A..=sound::FIFO_B => self.sound.read8(addr),
             _ => 0,
         }
     }
@@ -215,6 +227,7 @@ impl Memory {
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.write8(addr, value),
             timers::BASE..=timers::LAST => self.timers.write8(addr, value),
+            sound::CONTROL | sound::FIFO_A..=sound::FIFO_B => self.sound.write8(addr, value),
             SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
@@ -524,8 +537,17 @@ impl Bus for Memory {
     fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
         let crossed = self.ppu.tick(cycles, &mut self.irq);
-        self.timers.tick(cycles, &mut self.irq);
+        // The timers report coming round whether or not they interrupt, because
+        // an overflow is also a sound queue's sample clock.
+        let overflowed = self.timers.tick(cycles, &mut self.irq);
         self.dma.at_blanking(crossed);
+        // Draining comes before asking, so that a queue emptied by this tick is
+        // refilled by it rather than a tick later. What is asked is the queue's
+        // state and not what this tick did to it: a queue nothing has played
+        // from yet is empty, and has to be filled before a first sample can
+        // come out of it.
+        self.sound.at_timers(overflowed);
+        self.dma.at_fifo(self.sound.hungry());
         self.run_transfers();
         // The buttons are compared against what the game asked to watch here
         // rather than where a button is pressed, because the hardware compares
@@ -800,6 +822,87 @@ mod tests {
         mem.tick(1);
         assert_eq!(mem.read16(timers::BASE), 0xFFFC, "back to the reload");
         assert_ne!(mem.interrupts().requested(), 0, "and it said so");
+    }
+
+    /// The whole of playing a tune, with nothing listening at the end of it.
+    ///
+    /// Three separate pieces have to meet for this and none of them is enough
+    /// alone: a timer coming round at the sample rate, a queue that empties one
+    /// sample at a time and asks when it is half gone, and a memory mover in
+    /// its special mode that answers. This is the test that says they are wired
+    /// to each other and not merely all present.
+    #[test]
+    fn a_timer_drains_a_queue_and_a_mover_refills_it() {
+        let mut mem = Memory::new();
+
+        // A tune in memory: 64 bytes counting up, so where the queue has got to
+        // is readable off the sample.
+        for byte in 0..64u32 {
+            mem.write8(EWRAM + byte, byte as u8);
+        }
+
+        // Channel 1 feeds the first queue, in the special mode, repeating.
+        let one = dma::BASE + 12;
+        mem.write32(one, EWRAM);
+        mem.write32(one + 4, sound::FIFO_A);
+        mem.write16(one + 10, 0x8000 | 0x0200 | 0x3000 | 0x0400);
+
+        // Timer 0 comes round every four cycles, and drives the queue.
+        mem.write16(timers::BASE, 0xFFFC);
+        mem.write16(timers::BASE + 2, 0x0080);
+
+        // The queue starts empty, so it is hungry, so the first tick refills it
+        // before anything can be played out of it.
+        mem.tick(4);
+        assert_eq!(mem.sound().playing()[0], 0, "nothing was in it to play yet");
+
+        // Sixteen bytes arrived. Playing them out gives the tune in order.
+        let mut heard = Vec::new();
+        for _ in 0..16 {
+            mem.tick(4);
+            heard.push(mem.sound().playing()[0]);
+        }
+        assert_eq!(heard[0], 0, "the first sample of the tune");
+        assert_eq!(heard[15], 15, "and the sixteenth");
+
+        // And it kept going: the mover was asked again part way through and
+        // posted the next sixteen, so the tune carries on rather than repeating
+        // or falling silent.
+        let mut more = Vec::new();
+        for _ in 0..16 {
+            mem.tick(4);
+            more.push(mem.sound().playing()[0]);
+        }
+        assert_eq!(more[0], 16, "straight on into the next sixteen");
+        assert_eq!(more[15], 31);
+    }
+
+    /// And with no timer running, nothing is drained and nothing is asked for.
+    /// A queue is not a thing that empties on its own.
+    #[test]
+    fn a_queue_with_no_timer_driving_it_stays_where_it_is() {
+        let mut mem = Memory::new();
+        for byte in 0..64u32 {
+            mem.write8(EWRAM + byte, 0x40 + byte as u8);
+        }
+        let one = dma::BASE + 12;
+        mem.write32(one, EWRAM);
+        mem.write32(one + 4, sound::FIFO_A);
+        mem.write16(one + 10, 0x8000 | 0x0200 | 0x3000 | 0x0400);
+
+        // The queue is empty, so it asks — and keeps asking until it is full,
+        // which takes two refills of sixteen. That it stops asking is what says
+        // the mark is a level and not a one-off.
+        mem.tick(1);
+        assert!(mem.sound().hungry()[0], "half full is still asking");
+        mem.tick(1);
+        assert!(!mem.sound().hungry()[0], "and now it is full and stops");
+
+        // And through all of it nothing was played, because no timer is running
+        // to play it. A queue does not empty on its own.
+        mem.tick(1000);
+        assert_eq!(mem.sound().playing()[0], 0, "no timer, so no samples");
+        assert!(!mem.sound().hungry()[0], "and it stays full");
     }
 
     /// And the interrupt reaches the processor from there, which is the only
