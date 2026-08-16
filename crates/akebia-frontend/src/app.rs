@@ -37,7 +37,7 @@ use eframe::egui::{
 
 use crate::args::Args;
 use crate::remote::{Remote, Trouble};
-use crate::{audio, debug, net, remote, roms, save};
+use crate::{audio, debug, net, recent, remote, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
 pub const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
@@ -274,6 +274,13 @@ struct App {
     /// the commonest thing to want, and retyping an address is a poor way to
     /// spend the moment before a trade.
     last_address: String,
+    /// The games opened lately, as the menu offers them.
+    ///
+    /// Held rather than read from disk each time the menu is opened: it is
+    /// drawn every frame that the mouse is over it, and a file read per frame
+    /// to show ten lines that change once a session is not a trade worth
+    /// making.
+    recent: Vec<PathBuf>,
     /// The last thing worth saying about the session that is not the picture
     /// itself, kept on the menu bar until something replaces it.
     ///
@@ -340,6 +347,7 @@ impl App {
             connecting: None,
             address: None,
             last_address: String::new(),
+            recent: recent::path().map(|list| recent::load(&list)).unwrap_or_default(),
             notice,
         }
     }
@@ -350,6 +358,10 @@ impl App {
         match crate::load_console(&path, &self.args) {
             Ok(console) => {
                 crate::remember_dir(&path);
+                // Re-read rather than pushed onto the front here: what was
+                // written is what the menu should show, including the pruning
+                // of anything that has since gone away.
+                self.recent = recent::path().map(|list| recent::load(&list)).unwrap_or_default();
                 if let Some(dir) = path.parent() {
                     self.folder = dir.to_owned();
                 }
@@ -396,11 +408,31 @@ impl App {
         let mut listen = false;
         let mut dial = false;
         let mut give_up = false;
+        // A game chosen off the recent menu, and whether the menu was emptied.
+        let mut replay: Option<PathBuf> = None;
+        let mut forget = false;
         let mut settings = self.settings.clone();
 
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    // The games lately played, above the way of finding one
+                    // that is not in the list: going back to a game is far
+                    // commoner than going looking for a new one.
+                    ui.menu_button("Recent games", |ui| {
+                        let paths = self.recent.clone();
+                        if paths.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("Nothing yet"));
+                            return;
+                        }
+                        for (path, label) in paths.iter().zip(recent::labels(&paths)) {
+                            if ui.button(label).clicked() {
+                                replay = Some(path.clone());
+                            }
+                        }
+                        ui.separator();
+                        forget = ui.button("Clear the list").clicked();
+                    });
                     open_dialog = ui.button("ROM folder…").clicked();
                     ui.separator();
                     back_to_list =
@@ -486,6 +518,19 @@ impl App {
         }
         if open_dialog {
             self.open_dialog();
+        }
+        if let Some(path) = replay {
+            // Straight into the game, whatever is on screen now. A game chosen
+            // from the menu is a game asked for, and dropping back to the list
+            // first would make the menu a slower way of doing what the list
+            // already does.
+            self.play(ctx, path);
+        }
+        if forget {
+            if let Some(list) = recent::path() {
+                recent::clear(&list);
+            }
+            self.recent.clear();
         }
         if back_to_list {
             self.back_to_list(ctx, None);
@@ -1082,6 +1127,11 @@ struct List {
     dir: PathBuf,
     entries: Vec<roms::Entry>,
     filter: String,
+    /// Which machines' games to show. All three at once is the resting state
+    /// and the one a collection is normally looked at through — the toggles are
+    /// for the moment somebody wants only one of them, not a setting to be
+    /// configured before the list is usable.
+    showing: [bool; roms::Kind::ALL.len()],
     /// Index **within what is visible**, not within `entries`.
     selection: usize,
     /// Ask for the chosen row to be brought into the visible part of the scroll.
@@ -1092,21 +1142,48 @@ struct List {
 impl List {
     fn new(dir: PathBuf) -> Self {
         let entries = roms::scan(&dir);
-        Self { dir, entries, filter: String::new(), selection: 0, follow: false, warning: None }
+        Self {
+            dir,
+            entries,
+            filter: String::new(),
+            showing: [true; roms::Kind::ALL.len()],
+            selection: 0,
+            follow: false,
+            warning: None,
+        }
     }
 
-    /// Indices of `entries` that pass the typed filter.
+    /// Indices of `entries` that pass the typed filter and the machine
+    /// toggles.
     fn visible(&self) -> Vec<usize> {
-        if self.filter.trim().is_empty() {
-            return (0..self.entries.len()).collect();
-        }
-        let wanted = self.filter.to_lowercase();
+        let wanted = self.filter.trim().to_lowercase();
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.name.to_lowercase().contains(&wanted))
+            .filter(|(_, e)| self.shows(e.kind))
+            .filter(|(_, e)| wanted.is_empty() || e.name.to_lowercase().contains(&wanted))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn shows(&self, kind: roms::Kind) -> bool {
+        roms::Kind::ALL.iter().position(|k| *k == kind).is_some_and(|at| self.showing[at])
+    }
+
+    /// How many games of each machine the folder holds.
+    ///
+    /// Counted over everything and not over what is visible, so the number on a
+    /// switched-off button says how many would come back — a zero there is the
+    /// answer to "where are my Advance games", and a count that fell to zero
+    /// because the button is off would not be.
+    fn totals(&self) -> [usize; roms::Kind::ALL.len()] {
+        let mut totals = [0; roms::Kind::ALL.len()];
+        for entry in &self.entries {
+            if let Some(at) = roms::Kind::ALL.iter().position(|k| *k == entry.kind) {
+                totals[at] += 1;
+            }
+        }
+        totals
     }
 
     /// Draws the whole screen. Returns what it is asking for, if anything.
@@ -1157,9 +1234,42 @@ impl List {
                     .hint_text("Search")
                     .desired_width(f32::INFINITY),
             );
+            ui.add_space(8.0);
+            self.machines(ui);
             ui.add_space(10.0);
         });
         change_folder
+    }
+
+    /// The three machine toggles, each with how many games of its kind the
+    /// folder holds.
+    ///
+    /// The counts are half the point. A column of names sorted alphabetically
+    /// says nothing about what is in the folder, and "GBA 6" beside the button
+    /// answers the question somebody is usually asking when they reach for a
+    /// filter at all.
+    ///
+    /// A machine the folder has none of is shown greyed rather than hidden: a
+    /// row of buttons that changes shape from folder to folder is a row nobody
+    /// can learn, and "GBA 0" is a useful thing to be told.
+    fn machines(&mut self, ui: &mut egui::Ui) {
+        let totals = self.totals();
+        ui.horizontal(|ui| {
+            for (at, kind) in roms::Kind::ALL.into_iter().enumerate() {
+                let label = format!("{}  {}", kind.label(), totals[at]);
+                let toggle = ui.add_enabled_ui(totals[at] > 0, |ui| {
+                    ui.toggle_value(&mut self.showing[at], label)
+                });
+                toggle.inner.on_hover_text(kind.machine());
+            }
+            // Turning the last one off would leave an empty list explained by
+            // nothing on screen, so the last one on cannot be turned off. It is
+            // not a rule to be learnt: with one showing, that button simply
+            // does not respond, and every other one does.
+            if self.showing.iter().filter(|on| **on).count() == 0 {
+                self.showing = [true; roms::Kind::ALL.len()];
+            }
+        });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, how_many: usize) {
@@ -1234,8 +1344,16 @@ impl List {
                 // command line to add a flag to, and this screen is precisely
                 // the one they are looking at when the guess went wrong.
                 change_folder = accept(ui, "Choose the folder with the games").clicked();
-            } else {
+            } else if self.showing.iter().all(|on| *on) {
                 ui.label(RichText::new("No game matches the search").color(Color32::GRAY));
+            } else {
+                // Saying which one is off matters: the search box is visible
+                // and its contents obvious, and a button pressed some minutes
+                // ago is neither.
+                ui.label(
+                    RichText::new("No game matches the search on the machines shown")
+                        .color(Color32::GRAY),
+                );
             }
         });
         change_folder
@@ -2379,13 +2497,64 @@ mod tests {
                     name: (*n).to_owned(),
                     mapper: "MBC1".to_owned(),
                     cgb: CgbSupport::None,
+                    kind: roms::Kind::GameBoy,
                 })
                 .collect(),
             filter: String::new(),
+            showing: [true; roms::Kind::ALL.len()],
             selection: 0,
             follow: false,
             warning: None,
         }
+    }
+
+    /// A list holding one game of each machine, for the toggles.
+    fn mixed() -> List {
+        let mut list = list(&["alfa", "beta", "gamma", "delta"]);
+        list.entries[1].kind = roms::Kind::Color;
+        list.entries[2].kind = roms::Kind::Advance;
+        list.entries[3].kind = roms::Kind::Advance;
+        list
+    }
+
+    #[test]
+    fn the_folder_is_counted_by_machine() {
+        assert_eq!(mixed().totals(), [1, 1, 2]);
+    }
+
+    /// The whole point of the toggles: one machine's games, out of a folder
+    /// that holds everybody's.
+    #[test]
+    fn switching_a_machine_off_takes_its_games_out_of_the_list() {
+        let mut list = mixed();
+        assert_eq!(list.visible().len(), 4, "everything, to begin with");
+
+        list.showing = [false, false, true];
+        let names: Vec<&str> =
+            list.visible().iter().map(|&i| list.entries[i].name.as_str()).collect();
+        assert_eq!(names, ["gamma", "delta"], "the two Advance games and nothing else");
+    }
+
+    /// And the counts do not move when a button is switched off. A zero beside
+    /// "GBA" has to mean the folder has none, or it answers a different
+    /// question from the one being asked.
+    #[test]
+    fn the_counts_are_of_the_folder_and_not_of_what_is_shown() {
+        let mut list = mixed();
+        list.showing = [true, false, false];
+        assert_eq!(list.totals(), [1, 1, 2]);
+    }
+
+    /// The two filters are one filter. Typing a name while a machine is off
+    /// must not bring that machine's games back.
+    #[test]
+    fn the_search_and_the_machines_narrow_together() {
+        let mut list = mixed();
+        list.showing = [true, false, false];
+        list.filter = "a".to_owned();
+        let names: Vec<&str> =
+            list.visible().iter().map(|&i| list.entries[i].name.as_str()).collect();
+        assert_eq!(names, ["alfa"], "gamma and delta match the search and are not shown");
     }
 
     #[test]

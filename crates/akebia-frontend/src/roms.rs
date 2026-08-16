@@ -12,6 +12,52 @@ use akebia_core::cartridge::{CgbSupport, Header};
 /// person keeps their games in one folder and does not sort them by console.
 const EXTENSIONS: [&str; 3] = ["gb", "gbc", "gba"];
 
+/// Which machine a ROM is for.
+///
+/// # Why the header and not the extension
+///
+/// Because a collection does not agree with itself. Half the colour games in
+/// one are named `.gbc` and half `.gb`, depending on who dumped them, and a
+/// list that sorted by extension would put the same game in two different
+/// places on two different people's disks. The cartridge says what it is in its
+/// own header, and that is the same everywhere.
+///
+/// The Advance is the exception, and it has to be: its header has none of these
+/// fields, and reading the older machine's colour flag out of an Advance
+/// cartridge reads a byte that means something else entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    GameBoy,
+    Color,
+    Advance,
+}
+
+impl Kind {
+    /// The three, in the order a person thinks of them: oldest first.
+    pub const ALL: [Self; 3] = [Self::GameBoy, Self::Color, Self::Advance];
+
+    /// What the filter button says. Short, because there are three of them in a
+    /// row above a list that needs the room more than they do.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GameBoy => "GB",
+            Self::Color => "GBC",
+            Self::Advance => "GBA",
+        }
+    }
+
+    /// The machine spelled out, for the button's hover text. Three letters are
+    /// enough for somebody who already knows and no help at all to anybody
+    /// else.
+    pub const fn machine(self) -> &'static str {
+        match self {
+            Self::GameBoy => "Game Boy",
+            Self::Color => "Game Boy Color",
+            Self::Advance => "Game Boy Advance",
+        }
+    }
+}
+
 /// A ROM found in the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -24,6 +70,8 @@ pub struct Entry {
     /// Mapper family, as the core names it, or `?` if it could not be read.
     pub mapper: String,
     pub cgb: CgbSupport,
+    /// Which machine it runs on, for the filter above the list.
+    pub kind: Kind,
 }
 
 /// Whether the file is one the list would offer.
@@ -49,8 +97,8 @@ pub fn scan(dir: &Path) -> Vec<Entry> {
         .map(|path| {
             let name =
                 path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-            let (mapper, cgb) = describe(&path);
-            Entry { path, name, mapper, cgb }
+            let (mapper, cgb, kind) = describe(&path);
+            Entry { path, name, mapper, cgb, kind }
         })
         .collect();
 
@@ -64,7 +112,7 @@ pub fn scan(dir: &Path) -> Vec<Entry> {
 ///
 /// The first 336 bytes are read and not the whole file: the folder may hold
 /// dozens of multi-megabyte ROMs and the list has to appear instantly.
-fn describe(path: &Path) -> (String, CgbSupport) {
+fn describe(path: &Path) -> (String, CgbSupport, Kind) {
     use std::io::Read;
 
     // An Advance cartridge has a header of its own with none of this in it: no
@@ -72,13 +120,16 @@ fn describe(path: &Path) -> (String, CgbSupport) {
     // better than reading the older machine's fields out of bytes that mean
     // something else entirely.
     if crate::console::is_advance(path) {
-        return ("Advance".to_owned(), CgbSupport::None);
+        return ("Advance".to_owned(), CgbSupport::None, Kind::Advance);
     }
 
     // A ROM too short to have a header is not going to boot, but it is listed
     // all the same and flagged: the user sees the file in their file manager,
     // and hiding it silently would only make them think the list is broken.
-    let unknown = || ("?".to_owned(), CgbSupport::None);
+    // Unreadable, the extension is all there is left to go on.
+    let named_colour = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gbc"));
+    let guessed = if named_colour { Kind::Color } else { Kind::GameBoy };
+    let unknown = || ("?".to_owned(), CgbSupport::None, guessed);
 
     let mut header = [0u8; akebia_core::cartridge::header::HEADER_END];
     let read = std::fs::File::open(path)
@@ -88,7 +139,14 @@ fn describe(path: &Path) -> (String, CgbSupport) {
         return unknown();
     }
     match Header::parse(&header) {
-        Ok(header) => (header.cartridge_type.kind.name().to_owned(), header.cgb),
+        Ok(header) => {
+            // A cartridge that uses colour at all is a colour cartridge, even
+            // the ones that still boot on the older machine: that is what the
+            // person looking for it will call it.
+            let kind =
+                if header.cgb == CgbSupport::None { Kind::GameBoy } else { Kind::Color };
+            (header.cartridge_type.kind.name().to_owned(), header.cgb, kind)
+        }
         Err(_) => unknown(),
     }
 }
