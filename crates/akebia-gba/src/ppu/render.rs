@@ -138,6 +138,25 @@ impl Ppu {
         let backdrop = self.colour(0);
         self.frame[at..at + SCREEN_WIDTH].fill(backdrop);
 
+        // Everything on the screen, back to front, one priority at a time.
+        //
+        // Nothing here has to be asked twice: each layer is drawn over what is
+        // already there and skips its own transparent pixels, so the nearest
+        // thing with something to say at a pixel is simply the last to write
+        // it. Priority 3 is furthest back. Sprites of a priority go over the
+        // backgrounds sharing it — a sprite and a background claiming the same
+        // priority is not a tie for the sprite to lose.
+        for priority in (0..4).rev() {
+            self.draw_backgrounds_at(line, priority);
+            self.draw_sprites_at(line, priority);
+        }
+    }
+
+    /// Every background of one priority, whatever kind the mode makes them.
+    ///
+    /// Backgrounds sharing a priority are ordered by number with 0 nearest, so
+    /// counting downwards puts each where it belongs.
+    fn draw_backgrounds_at(&mut self, line: usize, priority: u16) {
         // All three bitmap modes are drawn as background 2, and a game can turn
         // that off — in which case the backdrop is the whole picture. This is
         // the bitmap modes' own condition and not a general one: the tiled
@@ -145,48 +164,34 @@ impl Ppu {
         // background 2's for them would blank a screen drawn on any of the
         // other three.
         let bitmap_on = self.dispcnt & BG2_ENABLED != 0;
+        // Being background 2 is not only about the enable bit: the picture
+        // takes background 2's priority as well, which is what lets a game put
+        // a sprite behind a bitmap.
+        let bitmap_here = bitmap_on && self.priority_of(2) == priority;
 
         match self.mode() {
             // The tiled modes, where a screenful of graphics is a small set of
             // blocks and a map saying where each goes.
-            0..=2 => self.draw_tiled_line(line),
-            3 if bitmap_on => self.draw_direct_line(line, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
-            4 if bitmap_on => self.draw_indexed_line(line),
-            5 if bitmap_on => {
+            0..=2 => {
+                for index in (0..4).rev() {
+                    if !self.background_is_on(index) || self.priority_of(index) != priority {
+                        continue;
+                    }
+                    if self.is_transformed(index) {
+                        self.draw_affine_background(index, line);
+                    } else {
+                        self.draw_text_background(index, line);
+                    }
+                }
+            }
+            3 if bitmap_here => self.draw_direct_line(line, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
+            4 if bitmap_here => self.draw_indexed_line(line),
+            5 if bitmap_here => {
                 self.draw_direct_line(line, self.picture_base(), SMALL_WIDTH, SMALL_HEIGHT)
             }
             // Six and seven are not modes: the hardware draws nothing for them
             // either.
             _ => {}
-        }
-    }
-
-    /// A line of the tiled modes: every background that is switched on, drawn
-    /// back to front.
-    ///
-    /// # Why back to front
-    ///
-    /// Because that way nothing has to be asked twice. Each background is drawn
-    /// over what is already there and skips its own transparent pixels, so the
-    /// nearest one that has something to say at a given pixel is the last to
-    /// write it — which is precisely the rule the hardware follows, arrived at
-    /// without comparing anything.
-    ///
-    /// Priority 3 is furthest back. Backgrounds sharing a priority are ordered
-    /// by number, with 0 nearest, so counting both loops downwards puts every
-    /// one of them in the right place.
-    fn draw_tiled_line(&mut self, line: usize) {
-        for priority in (0..4).rev() {
-            for index in (0..4).rev() {
-                if !self.background_is_on(index) || self.priority_of(index) != priority {
-                    continue;
-                }
-                if self.is_transformed(index) {
-                    self.draw_affine_background(index, line);
-                } else {
-                    self.draw_text_background(index, line);
-                }
-            }
         }
     }
 

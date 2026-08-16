@@ -48,6 +48,7 @@
 //! this look more exact than it is.
 
 pub mod render;
+mod sprites;
 
 use crate::interrupts::{Interrupts, Source};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
