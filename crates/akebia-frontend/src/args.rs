@@ -64,10 +64,11 @@ pub struct Args {
     pub debug: bool,
     /// Path to a Game Boy Advance BIOS image.
     ///
-    /// Optional, and worth saying why. An Advance cartridge is entered directly
-    /// without one, in the state the BIOS would have left the registers, and
-    /// most games run that way — but they call BIOS routines constantly, and
-    /// the real thing answers where an empty vector does not.
+    /// Optional because [`crate::bios`] goes looking in the usual places when
+    /// nothing is named here, not because a game can do without one. It was
+    /// believed they mostly could; both cartridges this was tried against take
+    /// their first interrupt, walk through the empty BIOS and draw nothing.
+    /// Naming it is for putting a *particular* image in.
     pub bios: Option<PathBuf>,
 }
 
@@ -95,7 +96,7 @@ Options:
   --ppm <FILE>          With --dump, write the frame as a colour PPM image
   --wav <FILE>          With --dump, write the generated audio as WAV
   --save <FILE>         Path to the saved game (default: the ROM with .sav)
-  --bios <FILE>         Game Boy Advance BIOS image (optional)
+  --bios <FILE>         Game Boy Advance BIOS image (found on its own if not given)
   --no-save             Do not load or write the saved game
   --frames <N>          Stop after N frames
   --narrow              With --tui, draw at 80 columns instead of 160

@@ -20,6 +20,7 @@ pub mod console;
 pub mod app;
 pub mod args;
 pub mod audio;
+pub mod bios;
 pub mod debug;
 pub mod net;
 pub mod remote;
@@ -69,15 +70,14 @@ pub fn load_console(path: &Path, args: &Args) -> Result<console::Console, String
     let mut gba = akebia_gba::Gba::new();
     gba.load_rom(&rom);
 
-    // A real BIOS if one was given, and the cartridge entered directly if not.
-    // Games call BIOS routines constantly, so having the real one matters —
-    // but requiring a file the player has to find would mean an emulator that
-    // mostly does not run.
-    if let Some(path) = &args.bios {
-        match std::fs::read(path) {
-            Ok(image) => gba.load_bios(&image),
-            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
-        }
+    // The one that was named, or the one that can be found where they are kept.
+    // Games do not merely *call* BIOS routines: every interrupt they take goes
+    // through it, so a machine without one runs a game as far as its first
+    // interrupt and no further. Looking is what keeps that from being a black
+    // window nobody can explain — see [`bios`], and [`bios::ADVICE`] for what
+    // is said when the looking turns up nothing.
+    if let Some(image) = bios::image(args.bios.as_deref(), path)? {
+        gba.load_bios(&image);
     }
     gba.reset();
     Ok(console::Console::Gba(Box::new(gba)))

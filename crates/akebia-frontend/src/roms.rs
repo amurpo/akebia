@@ -158,7 +158,11 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).filter(|h| !h.as_os_str().is_empty())
 }
 
-fn expand(candidate: &str) -> Option<PathBuf> {
+/// A candidate folder with a leading `~` turned into the home directory.
+///
+/// Shared with [`crate::bios`], which looks for its file in the same kind of
+/// places and has no business growing a second copy of this.
+pub(crate) fn expand(candidate: &str) -> Option<PathBuf> {
     match candidate.strip_prefix("~/") {
         Some(rest) => Some(home()?.join(rest)),
         None => Some(PathBuf::from(candidate)),

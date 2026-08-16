@@ -274,13 +274,16 @@ struct App {
     /// the commonest thing to want, and retyping an address is a poor way to
     /// spend the moment before a trade.
     last_address: String,
-    /// The last thing that happened to a link, kept on the menu bar until
-    /// something else happens to one.
+    /// The last thing worth saying about the session that is not the picture
+    /// itself, kept on the menu bar until something replaces it.
     ///
-    /// A link ends for reasons that are nobody's mistake —the other player put
-    /// their telephone down— and the game carries on, so there is no list to
-    /// leave the message on and no dialog worth stopping the game with. The end
-    /// of the menu bar is where the connection already speaks from.
+    /// Two kinds of thing end up here, and they have the same shape. A link
+    /// ends for reasons that are nobody's mistake —the other player put their
+    /// telephone down— and the game carries on. An Advance started without a
+    /// BIOS runs and draws nothing, which needs saying more than most things
+    /// do. Neither is a question, so neither belongs in a dialog, and there is
+    /// no list left to leave them on: the end of the menu bar is where the
+    /// session already speaks from.
     notice: Option<String>,
 }
 
@@ -320,6 +323,7 @@ impl App {
         let textures = [screen_texture("screen"), screen_texture("screen-linked")];
 
         let folder = roms::initial_dir(args.roms_dir.as_deref(), roms::state_path().as_deref());
+        let notice = initial.as_ref().and_then(Session::warning);
         let screen = match initial {
             Some(session) => Screen::Playing(Box::new(session)),
             None => Screen::List(List::new(folder.clone())),
@@ -336,7 +340,7 @@ impl App {
             connecting: None,
             address: None,
             last_address: String::new(),
-            notice: None,
+            notice,
         }
     }
 
@@ -351,8 +355,10 @@ impl App {
                 }
                 let session = Session::new(console, path, &self.args, &self.settings);
                 ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                // Whatever a previous game or a previous cable left there is
+                // gone; what this one has to say about itself takes its place.
+                self.notice = session.warning();
                 self.screen = Screen::Playing(Box::new(session));
-                self.notice = None;
                 // The window follows the machine. Starting an Advance in a Game
                 // Boy-shaped window would letterbox a picture that has a window
                 // of its own to be shown in.
@@ -466,7 +472,7 @@ impl App {
                 // covered by a full screen, cut short by some window managers
                 // and not looked at by anybody in the middle of a game: what it
                 // came to was choosing it and seeing nothing happen.
-                if let Some(said) = self.link_status() {
+                if let Some(said) = self.status() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
                         ui.label(RichText::new(said).color(ACCENT));
@@ -510,15 +516,16 @@ impl App {
         }
     }
 
-    /// One line saying where the cable stands, or nothing when there is no
-    /// cable and nothing has happened to one.
+    /// One line about the session, or nothing when there is nothing to say.
     ///
-    /// A connection has four states worth telling apart and the interface used
-    /// to show one of them. "Connecting" and "connected but the other end has
-    /// not answered yet" look identical from a chair —the game sits there in
-    /// both— and the difference is exactly what a player needs to know before
-    /// deciding the thing is broken.
-    fn link_status(&self) -> Option<String> {
+    /// A live cable outranks whatever [`App::notice`] is holding, because it is
+    /// happening now and the notice is something that happened. A connection
+    /// has four states worth telling apart and the interface used to show one
+    /// of them: "connecting" and "connected but the other end has not answered
+    /// yet" look identical from a chair —the game sits there in both— and the
+    /// difference is exactly what a player needs to know before deciding the
+    /// thing is broken.
+    fn status(&self) -> Option<String> {
         // Waiting has to say *where*, because the other machine has to be told
         // an address and this is the end that knows it.
         if let Some(pending) = &self.connecting {
@@ -1630,6 +1637,18 @@ impl Session {
         // touched has to come up the way the menu left things.
         session.apply(settings);
         session
+    }
+
+    /// What is wrong with this session that the player should hear about
+    /// before wondering, if anything.
+    ///
+    /// Only one thing so far: an Advance with no BIOS, which draws nothing and
+    /// gives no other sign of why. It goes on the menu bar rather than into a
+    /// dialog because it is a fact about the session and not a question — the
+    /// game does start, and stopping it to be told so every time would be worse
+    /// than the black screen it explains.
+    pub fn warning(&self) -> Option<String> {
+        self.console.missing_bios().then(|| crate::bios::ADVICE.to_string())
     }
 
     /// A second console in the state this one is in, down to the frame.

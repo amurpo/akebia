@@ -134,6 +134,17 @@ impl Console {
         }
     }
 
+    /// Whether this machine is running without something it needs to run at
+    /// all.
+    ///
+    /// Only the Advance can be, and only for one reason: no BIOS. It is asked
+    /// after the machine is built rather than reported by whatever built it,
+    /// because the machine is the thing that knows — and because a session
+    /// created any other way (a copy, a test) is answered just as truthfully.
+    pub fn missing_bios(&self) -> bool {
+        matches!(self, Self::Gba(gba) if !gba.has_bios())
+    }
+
     /// Whether this machine has a link port at all.
     ///
     /// The Advance has one and nothing here drives it, so the answer is no for
@@ -222,5 +233,17 @@ mod tests {
         let gba = Console::Gba(Box::new(Gba::new()));
         assert_eq!(gba.screen_size(), (240, 160));
         assert!(!gba.links(), "and the Advance's cable is not driven");
+    }
+
+    /// A machine handed no BIOS says so, and one that was handed one stops
+    /// saying it. It is only ever asked of the Advance: the older machine's
+    /// boot ROM is not needed to run a cartridge.
+    #[test]
+    fn an_advance_says_whether_it_has_its_bios() {
+        let mut gba = Gba::new();
+        assert!(Console::Gba(Box::new(Gba::new())).missing_bios());
+
+        gba.load_bios(&[0u8; 16 * 1024]);
+        assert!(!Console::Gba(Box::new(gba)).missing_bios(), "and now it has one");
     }
 }

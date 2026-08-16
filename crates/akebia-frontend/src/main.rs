@@ -257,6 +257,12 @@ fn dump(gb: &mut GameBoy, frames: u64, args: &Args) -> Result<(), String> {
 /// there is nothing to convert on the way out — where the older machine's has
 /// to come through a sink.
 fn dump_advance(gba: &mut akebia_gba::Gba, frames: u64, args: &Args) -> Result<(), String> {
+    // The same thing the window puts on its menu bar, said where a command has
+    // to say it. A capture that comes out black is worth explaining before it
+    // is looked at and blamed on the emulator's drawing.
+    if !gba.has_bios() {
+        eprintln!("{}", akebia_frontend::bios::ADVICE);
+    }
     for _ in 0..frames {
         gba.run_frame().map_err(|stopped| stopped.to_string())?;
     }
