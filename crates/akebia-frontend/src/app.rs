@@ -1709,25 +1709,28 @@ impl Session {
 
     /// Pushes the menu's settings into the running console.
     pub fn apply(&mut self, settings: &Settings) {
-        // Every setting there is belongs to the older machine: the shades are
-        // a DMG palette and the filter stands in for its speaker. The Advance
-        // has neither, and has no sound here at all, so an Advance session
-        // takes none of this rather than being given a silent stand-in.
         let sound = settings.sound && !self.muted;
-        let filter = settings.speaker_filter;
-        let shades = settings.palette().shades;
-        let Some(gb) = self.console.gameboy_mut() else {
-            self.audio = None;
-            return;
-        };
-        gb.set_dmg_shades(shades);
-        gb.set_speaker_filter(filter);
         match (sound, self.audio.is_some()) {
             // Dropping the output stops the stream, and from then on the frame's
             // samples are discarded instead of piling up.
             (false, true) => self.audio = None,
-            (true, false) => self.audio = crate::open_audio(gb, true),
+            (true, false) => {
+                self.audio = crate::open_audio(true);
+                if let Some(output) = &self.audio {
+                    self.console.set_sample_rate(output.sample_rate());
+                }
+            }
             _ => {}
+        }
+
+        // The rest of the settings are the older machine's alone: the shades
+        // are a DMG palette and the filter stands in for its speaker. The
+        // Advance has neither, and takes none of this rather than being given a
+        // stand-in for something it has not got.
+        let (filter, shades) = (settings.speaker_filter, settings.palette().shades);
+        if let Some(gb) = self.console.gameboy_mut() {
+            gb.set_dmg_shades(shades);
+            gb.set_speaker_filter(filter);
         }
     }
 
@@ -1950,14 +1953,18 @@ impl Session {
     /// out, serial out, autosave and trace.
     fn after_frame(&mut self) {
         self.frames += 1;
-        // All of this is the older machine's: sound, the serial port, the
-        // mapper's saved game and the debug capture. The Advance has none of
-        // them here yet, and doing nothing is the honest answer.
-        let (audio, serial) = (self.audio.as_ref(), self.serial);
+        // Both machines make sound, so this comes first and out of the console
+        // rather than out of a Game Boy. It has to happen whether or not there
+        // is a sound card: uncollected samples pile up for the whole session.
+        crate::drain_audio(&mut self.console, self.audio.as_ref());
+
+        // The rest is the older machine's: the serial port, the mapper's saved
+        // game and the debug capture. The Advance has none of them here yet,
+        // and doing nothing is the honest answer.
+        let serial = self.serial;
         let Some(gb) = self.console.gameboy_mut() else {
             return;
         };
-        crate::drain_audio(gb, audio);
         crate::drain_serial(gb, serial);
         if let Some(save) = self.save.as_mut() {
             save.tick(gb);

@@ -167,15 +167,15 @@ fn apply_palette(gb: &mut GameBoy, args: &Args) {
 /// Opens the audio, or warns on stderr and carries on in silence.
 ///
 /// Having no sound card is no reason to stop someone from playing.
-pub fn open_audio(gb: &mut GameBoy, enabled: bool) -> Option<audio::AudioOutput> {
+/// The rate it asks for is the caller's to pass on, because the two machines
+/// take it through different types and this has no reason to know which one is
+/// running.
+pub fn open_audio(enabled: bool) -> Option<audio::AudioOutput> {
     if !enabled {
         return None;
     }
     match audio::AudioOutput::new() {
-        Ok(output) => {
-            gb.set_sample_rate(output.sample_rate());
-            Some(output)
-        }
+        Ok(output) => Some(output),
         Err(message) => {
             eprintln!("warning: no sound ({message})");
             None
@@ -184,14 +184,14 @@ pub fn open_audio(gb: &mut GameBoy, enabled: bool) -> Option<audio::AudioOutput>
 }
 
 /// Hands the frame's audio to the device, or discards it if there is none.
-pub fn drain_audio(gb: &mut GameBoy, output: Option<&audio::AudioOutput>) {
+pub fn drain_audio(console: &mut console::Console, output: Option<&audio::AudioOutput>) {
     match output {
         Some(output) => {
-            let samples = gb.take_audio();
+            let samples = console.take_audio();
             output.push(&samples);
         }
-        // Uncollected, the APU's buffer would grow for the whole session.
-        None => gb.discard_audio(),
+        // Uncollected, the buffer would grow for the whole session.
+        None => console.discard_audio(),
     }
 }
 

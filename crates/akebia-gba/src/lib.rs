@@ -38,9 +38,14 @@
 //! for addresses it does not know is a machine reporting every button held for
 //! ever. A cartridge sat on its title screen over it. See [`keypad`].
 //!
-//! Nothing else exists yet: no sound bar the one register the BIOS insists on
-//! reading back, no timers, and no timing worth the name — a step of the
-//! processor charges one cycle, which is a floor and not a measurement.
+//! The four counters run, and so does half the sound: the two queues a game
+//! posts its own mixed-down music into, and a mixer that plays them. What is
+//! missing there is the four channels this machine inherited from the older
+//! one, which is a voice or two per tune rather than the tune. See [`sound`].
+//!
+//! What does not exist at all is timing worth the name — a step of the
+//! processor charges one cycle, which is a floor and not a measurement — and
+//! the effects the picture unit does last: windows, mosaic and blending.
 
 pub mod bus;
 pub mod console;
@@ -55,6 +60,7 @@ pub mod timers;
 pub use console::Gba;
 pub use cpu::{Mode, Registers};
 pub use keypad::Button;
+pub use sound::StereoSample;
 
 /// Frequency of the master clock, in Hz: four times the Game Boy's.
 pub const CLOCK_HZ: u32 = 16_777_216;

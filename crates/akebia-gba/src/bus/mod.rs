@@ -55,11 +55,6 @@ pub const ROM_MAX: usize = 32 * 1024 * 1024;
 /// Battery-backed save memory, on an 8-bit bus.
 pub const SRAM_LEN: usize = 64 * 1024;
 
-/// The sound level register, which is the only part of the sound hardware
-/// that is here. See [`Memory::sound_bias`].
-const SOUND_BIAS: u32 = 0x0400_0088;
-const SOUND_BIAS_AT_RESET: u16 = 0x0200;
-
 /// The blocks video memory repeats in: 128 KiB, of which it fills 96.
 const VRAM_BLOCK: u32 = 0x2_0000;
 
@@ -93,23 +88,9 @@ pub struct Memory {
     /// The four counters, which are the only clock a game has that is not the
     /// beam.
     timers: Timers,
-    /// The two queues digital sound is played out of. There is no sound; the
-    /// queues are here because the memory movers are triggered by them.
+    /// The two queues digital sound is played out of, the mixer they come out
+    /// of, and the registers that drive both.
     sound: Sound,
-    /// The one sound register that exists, and the reason it does.
-    ///
-    /// There is no sound here at all, and this changes that not one bit: it
-    /// holds what is written and hands it back. It is here because the BIOS's
-    /// routine for changing the level does so a step at a time, reading the
-    /// register back after each step and stopping when it has reached the
-    /// target — so a register that always read zero was a target never reached,
-    /// and the BIOS span in that loop for ever. It cost one of the test suites
-    /// its entire run.
-    ///
-    /// The rest of the sound registers are still absent, and a register that
-    /// merely remembers is not an implementation of anything. This one is here
-    /// because *reading it back* is the whole of what the BIOS needs.
-    sound_bias: u16,
     cycles: u64,
     bios_loaded: bool,
 }
@@ -134,9 +115,6 @@ impl Memory {
             keypad: Keypad::new(),
             timers: Timers::new(),
             sound: Sound::new(),
-            // What the hardware holds after a reset: the level sitting at the
-            // midpoint of its range.
-            sound_bias: SOUND_BIAS_AT_RESET,
             cycles: 0,
             bios_loaded: false,
         }
@@ -185,10 +163,13 @@ impl Memory {
         &mut self.ppu
     }
 
-    /// The sound queues. Nothing plays them yet; this is how a test — and one
-    /// day a mixer — reads what has come out of them.
     pub fn sound(&self) -> &Sound {
         &self.sound
+    }
+
+    /// The sound unit, for taking the samples it has made.
+    pub fn sound_mut(&mut self) -> &mut Sound {
+        &mut self.sound
     }
 
     pub fn keypad(&self) -> &Keypad {
@@ -219,13 +200,12 @@ impl Memory {
         match addr & !1 {
             ppu::DISPCNT..=ppu::LAST => self.ppu.read8(addr),
             dma::BASE..=dma::LAST => self.dma.read8(addr),
-            SOUND_BIAS => half(self.sound_bias),
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.read8(addr),
             timers::BASE..=timers::LAST => self.timers.read8(addr),
-            sound::CONTROL | sound::FIFO_A..=sound::FIFO_B => self.sound.read8(addr),
+            sound::FIRST..=sound::LAST => self.sound.read8(addr),
             _ => 0,
         }
     }
@@ -242,8 +222,7 @@ impl Memory {
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.write8(addr, value),
             timers::BASE..=timers::LAST => self.timers.write8(addr, value),
-            sound::CONTROL | sound::FIFO_A..=sound::FIFO_B => self.sound.write8(addr, value),
-            SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
+            sound::FIRST..=sound::LAST => self.sound.write8(addr, value),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
                 self.irq.set_enabled(updated);
@@ -563,6 +542,10 @@ impl Bus for Memory {
         // come out of it.
         self.sound.at_timers(overflowed);
         self.dma.at_fifo(self.sound.hungry());
+        // And *then* the mixer, so that the sample this tick took out of a
+        // queue is the one this tick's audio is made of. The other way round,
+        // every sample would be heard one time round of the timer late.
+        self.sound.tick(cycles);
         self.run_transfers();
         // The buttons are compared against what the game asked to watch here
         // rather than where a button is pressed, because the hardware compares

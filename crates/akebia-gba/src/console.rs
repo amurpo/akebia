@@ -33,6 +33,7 @@ use crate::bus::Memory;
 use crate::cpu::{Cpu, Fault};
 use crate::keypad::Button;
 use crate::ppu::FRAME_CYCLES;
+use crate::sound::StereoSample;
 use crate::{Mode, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// Where a cartridge is mapped, and so where a machine without a BIOS starts.
@@ -169,6 +170,29 @@ impl Gba {
 
     pub const fn screen_size(&self) -> (usize, usize) {
         (SCREEN_WIDTH, SCREEN_HEIGHT)
+    }
+
+    /// The samples made since this was last called, and it empties what it
+    /// hands over.
+    ///
+    /// Whoever runs frames must call this or [`Gba::discard_audio`] after each
+    /// one. There is no third option: samples are made whether or not anybody
+    /// wants them — the mixer is driven by the same clock as the beam — and a
+    /// frontend that never collected them would grow this by fifty thousand a
+    /// second for as long as the game ran.
+    pub fn take_audio(&mut self) -> Vec<StereoSample> {
+        self.mem.sound_mut().drain()
+    }
+
+    /// Throws them away instead, for a frontend with no sound card.
+    pub fn discard_audio(&mut self) {
+        self.mem.sound_mut().discard();
+    }
+
+    /// Changes the rate the samples come out at, which is the sound card's to
+    /// decide and not the machine's.
+    pub fn set_sample_rate(&mut self, rate: u32) {
+        self.mem.sound_mut().set_sample_rate(rate);
     }
 
     /// Presses or releases a button. Whoever calls this must do so *before*

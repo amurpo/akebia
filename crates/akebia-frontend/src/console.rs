@@ -134,6 +134,43 @@ impl Console {
         }
     }
 
+    /// The samples this machine has made since the last call, in the shape the
+    /// frontend speaks.
+    ///
+    /// Both machines make audio and neither makes it in the other's type: they
+    /// are separate cores and the Advance's has no business importing the older
+    /// one's. They agree on what a stereo sample *is*, though — two numbers
+    /// between -1 and 1 — so the translation is here, in the one place that has
+    /// to know about both.
+    pub fn take_audio(&mut self) -> Vec<akebia_core::StereoSample> {
+        match self {
+            Self::Gb(gb) => gb.take_audio(),
+            Self::Gba(gba) => gba
+                .take_audio()
+                .into_iter()
+                .map(|s| akebia_core::StereoSample { left: s.left, right: s.right })
+                .collect(),
+        }
+    }
+
+    /// Throws them away instead. Whoever runs frames must do one or the other:
+    /// samples are made whether or not anybody is listening, and uncollected
+    /// they would pile up for as long as the game ran.
+    pub fn discard_audio(&mut self) {
+        match self {
+            Self::Gb(gb) => gb.discard_audio(),
+            Self::Gba(gba) => gba.discard_audio(),
+        }
+    }
+
+    /// Tells the machine what rate the sound card wants.
+    pub fn set_sample_rate(&mut self, rate: u32) {
+        match self {
+            Self::Gb(gb) => gb.set_sample_rate(rate),
+            Self::Gba(gba) => gba.set_sample_rate(rate),
+        }
+    }
+
     /// Whether this machine is running without something it needs to run at
     /// all.
     ///

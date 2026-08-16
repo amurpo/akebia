@@ -26,7 +26,7 @@ use akebia_core::GameBoy;
 
 use akebia_frontend::args::{self, Args, Command};
 use akebia_frontend::{
-    app, console, debug, describe_fault, drain_audio, drain_serial, load, load_console,
+    app, console, debug, describe_fault, drain_serial, load, load_console,
     open_audio, remember_dir, save,
 };
 
@@ -263,8 +263,23 @@ fn dump_advance(gba: &mut akebia_gba::Gba, frames: u64, args: &Args) -> Result<(
     if !gba.has_bios() {
         eprintln!("{}", akebia_frontend::bios::ADVICE);
     }
+    let mut audio = Vec::new();
     for _ in 0..frames {
         gba.run_frame().map_err(|stopped| stopped.to_string())?;
+        // Kept only when it is wanted, and dropped otherwise: the mixer runs
+        // off the same clock as the beam, so the samples are made either way.
+        match &args.wav {
+            Some(_) => audio.extend(
+                gba.take_audio()
+                    .into_iter()
+                    .map(|s| akebia_core::StereoSample { left: s.left, right: s.right }),
+            ),
+            None => gba.discard_audio(),
+        }
+    }
+
+    if let Some(path) = &args.wav {
+        write_wav(path, &audio, akebia_gba::sound::DEFAULT_SAMPLE_RATE)?;
     }
 
     let (width, height) = gba.screen_size();
@@ -388,13 +403,22 @@ fn play_terminal(
     let stdout = std::io::stdout();
     let mut video = terminal::TerminalVideo::new(stdout.lock(), args.narrow)
         .map_err(|e| format!("could not set up the terminal: {e}"))?;
-    let audio = open_audio(gb, !args.mute);
+    // The terminal mode is the older machine's alone — it draws 160×144 in
+    // characters — so it goes straight at the Game Boy rather than through a
+    // `Console`.
+    let audio = open_audio(!args.mute);
+    if let Some(output) = &audio {
+        gb.set_sample_rate(output.sample_rate());
+    }
     let mut pacer = FramePacer::new();
     let mut trace = args.debug.then(debug::LiveTrace::new);
 
     loop {
         let result = gb.run_frame(&mut video);
-        drain_audio(gb, audio.as_ref());
+        match audio.as_ref() {
+            Some(output) => output.push(&gb.take_audio()),
+            None => gb.discard_audio(),
+        }
         drain_serial(gb, args.serial);
         // It has to be drained every frame even if nothing is printed: otherwise
         // the core's capture would pile up 144 lines per frame without end.
