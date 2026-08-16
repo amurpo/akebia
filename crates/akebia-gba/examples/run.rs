@@ -56,9 +56,22 @@ use akebia_gba::CLOCK_HZ;
 /// Where a cartridge is mapped, and so where a machine with one starts.
 const ROM_BASE: u32 = 0x0800_0000;
 
-/// Long enough for a test suite to finish and short enough to give up in a
-/// second or two.
-const DEFAULT_STEPS: u64 = 50_000_000;
+/// How long a run goes for when nothing was asked for, in frames.
+///
+/// # Why this is counted in frames, and why it is this many
+///
+/// Because the two things this is pointed at want opposite budgets, and only
+/// one of them is expensive. A test suite branches to itself the moment it
+/// finishes and stops the run there — a fifth of a second, whatever the budget
+/// is. A cartridge never stops, so it runs the budget out every time, and
+/// anything under about nine hundred frames is a run that ends before the game
+/// has finished showing its publisher's logo.
+///
+/// So a budget generous enough to be useful costs the suites nothing at all and
+/// costs a cartridge fifteen seconds. That is the right way round: the default
+/// should be the one that answers a question, and the flag should be for the
+/// person in a hurry.
+const DEFAULT_FRAMES: u64 = 900;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -200,9 +213,19 @@ fn main() -> ExitCode {
     // frame is `FRAME_CYCLES` of them at the most — at the most, because any
     // honest timing later can only make an instruction cost more than one, and
     // so make a frame cost fewer steps than this.
-    let limit = limit.unwrap_or(match until_frame {
-        Some(frames) => (frames + 1).saturating_mul(u64::from(FRAME_CYCLES)),
-        None => DEFAULT_STEPS,
+    // Frames unless a step budget was named outright, and a frame count pays
+    // for itself in steps. One step charges one cycle, so a frame costs at most
+    // `FRAME_CYCLES` of them — at most, because any honest timing later can only
+    // make an instruction cost more than one, and so make a frame cost fewer
+    // steps than this.
+    let until_frame = match (limit, until_frame) {
+        (_, Some(frames)) => Some(frames),
+        // A bare `--steps` means that and nothing else.
+        (Some(_), None) => None,
+        (None, None) => Some(DEFAULT_FRAMES),
+    };
+    let limit = limit.unwrap_or_else(|| {
+        (until_frame.unwrap_or(DEFAULT_FRAMES) + 1).saturating_mul(u64::from(FRAME_CYCLES))
     });
 
     let plan = Plan { limit, until_frame, from, trace, press, press_at };
@@ -220,8 +243,11 @@ fn main() -> ExitCode {
     }
 
     match outcome {
-        Outcome::Settled { .. } => ExitCode::SUCCESS,
-        _ => ExitCode::FAILURE,
+        // Both of these are the run doing what it was asked. A cartridge that
+        // is still going after the frames it was given has not failed at
+        // anything — it is a game, and games do not stop.
+        Outcome::Settled { .. } | Outcome::Reached { .. } => ExitCode::SUCCESS,
+        Outcome::Faulted(..) | Outcome::RanOn => ExitCode::FAILURE,
     }
 }
 
@@ -435,7 +461,6 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
         Outcome::RanOn => {
             println!("the step limit ran out with the machine still running");
             println!("  {} frames is about {}", mem.ppu().frames(), machine_time(mem));
-            println!("  for a game that is an opening logo. Try --frames 900");
         }
     }
 
