@@ -276,13 +276,22 @@ fn data_processing(regs: &mut Registers, addr: u32, instruction: u32) -> Result<
     }
 
     if sets_flags {
-        if rd == 15 && op.writes_result() {
-            // Writing `R15` with the flags asked for is not a flag update at
+        if rd == 15 {
+            // Naming `R15` with the flags asked for is not a flag update at
             // all: it is how an exception returns. The saved status register
             // goes back whole, restoring the mode and the register bank along
             // with the flags, and the four condition bits this instruction
             // computed are discarded. `MOVS pc, lr` is the whole of a handler's
             // last line.
+            //
+            // It is the *destination field* that decides this, not whether the
+            // instruction has anything to put there. A comparison has no
+            // destination — its four bits are spare — and one written with
+            // fifteen in them still restores the status register, without
+            // writing a result and without disturbing the program counter. No
+            // assembler emits that and no compiler would, which is exactly why
+            // a test suite asks: it is where an emulator that reasoned about
+            // intent rather than about bits gives a different machine.
             regs.restore_cpsr();
         } else {
             regs.set_nz(out.result);
@@ -997,6 +1006,36 @@ mod tests {
         assert_eq!(cpu.regs.pc(), BASE + 0x40, "it went where the link register pointed");
         assert_eq!(cpu.regs.mode(), Mode::User, "and came out of the handler's mode");
         assert_eq!(cpu.regs.sp(), 0x0300_7F00, "with the interrupted program's stack back");
+    }
+
+    /// The same rule, asked of an instruction that has no result to write. A
+    /// comparison's destination field is spare, so nothing reads it — except
+    /// this. The processor restores the status register on the four bits alone,
+    /// leaving the counter walking on as any comparison would. No assembler
+    /// emits it, which is why the ROM that checks it spells the word out.
+    #[test]
+    fn a_comparison_that_names_the_counter_restores_the_status_register_anyway() {
+        // dw 0xE15FF000 - "CMPS pc, r0", with fifteen in the destination field.
+        let (mut cpu, mut mem) = machine(&[0xE15F_F000]);
+        cpu.regs.set_mode(Mode::User);
+        cpu.regs.set_n(true);
+        cpu.regs.set_z(true);
+        cpu.regs.set(13, 0x0300_7F00);
+        let interrupted = cpu.regs.cpsr();
+
+        cpu.regs.set_mode(Mode::Irq);
+        cpu.regs.set_spsr(interrupted);
+        cpu.regs.set(13, 0x0300_7FA0);
+        cpu.regs.set_pc(BASE);
+        // The comparison itself would clear both flags: the counter read as
+        // eight ahead is neither zero nor negative.
+        cpu.regs.set(0, 0);
+
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(cpu.regs.pc(), BASE + 4, "it wrote no result, so the counter walked on");
+        assert_eq!(cpu.regs.mode(), Mode::User, "and yet the mode came back");
+        assert_eq!(cpu.regs.sp(), 0x0300_7F00, "with the bank that goes with it");
+        assert!(cpu.regs.n() && cpu.regs.z(), "the flags are the saved ones, not the computed ones");
     }
 
     /// The shifter is reached through the operand, so this is the one test that

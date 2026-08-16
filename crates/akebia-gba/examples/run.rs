@@ -60,12 +60,15 @@ const DEFAULT_STEPS: u64 = 50_000_000;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--ppm FILE]");
+        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--from N] [--ppm FILE]");
         return ExitCode::FAILURE;
     };
 
     let mut limit = DEFAULT_STEPS;
     let mut trace = 0u64;
+    // Where to begin tracing. A fault a million steps in cannot be seen from
+    // the first forty instructions, and printing all million is not reading.
+    let mut from = 0u64;
     let mut bios = None;
     let mut ppm = None;
     let mut boot = false;
@@ -85,15 +88,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--steps" | "--trace" => {
+            "--steps" | "--trace" | "--from" => {
                 let Some(n) = args.next().and_then(|v| v.parse().ok()) else {
                     eprintln!("{flag} wants a number");
                     return ExitCode::FAILURE;
                 };
-                if flag == "--steps" {
-                    limit = n;
-                } else {
-                    trace = n;
+                match flag.as_str() {
+                    "--steps" => limit = n,
+                    "--trace" => trace = n,
+                    _ => from = n,
                 }
             }
             _ => {
@@ -163,7 +166,7 @@ fn main() -> ExitCode {
         cpu.regs.set_pc(ROM_BASE);
     }
 
-    let outcome = run(&mut cpu, &mut mem, limit, trace);
+    let outcome = run(&mut cpu, &mut mem, limit, from, trace);
     report(&cpu, &mem, &outcome);
 
     if let Some(path) = &ppm {
@@ -195,12 +198,25 @@ enum Outcome {
     RanOn,
 }
 
-fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, trace: u64) -> Outcome {
+fn run(cpu: &mut Cpu, mem: &mut Memory, limit: u64, from: u64, trace: u64) -> Outcome {
     for step in 0..limit {
         let before = cpu.regs.pc();
 
-        if step < trace {
-            println!("{:08X}  {:08X}", before, mem.peek32(before));
+        if step >= from && step < from + trace {
+            let flag = |on: bool, name: char| if on { name } else { '-' };
+            println!(
+                "{step:9}  {before:08X}  {:08X}  {}{}{}{}  {:?}{}  r0={:08X} r1={:08X} r12={:08X}",
+                mem.peek32(before),
+                flag(cpu.regs.n(), 'N'),
+                flag(cpu.regs.z(), 'Z'),
+                flag(cpu.regs.c(), 'C'),
+                flag(cpu.regs.v(), 'V'),
+                cpu.regs.mode(),
+                if cpu.regs.thumb() { " T" } else { "  " },
+                cpu.regs.get(0),
+                cpu.regs.get(1),
+                cpu.regs.get(12),
+            );
         }
 
         if let Err(fault) = cpu.step(mem) {
