@@ -9,8 +9,9 @@
 //! comes out of the queues; the four inherited channels are what a game reaches
 //! for when it wants one more voice cheaply.
 //!
-//! Only the queues are here so far. What plays them is [`Sound::mix`], and
-//! where the other four will plug in is marked.
+//! Both are here. [`Sound::mix`] is where they meet: the queues come in as
+//! they are, the four channels come in through [`Sound::psg`] with their own
+//! volume and their own share of the total, and the sum is what leaves.
 //!
 //! # How a queue gets played
 //!
@@ -46,11 +47,18 @@
 //! mixed down by the game to eight bits at some 16 kHz, band-limited by the
 //! game itself, and rolling more treble off it only muffles it.
 
+mod components;
 mod fifo;
+mod noise;
+mod square;
+mod wave;
 
 use crate::timers::COUNT as TIMERS;
 use crate::CLOCK_HZ;
 use fifo::Fifo;
+use noise::Noise;
+use square::Square;
+use wave::Wave;
 
 /// Where a game posts samples. Two addresses, four bytes each, and write-only:
 /// they are the mouth of a queue, and there is nothing there to read.
@@ -58,8 +66,7 @@ pub const FIFO_A: u32 = 0x0400_00A0;
 pub const FIFO_B: u32 = 0x0400_00A7;
 
 /// `SOUNDCNT_L`: how loud the four inherited channels are on each side, and
-/// which of them sounds on which. Kept, and so far nothing is listening to it:
-/// see [`Sound::psg`].
+/// which of them sounds on which side.
 pub const VOLUME: u32 = 0x0400_0080;
 /// `SOUNDCNT_H`: how the two queues are driven and how loud they are.
 pub const CONTROL: u32 = 0x0400_0082;
@@ -69,10 +76,6 @@ pub const ENABLE: u32 = 0x0400_0084;
 pub const BIAS: u32 = 0x0400_0088;
 
 /// The whole sound block, which nothing else shares.
-///
-/// The four inherited channels live at the bottom of it and are not read or
-/// written yet; routing the range whole means the day they are is a change to
-/// this module and to nothing else.
 pub const FIRST: u32 = 0x0400_0060;
 pub const LAST: u32 = FIFO_B;
 
@@ -111,8 +114,49 @@ const CONTROL_KEPT: u16 = !(A_RESET | B_RESET);
 
 // ---- `SOUNDCNT_X` ----------------------------------------------------------
 
-/// The master switch. Cleared, nothing sounds — the queues included.
+/// The master switch. Cleared, nothing sounds — the queues included — and the
+/// four inherited channels are put back to nothing.
 const MASTER: u16 = 1 << 7;
+
+// ---- Where the four inherited channels are reached -------------------------
+
+/// One byte apiece, and not one halfword: two different registers share a
+/// halfword all the way down this block, so they are matched whole rather than
+/// by pairs.
+const CH1_SWEEP: u32 = 0x0400_0060;
+const CH1_DUTY: u32 = 0x0400_0062;
+const CH1_ENVELOPE: u32 = 0x0400_0063;
+const CH1_FREQUENCY: u32 = 0x0400_0064;
+const CH1_CONTROL: u32 = 0x0400_0065;
+const CH2_DUTY: u32 = 0x0400_0068;
+const CH2_ENVELOPE: u32 = 0x0400_0069;
+const CH2_FREQUENCY: u32 = 0x0400_006C;
+const CH2_CONTROL: u32 = 0x0400_006D;
+const CH3_BANKING: u32 = 0x0400_0070;
+const CH3_LENGTH: u32 = 0x0400_0072;
+const CH3_VOLUME: u32 = 0x0400_0073;
+const CH3_FREQUENCY: u32 = 0x0400_0074;
+const CH3_CONTROL: u32 = 0x0400_0075;
+const CH4_LENGTH: u32 = 0x0400_0078;
+const CH4_ENVELOPE: u32 = 0x0400_0079;
+const CH4_FREQUENCY: u32 = 0x0400_007C;
+const CH4_CONTROL: u32 = 0x0400_007D;
+/// The last of the four channels' own registers. Everything from here to
+/// `VOLUME` is the queues' and the mixer's.
+const PSG_LAST: u32 = 0x0400_007F;
+/// The window on to the wave table: sixteen bytes, and which bank they are is
+/// the wave channel's business. See [`wave::Wave`].
+const WAVE_RAM: u32 = 0x0400_0090;
+const WAVE_RAM_LAST: u32 = 0x0400_009F;
+
+/// Cycles between one step of the 512 Hz sequencer and the next.
+///
+/// The older machine takes this off a bit of its divider register, so that a
+/// game writing to the divider moves its own envelopes — a thing some sound
+/// engines do on purpose. This machine has no such register and counts its own,
+/// which is one dependency fewer and one quirk fewer.
+const SEQUENCER_PERIOD: u32 = CLOCK_HZ / 512;
+const SEQUENCER_STEPS: u8 = 8;
 
 // ---- The mixer's own scale -------------------------------------------------
 
@@ -130,6 +174,11 @@ const MASTER: u16 = 1 << 7;
 /// channels at a quarter between them — are the ones the documentation implies
 /// rather than ones anybody here has heard.
 const QUEUE_AT_FULL_VOLUME: f32 = 0.5;
+
+/// And the four inherited channels together, at their loudest, before the
+/// ratio in `SOUNDCNT_H` is applied to them: a quarter of what one queue is
+/// worth, which is the proportion the documentation implies.
+const PSG_AT_FULL_VOLUME: f32 = 0.25;
 
 /// What the mixer can swing either side of nothing, in the units the bias is
 /// written in.
@@ -158,6 +207,15 @@ pub struct StereoSample {
 /// Both queues, the registers that drive them, and the mixer they come out of.
 #[derive(Clone)]
 pub struct Sound {
+    /// The four this machine inherited: two squares, a table and noise.
+    square1: Square,
+    square2: Square,
+    wave: Wave,
+    noise: Noise,
+    /// Where the 512 Hz sequencer that pulses their modulators has got to.
+    sequencer_step: u8,
+    sequencer_cycles: u32,
+
     queues: [Fifo; 2],
     /// The sample most recently taken from each queue, held until the next one
     /// is due. This *is* the signal: see the module's second section.
@@ -193,6 +251,12 @@ impl Default for Sound {
 impl Sound {
     pub fn new() -> Self {
         Self {
+            square1: Square::with_sweep(),
+            square2: Square::plain(),
+            wave: Wave::new(),
+            noise: Noise::new(),
+            sequencer_step: 0,
+            sequencer_cycles: 0,
             queues: [Fifo::default(); 2],
             playing: [0; 2],
             volume: 0,
@@ -261,6 +325,7 @@ impl Sound {
     /// is the only way an output sample can land between two of the timer's,
     /// which at 48 kHz against a game's 16 kHz is most of them.
     pub fn tick(&mut self, cycles: u32) {
+        self.run_channels(cycles);
         let (left, right) = self.mix();
         // The cycles are handed out to the samples they fall in rather than all
         // to the one that happens to be current. It costs a loop that almost
@@ -285,6 +350,50 @@ impl Sound {
                 self.emit();
             }
         }
+    }
+
+    /// Moves the four inherited channels and the sequencer that shapes them.
+    ///
+    /// Nothing runs with the master switch off, and that is not an optimisation
+    /// — a channel left running while the sound is off would come back mid-note
+    /// when it was switched on again, and a length counter would have expired
+    /// meanwhile.
+    fn run_channels(&mut self, cycles: u32) {
+        if !self.enabled {
+            return;
+        }
+        self.square1.tick(cycles);
+        self.square2.tick(cycles);
+        self.wave.tick(cycles);
+        self.noise.tick(cycles);
+
+        self.sequencer_cycles += cycles;
+        while self.sequencer_cycles >= SEQUENCER_PERIOD {
+            self.sequencer_cycles -= SEQUENCER_PERIOD;
+            self.step_sequencer();
+        }
+    }
+
+    /// One step of the sequencer. Each one pulses a different set.
+    fn step_sequencer(&mut self) {
+        // Every other step: the lengths, at 256 Hz.
+        if self.sequencer_step % 2 == 0 {
+            self.square1.tick_length();
+            self.square2.tick_length();
+            self.wave.tick_length();
+            self.noise.tick_length();
+        }
+        // Two of the eight: the sweep, at 128 Hz.
+        if self.sequencer_step == 2 || self.sequencer_step == 6 {
+            self.square1.tick_sweep();
+        }
+        // The last: the envelopes, at 64 Hz.
+        if self.sequencer_step == 7 {
+            self.square1.tick_envelope();
+            self.square2.tick_envelope();
+            self.noise.tick_envelope();
+        }
+        self.sequencer_step = (self.sequencer_step + 1) % SEQUENCER_STEPS;
     }
 
     /// What the mixer is putting out this instant, before it is sampled.
@@ -327,17 +436,41 @@ impl Sound {
 
     /// What the four inherited channels are putting out, each side.
     ///
-    /// Nothing yet. They are the older machine's squares, wave table and noise
-    /// generator, reached through `0x04000060`–`0x0400007C` and the table at
-    /// `0x04000090`; `SOUNDCNT_L` is already kept for them and read back, which
-    /// is why a game that sets it up finds what it wrote.
+    /// Each channel hands over what its DAC is doing rather than what sample it
+    /// is on, because a channel whose DAC is off is *disconnected* and sits at
+    /// the middle, while one that is on and playing a zero sits at the bottom.
+    /// The two are a click apart and the sample cannot tell them apart.
     ///
-    /// When they arrive they belong here, the four of them together worth a
-    /// quarter of full scale before the ratio in `SOUNDCNT_H` is applied to
-    /// them, and nothing above this line changes.
+    /// `SOUNDCNT_L` says which of them reaches which side and how loud each
+    /// side is, and then `SOUNDCNT_H` says how much of the total the four of
+    /// them are worth against the queues.
     fn psg(&self) -> (f32, f32) {
-        let _ = (self.volume, self.ratio());
-        (0.0, 0.0)
+        let outputs = [
+            self.square1.dac_output(),
+            self.square2.dac_output(),
+            self.wave.dac_output(),
+            self.noise.dac_output(),
+        ];
+
+        let (mut left, mut right) = (0.0, 0.0);
+        for (channel, &analog) in outputs.iter().enumerate() {
+            // The low nibble of the high byte is the right side and the high
+            // nibble the left, which is the way round the older machine had it.
+            if self.volume >> (channel + 12) & 1 != 0 {
+                left += analog;
+            }
+            if self.volume >> (channel + 8) & 1 != 0 {
+                right += analog;
+            }
+        }
+
+        // A master volume of zero **is not silence**: it is the quietest of
+        // eight settings. That is why one is added before dividing.
+        let ratio = self.ratio();
+        let scale = |summed: f32, master: u16| {
+            summed / 4.0 * (master as f32 + 1.0) / 8.0 * PSG_AT_FULL_VOLUME * ratio
+        };
+        (scale(left, self.volume >> 4 & 7), scale(right, self.volume & 7))
     }
 
     /// How much of their full loudness the four inherited channels get.
@@ -400,20 +533,53 @@ impl Sound {
         [self.queues[0].hungry(), self.queues[1].hungry()]
     }
 
+    /// `SOUNDCNT_X` as it reads: the switch, and which channels are sounding.
+    ///
+    /// The bottom four bits are read-only and are not a copy of anything a game
+    /// wrote — they are the channels' own answer. A game watching for a note to
+    /// finish watches them.
+    fn enable_bits(&self) -> u16 {
+        (u16::from(self.enabled) << 7)
+            | u16::from(self.square1.enabled)
+            | u16::from(self.square2.enabled) << 1
+            | u16::from(self.wave.enabled) << 2
+            | u16::from(self.noise.enabled) << 3
+    }
+
     pub fn read8(&self, addr: u32) -> u8 {
-        let half = |value: u16| (value >> ((addr & 1) * 8)) as u8;
-        match addr & !1 {
-            VOLUME => half(self.volume),
-            CONTROL => half(self.control),
-            // Bits 0-3 say which of the four inherited channels is still
-            // sounding. None of them is, because there are none.
-            ENABLE => half(u16::from(self.enabled) << 7),
-            BIAS => half(self.bias),
-            // The queues are write-only. There is nothing at the mouth of a
-            // queue to read, and answering with a sample would be answering
-            // with one the hardware has already played or not yet reached.
-            _ => 0,
+        match addr {
+            CH1_SWEEP => self.square1.read_sweep(),
+            CH1_DUTY => self.square1.read_duty(),
+            CH1_ENVELOPE => self.square1.read_envelope(),
+            CH1_CONTROL => self.square1.read_control(),
+            CH2_DUTY => self.square2.read_duty(),
+            CH2_ENVELOPE => self.square2.read_envelope(),
+            CH2_CONTROL => self.square2.read_control(),
+            CH3_BANKING => self.wave.read_control_low(),
+            CH3_VOLUME => self.wave.read_volume(),
+            CH3_CONTROL => self.wave.read_control(),
+            CH4_ENVELOPE => self.noise.read_envelope(),
+            CH4_FREQUENCY => self.noise.read_frequency(),
+            CH4_CONTROL => self.noise.read_control(),
+            WAVE_RAM..=WAVE_RAM_LAST => self.wave.read_ram((addr - WAVE_RAM) as usize),
+            // The frequency registers and the length loads do not read back:
+            // they are write-only on the hardware, and answering with what was
+            // written would be inventing an answer the machine does not give.
+            _ => match addr & !1 {
+                VOLUME => self.half_of(self.volume, addr),
+                CONTROL => self.half_of(self.control, addr),
+                ENABLE => self.half_of(self.enable_bits(), addr),
+                BIAS => self.half_of(self.bias, addr),
+                // The queues are write-only. There is nothing at the mouth of a
+                // queue to read, and answering with a sample would be answering
+                // with one the hardware has already played or not yet reached.
+                _ => 0,
+            },
         }
+    }
+
+    fn half_of(&self, value: u16, addr: u32) -> u8 {
+        (value >> ((addr & 1) * 8)) as u8
     }
 
     pub fn write8(&mut self, addr: u32, value: u8) {
@@ -424,6 +590,43 @@ impl Sound {
             return;
         }
 
+        // The four inherited channels take no notice of anything while the
+        // master switch is off, and neither does the register that says how
+        // loud they are. Their table is the exception: a game writes a waveform
+        // before switching the sound on, and finding it wiped afterwards would
+        // be a bass line of silence.
+        let theirs = matches!(addr, FIRST..=PSG_LAST) || addr & !1 == VOLUME;
+        if theirs && !self.enabled {
+            return;
+        }
+
+        match addr {
+            CH1_SWEEP => self.square1.write_sweep(value),
+            CH1_DUTY => self.square1.write_duty_length(value),
+            CH1_ENVELOPE => self.square1.write_envelope(value),
+            CH1_FREQUENCY => self.square1.write_frequency_low(value),
+            CH1_CONTROL => self.square1.write_control(value),
+            CH2_DUTY => self.square2.write_duty_length(value),
+            CH2_ENVELOPE => self.square2.write_envelope(value),
+            CH2_FREQUENCY => self.square2.write_frequency_low(value),
+            CH2_CONTROL => self.square2.write_control(value),
+            CH3_BANKING => self.wave.write_control_low(value),
+            CH3_LENGTH => self.wave.write_length(value),
+            CH3_VOLUME => self.wave.write_volume(value),
+            CH3_FREQUENCY => self.wave.write_frequency_low(value),
+            CH3_CONTROL => self.wave.write_control(value),
+            CH4_LENGTH => self.noise.write_length(value),
+            CH4_ENVELOPE => self.noise.write_envelope(value),
+            CH4_FREQUENCY => self.noise.write_frequency(value),
+            CH4_CONTROL => self.noise.write_control(value),
+            WAVE_RAM..=WAVE_RAM_LAST => self.wave.write_ram((addr - WAVE_RAM) as usize, value),
+            _ => self.write_wide(addr, value),
+        }
+    }
+
+    /// The registers that are halfwords written a byte at a time: the mixer's
+    /// own, which are this machine's additions rather than the older one's.
+    fn write_wide(&mut self, addr: u32, value: u8) {
         let shift = (addr & 1) * 8;
         let widened = |old: u16| (old & !(0xFFu16 << shift)) | (u16::from(value) << shift);
 
@@ -446,12 +649,35 @@ impl Sound {
                 // The low byte is where the switch is; the high byte of this
                 // register is nothing at all.
                 if shift == 0 {
-                    self.enabled = u16::from(value) & MASTER != 0;
+                    let on = u16::from(value) & MASTER != 0;
+                    if !on {
+                        self.power_off();
+                    }
+                    self.enabled = on;
                 }
             }
             BIAS => self.bias = widened(self.bias),
             _ => {}
         }
+    }
+}
+
+impl Sound {
+    /// What the master switch does on the way down.
+    ///
+    /// The four channels go back to nothing and so does the register that says
+    /// how loud they are, which is what the older machine does and what a game
+    /// setting the sound up again is written to expect. The wave table survives
+    /// — see [`wave::Wave::power_off`] — and so does everything that is this
+    /// machine's own: the queues, how they are driven, and the bias.
+    fn power_off(&mut self) {
+        self.square1.power_off();
+        self.square2.power_off();
+        self.wave.power_off();
+        self.noise.power_off();
+        self.volume = 0;
+        self.sequencer_step = 0;
+        self.sequencer_cycles = 0;
     }
 }
 
