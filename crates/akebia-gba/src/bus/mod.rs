@@ -41,6 +41,7 @@ use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
 use crate::keypad::{self, Keypad};
 use crate::ppu::{self, Ppu};
+use crate::timers::{self, Timers};
 
 pub const BIOS_LEN: usize = 16 * 1024;
 pub const EWRAM_LEN: usize = 256 * 1024;
@@ -88,6 +89,9 @@ pub struct Memory {
     /// The buttons. They live here for the same reason the picture unit does:
     /// a game reaches them at an address in this map.
     keypad: Keypad,
+    /// The four counters, which are the only clock a game has that is not the
+    /// beam.
+    timers: Timers,
     /// The one sound register that exists, and the reason it does.
     ///
     /// There is no sound here at all, and this changes that not one bit: it
@@ -123,6 +127,7 @@ impl Memory {
             ppu: Ppu::new(),
             dma: Dma::new(),
             keypad: Keypad::new(),
+            timers: Timers::new(),
             // What the hardware holds after a reset: the level sitting at the
             // midpoint of its range.
             sound_bias: SOUND_BIAS_AT_RESET,
@@ -193,6 +198,7 @@ impl Memory {
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.read8(addr),
+            timers::BASE..=timers::LAST => self.timers.read8(addr),
             _ => 0,
         }
     }
@@ -208,6 +214,7 @@ impl Memory {
             ppu::DISPCNT..=ppu::LAST => self.ppu.write8(addr, value),
             dma::BASE..=dma::LAST => self.dma.write8(addr, value),
             keypad::KEYINPUT..=keypad::LAST => self.keypad.write8(addr, value),
+            timers::BASE..=timers::LAST => self.timers.write8(addr, value),
             SOUND_BIAS => self.sound_bias = widened(self.sound_bias),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
@@ -517,6 +524,7 @@ impl Bus for Memory {
     fn tick(&mut self, cycles: u32) {
         self.cycles += u64::from(cycles);
         let crossed = self.ppu.tick(cycles, &mut self.irq);
+        self.timers.tick(cycles, &mut self.irq);
         self.dma.at_blanking(crossed);
         self.run_transfers();
         // The buttons are compared against what the game asked to watch here
@@ -735,13 +743,15 @@ mod tests {
     /// hardware does - it gives back whatever was last fetched. Pinned here so
     /// that when a pipeline exists to ask, this test is what changes.
     ///
-    /// The cartridge used to be on this list and has come off it, and so has
-    /// the picture unit's first register, which is the list working as intended.
+    /// The cartridge used to be on this list, and so did the picture unit's
+    /// first register, the buttons, and the timers. Things coming off it is the
+    /// list working as intended — it is a list of what is missing, and the only
+    /// way to keep it honest is to make it fail when something arrives.
     #[test]
     fn what_is_not_mapped_yet_reads_as_zero() {
         let mut mem = Memory::new();
-        // A timer, a sound channel, and the space above the map entirely.
-        for addr in [0x0400_0100, 0x0400_0060, 0x1000_0000, BIOS_LEN as u32] {
+        // A sound channel, a serial register, and the space above the map.
+        for addr in [0x0400_0060, 0x0400_0120, 0x1000_0000, BIOS_LEN as u32] {
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X}");
             mem.write32(addr, 0xFFFF_FFFF);
             assert_eq!(mem.read32(addr), 0, "0x{addr:08X} after a write");
@@ -771,6 +781,25 @@ mod tests {
         // about the one address and not about the pair.
         mem.write16(keypad::KEYCNT, 0x4001);
         assert_eq!(mem.read16(keypad::KEYCNT), 0x4001);
+    }
+
+    /// A timer counts the same clock the beam does, and interrupts through the
+    /// same controller. Wiring it to a clock of its own would be two machines.
+    #[test]
+    fn a_timer_counts_the_clock_and_interrupts_through_it() {
+        let mut mem = Memory::new();
+        // Four cycles short of coming round, asking for the interrupt.
+        mem.write16(timers::BASE, 0xFFFC);
+        mem.write16(timers::BASE + 2, 0x00C0);
+        assert_eq!(mem.read16(timers::BASE), 0xFFFC, "switched on, so loaded");
+
+        mem.tick(3);
+        assert_eq!(mem.read16(timers::BASE), 0xFFFF);
+        assert_eq!(mem.interrupts().requested(), 0, "one short");
+
+        mem.tick(1);
+        assert_eq!(mem.read16(timers::BASE), 0xFFFC, "back to the reload");
+        assert_ne!(mem.interrupts().requested(), 0, "and it said so");
     }
 
     /// And the interrupt reaches the processor from there, which is the only

@@ -48,6 +48,7 @@ pub mod dma;
 pub mod interrupts;
 pub mod keypad;
 pub mod ppu;
+pub mod timers;
 
 pub use cpu::{Mode, Registers};
 
