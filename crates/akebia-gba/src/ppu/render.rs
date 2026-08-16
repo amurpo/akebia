@@ -33,13 +33,19 @@
 //!
 //! # What is here
 //!
-//! The three bitmap modes, and the scrolling backgrounds of the tiled ones —
-//! all four of mode 0's and the two of mode 1's, drawn in priority order with
-//! the further ones showing through wherever the nearer have nothing.
+//! The three bitmap modes, and both kinds of tiled background: the ones that
+//! scroll and the two that can be rotated and scaled. Every background a mode
+//! has is drawn in priority order, with the further ones showing through
+//! wherever the nearer have nothing.
 //!
-//! Not here: the backgrounds that rotate and scale, which are the other half of
-//! modes 1 and 2; sprites, which sit on top of everything; and the windows,
-//! mosaic and blending that the rest of the register block is for.
+//! The two kinds are the same idea read differently. A scrolling background
+//! walks the screen and offsets it; a turning one walks the *map* along a
+//! slanted line and reads whatever it lands on. That is the whole difference,
+//! and it is why the second kind pays for itself with a map of single bytes:
+//! there is no room left for mirroring or a choice of palette.
+//!
+//! Not here: sprites, which sit on top of everything; and the windows, mosaic
+//! and blending that the rest of the register block is for.
 //!
 //! An unwritten mode draws the backdrop rather than nothing, which is what the
 //! hardware does and is also honest: a screen in the backdrop colour says the
@@ -75,6 +81,9 @@ const TILE_BASE: u16 = 0x000C;
 /// Sixteen colours per tile, or 256 for the whole background.
 const FULL_COLOUR: u16 = 1 << 7;
 const MAP_BASE: u16 = 0x1F00;
+/// Only meaningful on a background that can be turned: whether going off the
+/// edge of the map brings the other edge round or shows nothing.
+const OVERFLOW_WRAPS: u16 = 1 << 13;
 const SIZE: u16 = 0xC000;
 
 /// A map entry: a tile, which way round it goes, and which palette it uses.
@@ -169,7 +178,12 @@ impl Ppu {
     fn draw_tiled_line(&mut self, line: usize) {
         for priority in (0..4).rev() {
             for index in (0..4).rev() {
-                if self.background_is_on(index) && self.priority_of(index) == priority {
+                if !self.background_is_on(index) || self.priority_of(index) != priority {
+                    continue;
+                }
+                if self.is_transformed(index) {
+                    self.draw_affine_background(index, line);
+                } else {
                     self.draw_text_background(index, line);
                 }
             }
@@ -185,12 +199,27 @@ impl Ppu {
         if self.dispcnt & (BG0_ENABLED << index) == 0 {
             return false;
         }
-        // Only the ones drawn from a map of tiles and a scroll position are
-        // here. Modes 1 and 2 have backgrounds that are rotated and scaled
-        // instead, and those are not drawn yet.
         match self.mode() {
+            // Four that scroll.
             0 => true,
-            1 => index < 2,
+            // Two that scroll and one that can be turned.
+            1 => index < 3,
+            // Two that can be turned, and nothing else.
+            2 => index >= 2,
+            _ => false,
+        }
+    }
+
+    /// Whether a background is one of the two that can be rotated, in a mode
+    /// where it is being used that way.
+    ///
+    /// Background 2 is the one that changes character between modes: it scrolls
+    /// in mode 0 and turns in modes 1 and 2. Which it is doing is not a
+    /// property of the background but of the pair.
+    fn is_transformed(&self, index: usize) -> bool {
+        match self.mode() {
+            1 => index == 2,
+            2 => index >= 2,
             _ => false,
         }
     }
@@ -244,6 +273,64 @@ impl Ppu {
             // shows through. It is what lets four backgrounds share a screen.
             if colour != 0 {
                 self.frame[at + x] = self.colour(colour);
+            }
+        }
+    }
+
+    /// One line of a background that has been rotated or scaled.
+    ///
+    /// # Walking the source instead of the destination
+    ///
+    /// The screen is swept in a straight line and the map is not, so this walks
+    /// the *map* along a slanted line and reads whatever it lands on. Going the
+    /// other way — working out where each map pixel belongs on screen — would
+    /// leave gaps wherever the picture is stretched, because two screen pixels
+    /// would want the same source and one would be skipped.
+    ///
+    /// The step is two of the four multipliers, added at every pixel. They are
+    /// eight-bit fractions, so the sum is shifted down by eight to become a
+    /// coordinate, and the fraction that is thrown away is what makes the
+    /// picture stretch or shrink.
+    ///
+    /// A transformed map is simpler than a scrolling one in every other way:
+    /// one byte an entry, no mirroring, no choice of palette, and always 256
+    /// colours. There is no room in a byte for anything else.
+    fn draw_affine_background(&mut self, index: usize, line: usize) {
+        let control = self.backgrounds[index].control;
+        let affine = self.affine[index - 2];
+        // 128, 256, 512 or 1024 pixels square.
+        let size = 128 << ((control & SIZE) >> 14);
+        let squares = size / 8;
+        let map_base = usize::from((control & MAP_BASE) >> 8) * MAP_BLOCK;
+        let tile_base = usize::from((control & TILE_BASE) >> 2) * TILE_BLOCK;
+        let wraps = control & OVERFLOW_WRAPS != 0;
+
+        let mut x = affine.at_x;
+        let mut y = affine.at_y;
+        let at = line * SCREEN_WIDTH;
+
+        for screen_x in 0..SCREEN_WIDTH {
+            let (px, py) = (x >> 8, y >> 8);
+            x = x.wrapping_add(i32::from(affine.pa));
+            y = y.wrapping_add(i32::from(affine.pc));
+
+            // Off the edge of the map is either nothing or the other edge, and
+            // a game says which. Wrapping is how a floor is made to stretch to
+            // the horizon; not wrapping is how a single turning object is drawn
+            // without it repeating around itself.
+            let (px, py) = if wraps {
+                (px & (size - 1), py & (size - 1))
+            } else if px < 0 || py < 0 || px >= size || py >= size {
+                continue;
+            } else {
+                (px, py)
+            };
+            let (px, py) = (px as usize, py as usize);
+
+            let tile = usize::from(self.background_byte(map_base + (py / 8) * squares as usize + px / 8));
+            let colour = self.background_byte(tile_base + tile * 64 + (py % 8) * 8 + px % 8);
+            if colour != 0 {
+                self.frame[at + screen_x] = self.colour(colour);
             }
         }
     }
@@ -798,6 +885,329 @@ mod tests {
         ppu.write8(DISPCNT, 2);
         sweep_a_frame(&mut ppu);
         assert_eq!(pixel(&ppu, 0, 0), BLUE, "and mode 2 does not");
+    }
+
+    // --- The backgrounds that can be turned ------------------------------
+
+    /// One whole step along an axis, as the eight-bit fraction the hardware
+    /// takes. A transformation of `ONE, 0, 0, ONE` is no transformation at all.
+    const ONE: i16 = 0x100;
+
+    /// The four multipliers of one of the two backgrounds that can be turned.
+    fn transform(ppu: &mut Ppu, index: usize, pa: i16, pb: i16, pc: i16, pd: i16) {
+        let at = crate::ppu::BG_AFFINE + (index as u32 - 2) * 16;
+        for (offset, value) in [pa, pb, pc, pd].into_iter().enumerate() {
+            ppu.write8(at + offset as u32 * 2, value as u8);
+            ppu.write8(at + offset as u32 * 2 + 1, (value >> 8) as u8);
+        }
+    }
+
+    /// Where the top-left pixel of the screen is taken from, as a 24.8
+    /// fraction: `8 << 8` is eight whole pixels along.
+    fn origin(ppu: &mut Ppu, index: usize, x: i32, y: i32) {
+        let at = crate::ppu::BG_AFFINE + (index as u32 - 2) * 16 + 8;
+        for byte in 0..4 {
+            ppu.write8(at + byte, (x >> (byte * 8)) as u8);
+            ppu.write8(at + 4 + byte, (y >> (byte * 8)) as u8);
+        }
+    }
+
+    /// A tile of a transformed background: always a byte a pixel, so 64 bytes
+    /// and no four-bit packing. Never tile 0, for the reason [`fill_tile`]
+    /// gives.
+    fn fill_turning_tile(ppu: &mut Ppu, base: usize, tile: usize, index: u8) {
+        assert_ne!(tile, 0, "tile 0 is what an unwritten map entry names");
+        for byte in 0..64 {
+            ppu.vram_mut()[base + tile * 64 + byte] = index;
+        }
+    }
+
+    /// One square of a transformed map, which is a byte and nothing else: no
+    /// mirroring, no palette, and no second block to fall into.
+    fn set_turning_map(ppu: &mut Ppu, base: usize, column: usize, row: usize, squares: usize, tile: u8) {
+        ppu.vram_mut()[base + row * squares + column] = tile;
+    }
+
+    /// A background of the smallest size, 128 pixels square, with its tiles in
+    /// the second 16 KiB block and its map in the second 2 KiB one.
+    fn turning_background(ppu: &mut Ppu, index: usize, extra: u16) {
+        background(ppu, index, (1 << 2) | (1 << 8) | extra);
+    }
+
+    /// The identity: the same map a scrolling background would draw, in the
+    /// same place. Everything else here is a departure from this one, so if it
+    /// is wrong nothing below it means anything.
+    #[test]
+    fn a_background_that_can_turn_and_is_not_turned_draws_where_the_map_says() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 2, 1, 16, 1);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 16, 8), RED, "the square the map filled");
+        assert_eq!(pixel(&ppu, 23, 15), RED, "and all eight pixels of it");
+        assert_eq!(pixel(&ppu, 24, 8), BLUE, "the square beside it is empty");
+        assert_eq!(pixel(&ppu, 16, 0), BLUE, "and the one above it");
+    }
+
+    /// A whole byte of the map is the tile number. A scrolling map spends its
+    /// top bits on mirroring and a palette; there is no room for either here,
+    /// and reading them as flags would put a different tile on the screen.
+    #[test]
+    fn a_turned_map_spends_its_whole_byte_on_the_tile_number() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 200, GREEN);
+
+        turning_background(&mut ppu, 2, 0);
+        // Past 127, so the top bit is set and a mirroring flag would eat it.
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 0xC5, 200);
+        set_turning_map(&mut ppu, MAP_BLOCK, 0, 0, 16, 0xC5);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 0, 0), GREEN, "tile 0xC5 and not tile 0x45");
+    }
+
+    /// Half a step across per pixel is twice the size on screen. This is the
+    /// whole of scaling, and it is also what says the two axes are independent:
+    /// only the across one was touched.
+    #[test]
+    fn a_step_of_less_than_a_pixel_stretches_the_picture() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 0, 0, 16, 1);
+        transform(&mut ppu, 2, ONE / 2, 0, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 15, 0), RED, "eight pixels of map cover sixteen");
+        assert_eq!(pixel(&ppu, 16, 0), BLUE, "and stop there");
+        assert_eq!(pixel(&ppu, 0, 8), BLUE, "the down axis was left alone");
+    }
+
+    /// The starting point says which part of the map the corner of the screen
+    /// comes from, which is this kind of background's scroll position.
+    #[test]
+    fn the_starting_point_chooses_the_corner_of_the_map() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 2, 0, 16, 1);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+        origin(&mut ppu, 2, 16 << 8, 0);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the third square is now in the corner");
+        assert_eq!(pixel(&ppu, 8, 0), BLUE, "and the fourth beside it");
+    }
+
+    /// The turn itself. The two multipliers that are zero in every test above
+    /// are what move a line sideways as the beam goes down, and a background
+    /// with one of them set is one that is no longer square to the screen.
+    #[test]
+    fn the_two_cross_multipliers_slant_the_picture_down_the_screen() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 2, 0, 16, 1);
+        // One pixel across the map for every line down the screen.
+        transform(&mut ppu, 2, ONE, ONE, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 16, 0), RED, "the first line is square");
+        assert_eq!(pixel(&ppu, 12, 0), BLUE, "with nothing to the left of it");
+        assert_eq!(pixel(&ppu, 12, 4), RED, "four lines down it has moved four across");
+    }
+
+    /// Off the edge of the map is the other edge, if the game asked for that.
+    /// It is how a floor is made to reach the horizon out of a map far smaller
+    /// than the distance.
+    #[test]
+    fn a_map_that_wraps_shows_its_other_edge_past_the_end() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, OVERFLOW_WRAPS);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 0, 0, 16, 1);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the square itself");
+        // The map is 128 pixels wide and the screen is 240.
+        assert_eq!(pixel(&ppu, 128, 0), RED, "and again where it came round");
+        assert_eq!(pixel(&ppu, 136, 0), BLUE, "the empty square beside it, likewise");
+    }
+
+    /// And without that bit, off the edge is nothing at all — including off the
+    /// *near* edge, which is where a coordinate treated as unsigned would draw
+    /// the far one.
+    #[test]
+    fn a_map_that_does_not_wrap_shows_nothing_past_either_end() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 0, 0, 16, 1);
+        // Every square of the last column, so that a wrap would be visible.
+        for row in 0..16 {
+            set_turning_map(&mut ppu, MAP_BLOCK, 15, row, 16, 1);
+        }
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+        // Eight pixels short of the map, so the screen starts before it begins.
+        origin(&mut ppu, 2, -8 << 8, 0);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 0, 0), BLUE, "before the map starts is nothing");
+        assert_eq!(pixel(&ppu, 8, 0), RED, "and the map itself begins here");
+        assert_eq!(pixel(&ppu, 136, 0), BLUE, "past the far edge is nothing too");
+    }
+
+    /// The starting point is 28 bits and not 32: the top four are not part of
+    /// it, and the sign lives in bit 27. A compiler writing a negative number
+    /// sets all of the top five and the distinction never shows — but the
+    /// hardware keeps only the 28, and a game that writes what the hardware
+    /// keeps must land in the same place. Read as a plain word it would be a
+    /// million pixels away instead of eight.
+    #[test]
+    fn the_starting_point_takes_its_sign_from_its_own_top_bit() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 0, 0, 16, 1);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+        // Eight pixels back, in 28 bits: the same number as `-8 << 8` with the
+        // four bits the hardware has no room for cut off.
+        origin(&mut ppu, 2, (-8 << 8) & 0x0FFF_FFFF, 0);
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 0, 0), BLUE, "the screen starts before the map does");
+        assert_eq!(pixel(&ppu, 8, 0), RED, "and the map begins eight pixels in");
+    }
+
+    /// The running starting point is advanced down the whole frame and put back
+    /// at the bottom. Without the reload the second frame would begin where the
+    /// first left off, and a slanted background would walk off the screen.
+    #[test]
+    fn the_starting_point_goes_back_to_the_top_every_frame() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        set_turning_map(&mut ppu, MAP_BLOCK, 2, 0, 16, 1);
+        transform(&mut ppu, 2, ONE, ONE, 0, ONE);
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 16, 0), RED, "the first frame");
+
+        sweep_a_frame(&mut ppu);
+        assert_eq!(pixel(&ppu, 16, 0), RED, "and the second, in the same place");
+    }
+
+    /// Writing the starting point part way down the screen moves what is left
+    /// of the frame and leaves what is drawn alone. One background, a different
+    /// transformation on every line: that is how a road is drawn.
+    #[test]
+    fn writing_the_starting_point_moves_the_lines_below_and_not_the_ones_above() {
+        let mut ppu = Ppu::new();
+        let mut irq = Interrupts::new();
+        ppu.write8(DISPCNT, 2);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+
+        turning_background(&mut ppu, 2, 0);
+        fill_turning_tile(&mut ppu, TILE_BLOCK, 1, 1);
+        // A whole column of the map, so that every line has something in it.
+        for row in 0..16 {
+            set_turning_map(&mut ppu, MAP_BLOCK, 0, row, 16, 1);
+        }
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+
+        // Eighty lines from the top of the picture, then the corner moves. As
+        // in [`a_line_keeps_what_was_set_when_it_was_drawn`], the rest of *this*
+        // frame and no more.
+        let line = crate::ppu::LINE_CYCLES;
+        ppu.tick(line * 80, &mut irq);
+        origin(&mut ppu, 2, 16 << 8, 0);
+        ppu.tick(line * (u32::from(crate::ppu::LINES_PER_FRAME) - 80), &mut irq);
+        assert_eq!(ppu.frames(), 1, "exactly one frame was swept");
+
+        assert_eq!(pixel(&ppu, 0, 0), RED, "drawn before the corner moved");
+        assert_eq!(pixel(&ppu, 0, 120), BLUE, "and this one after it");
+    }
+
+    /// Background 2 is the one that changes character with the mode: it scrolls
+    /// in mode 0 and turns in modes 1 and 2. Mode 1 is where both kinds are on
+    /// screen at once, which is the arrangement that needs the two drawing
+    /// paths to agree about priority and about the backdrop.
+    #[test]
+    fn mode_one_draws_two_that_scroll_and_one_that_turns() {
+        let mut ppu = Ppu::new();
+        ppu.write8(DISPCNT, 1);
+        set_colour(&mut ppu, 0, BLUE);
+        set_colour(&mut ppu, 1, RED);
+        set_colour(&mut ppu, 2, GREEN);
+
+        // Background 0 scrolls: a two-byte map, four-bit tiles, in the blocks
+        // the earlier tests use.
+        background(&mut ppu, 0, 1 << 8);
+        fill_tile(&mut ppu, 0, 1, 1);
+        set_map(&mut ppu, MAP_BLOCK, 0, 0, 256, 1);
+
+        // Background 2 turns: a one-byte map and eight-bit tiles, kept well
+        // clear of the other's blocks.
+        background(&mut ppu, 2, (2 << 2) | (2 << 8));
+        fill_turning_tile(&mut ppu, TILE_BLOCK * 2, 1, 2);
+        set_turning_map(&mut ppu, MAP_BLOCK * 2, 4, 0, 16, 1);
+        transform(&mut ppu, 2, ONE, 0, 0, ONE);
+
+        // And background 3 does not exist in this mode, however it is set up.
+        background(&mut ppu, 3, (2 << 2) | (2 << 8));
+
+        sweep_a_frame(&mut ppu);
+
+        assert_eq!(pixel(&ppu, 0, 0), RED, "the one that scrolls");
+        assert_eq!(pixel(&ppu, 32, 0), GREEN, "and the one that turns, beside it");
+        assert_eq!(pixel(&ppu, 100, 0), BLUE, "with the backdrop between them");
     }
 
     /// The scroll registers are write-only, and answering with what was stored

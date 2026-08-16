@@ -86,7 +86,7 @@ pub const FRAME_CYCLES: u32 = LINE_CYCLES * LINES_PER_FRAME as u32;
 /// The first register the picture unit answers, and the last. The bus needs
 /// the pair to know what to hand over.
 pub const DISPCNT: u32 = 0x0400_0000;
-pub const LAST: u32 = 0x0400_001F;
+pub const LAST: u32 = 0x0400_003F;
 
 const GREEN_SWAP: u32 = 0x0400_0002;
 const DISPSTAT: u32 = 0x0400_0004;
@@ -96,6 +96,10 @@ pub const VCOUNT: u32 = 0x0400_0006;
 /// scroll positions, two halfwords each.
 const BG_CONTROL: u32 = 0x0400_0008;
 const BG_SCROLL: u32 = 0x0400_0010;
+/// Sixteen bytes each for the two backgrounds that can be rotated: four
+/// multipliers and two starting points.
+const BG_AFFINE: u32 = 0x0400_0020;
+const AFFINE_STRIDE: u32 = 16;
 
 /// `DISPCNT`'s video mode, and the bit that says the screen is being held
 /// blank whatever the mode.
@@ -139,6 +143,61 @@ pub(super) struct Background {
     pub control: u16,
     pub hofs: u16,
     pub vofs: u16,
+}
+
+/// The two backgrounds that can be rotated and scaled, and where they have got
+/// to.
+///
+/// # Why the starting point is kept twice
+///
+/// The four multipliers describe a transformation and the two starting points
+/// say which part of the map the top-left pixel of the screen comes from. But
+/// the beam moves down the screen, so the starting point of *each line* is a
+/// different number, and the hardware keeps a running pair that it advances by
+/// two of the multipliers after every line.
+///
+/// A game exploits this. Writing the starting point mid-frame moves the
+/// remaining lines and leaves the ones already drawn alone, which is how the
+/// floor of a racing game is drawn: one background, one line at a time, with
+/// the transformation changed between each. So the pair a game writes and the
+/// pair being walked have to be separate, and the walked pair is reloaded from
+/// the written one once a frame — not once a line, or the effect would be
+/// impossible.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Affine {
+    /// The transformation, as eight-bit fractions.
+    pub pa: i16,
+    pub pb: i16,
+    pub pc: i16,
+    pub pd: i16,
+    /// What the game wrote: 28 bits signed, with eight of them fractional.
+    pub x: i32,
+    pub y: i32,
+    /// Where this line starts, which the sweep advances.
+    pub at_x: i32,
+    pub at_y: i32,
+}
+
+impl Affine {
+    /// Takes the written starting point as the current one. Once a frame, as
+    /// the beam leaves the screen, and whenever the game writes it.
+    fn reload(&mut self) {
+        self.at_x = self.x;
+        self.at_y = self.y;
+    }
+
+    /// Moves to the next line, which is a step down the transformed axes and
+    /// not simply one pixel down.
+    fn next_line(&mut self) {
+        self.at_x = self.at_x.wrapping_add(i32::from(self.pb));
+        self.at_y = self.at_y.wrapping_add(i32::from(self.pd));
+    }
+}
+
+/// A starting point is 28 bits and signed, so the top four have to be brought
+/// down before the sign means anything.
+fn signed_28(value: u32) -> i32 {
+    ((value << 4) as i32) >> 4
 }
 
 /// Which background a register address belongs to.
@@ -189,6 +248,9 @@ pub struct Ppu {
     dot: u32,
     /// The four backgrounds. Which of them exist depends on the mode.
     pub(super) backgrounds: [Background; 4],
+    /// The rotation and scaling of backgrounds 2 and 3, in that order. Only
+    /// those two can be transformed, which is why there are two and not four.
+    pub(super) affine: [Affine; 2],
     /// How many frames have been swept. Nothing in the machine can read this;
     /// it is for whatever is driving the emulator to know when a picture is
     /// finished.
@@ -219,6 +281,7 @@ impl Ppu {
             vcount: 0,
             dot: 0,
             backgrounds: [Background::default(); 4],
+            affine: [Affine::default(); 2],
             frames: 0,
             pram: Box::new([0; PRAM_LEN]),
             vram: Box::new([0; VRAM_LEN]),
@@ -284,6 +347,11 @@ impl Ppu {
                 // [`render`](crate::ppu::render).
                 if self.vcount < VBLANK_AT {
                     self.draw_line(self.vcount);
+                    // The transformed backgrounds step down their own axes,
+                    // which is not the same as one pixel down the screen.
+                    for affine in &mut self.affine {
+                        affine.next_line();
+                    }
                 }
 
                 // The interrupt goes out in every line, not only the drawn
@@ -311,8 +379,16 @@ impl Ppu {
         }
 
         let bottom = self.vcount == VBLANK_AT;
-        if bottom && self.dispstat & VBLANK_IRQ != 0 {
-            irq.raise(Source::VBlank);
+        if bottom {
+            // Off the bottom of the screen, the transformed backgrounds go back
+            // to the starting point the game wrote — once a frame, so that
+            // anything written part way down survives to the bottom.
+            for affine in &mut self.affine {
+                affine.reload();
+            }
+            if self.dispstat & VBLANK_IRQ != 0 {
+                irq.raise(Source::VBlank);
+            }
         }
         // The comparison happens as the line changes, which is why a game can
         // set the line to match to one it is already on and hear nothing until
@@ -355,7 +431,34 @@ impl Ppu {
                 let index = background_of(addr);
                 self.backgrounds[index].control = widened(self.backgrounds[index].control);
             }
-            BG_SCROLL..=LAST => {
+            // The transformation, all of it write-only like the scroll.
+            BG_AFFINE..=LAST => {
+                let index = ((addr - BG_AFFINE) / AFFINE_STRIDE) as usize & 1;
+                let offset = (addr - BG_AFFINE) % AFFINE_STRIDE;
+                let affine = &mut self.affine[index];
+                let byte = |existing: i32, at: u32| -> i32 {
+                    let at = at * 8;
+                    ((existing as u32 & !(0xFFu32 << at)) | (u32::from(value) << at)) as i32
+                };
+                match offset {
+                    0 | 1 => affine.pa = widened(affine.pa as u16) as i16,
+                    2 | 3 => affine.pb = widened(affine.pb as u16) as i16,
+                    4 | 5 => affine.pc = widened(affine.pc as u16) as i16,
+                    6 | 7 => affine.pd = widened(affine.pd as u16) as i16,
+                    8..=11 => {
+                        affine.x = signed_28(byte(affine.x, offset - 8) as u32);
+                        // Writing the starting point takes effect from the next
+                        // line drawn, not the next frame. That is what makes a
+                        // per-line effect possible at all.
+                        affine.reload();
+                    }
+                    _ => {
+                        affine.y = signed_28(byte(affine.y, offset - 12) as u32);
+                        affine.reload();
+                    }
+                }
+            }
+            BG_SCROLL..BG_AFFINE => {
                 let index = background_of(addr);
                 let background = &mut self.backgrounds[index];
                 // Two halfwords each: the across one first, then the down one.
