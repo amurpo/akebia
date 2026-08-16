@@ -78,7 +78,8 @@ fn main() -> ExitCode {
     let Some(path) = args.next() else {
         eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--frames N]");
         eprintln!("                       [--trace N] [--from N]");
-        eprintln!("                       [--press BUTTONS] [--press-at N] [--ppm FILE]");
+        eprintln!("                       [--press BUTTONS] [--press-at N] [--press-every N]");
+        eprintln!("                       [--ppm FILE]");
         eprintln!("  BUTTONS: comma-separated, from a b select start right left up down r l");
         return ExitCode::FAILURE;
     };
@@ -98,6 +99,10 @@ fn main() -> ExitCode {
     // without this there is no way to be one.
     let mut press: Vec<Button> = Vec::new();
     let mut press_at = 0u64;
+    // How often to press again. A menu is not reached by one press: a game asks
+    // for the button at its title, then again at each screen after it, and a
+    // run that presses once stops at the first of them.
+    let mut press_every = 0u64;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--boot" => boot = true,
@@ -114,7 +119,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--steps" | "--frames" | "--trace" | "--from" | "--press-at" => {
+            "--steps" | "--frames" | "--trace" | "--from" | "--press-at" | "--press-every" => {
                 let Some(n) = args.next().and_then(|v| v.parse().ok()) else {
                     eprintln!("{flag} wants a number");
                     return ExitCode::FAILURE;
@@ -124,7 +129,8 @@ fn main() -> ExitCode {
                     "--frames" => until_frame = Some(n),
                     "--trace" => trace = n,
                     "--from" => from = n,
-                    _ => press_at = n,
+                    "--press-at" => press_at = n,
+                    _ => press_every = n,
                 }
             }
             "--press" => {
@@ -232,9 +238,11 @@ fn main() -> ExitCode {
         (until_frame.unwrap_or(DEFAULT_FRAMES) + 1).saturating_mul(u64::from(FRAME_CYCLES))
     });
 
-    let plan = Plan { limit, until_frame, from, trace, press, press_at };
-    let outcome = run(&mut cpu, &mut mem, &plan);
+    let plan = Plan { limit, until_frame, from, trace, press, press_at, press_every };
+    let mut switched_on = 0u16;
+    let outcome = run(&mut cpu, &mut mem, &plan, &mut switched_on);
     report(&cpu, &mem, &outcome);
+    report_features(switched_on);
 
     if let Some(path) = &ppm {
         let lines = draw_one_more_frame(&mut cpu, &mut mem);
@@ -318,19 +326,57 @@ struct Plan {
     /// What to press, and when.
     press: Vec<Button>,
     press_at: u64,
+    /// Steps between one press and the next, or zero for a single press.
+    press_every: u64,
 }
 
-fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan) -> Outcome {
-    let Plan { limit, until_frame, from, trace, press, press_at } = plan;
+/// Which of the machine's features a game switched on at any point in the run.
+///
+/// It is here rather than in a test because it answers a question no test can
+/// ask: whether a picture that comes out wrong is wrong because the drawing is
+/// wrong, or because the game asked for something this unit does not draw at
+/// all. The second kind looks exactly like a bug in the first.
+fn report_features(dispcnt: u16) {
+    const FEATURES: [(u16, &str); 6] = [
+        (1 << 6, "sprite tiles laid out in one dimension"),
+        (1 << 7, "the screen held blank"),
+        (1 << 12, "sprites"),
+        (1 << 13, "window 0            <- NOT DRAWN"),
+        (1 << 14, "window 1            <- NOT DRAWN"),
+        (1 << 15, "a window cut by sprites <- NOT DRAWN"),
+    ];
+    println!();
+    println!("switched on at some point (DISPCNT={dispcnt:04X}):");
+    for (bit, name) in FEATURES {
+        if dispcnt & bit != 0 {
+            println!("  {name}");
+        }
+    }
+    let backgrounds: Vec<String> =
+        (0..4).filter(|i| dispcnt & (1 << (8 + i)) != 0).map(|i| i.to_string()).collect();
+    println!("  backgrounds {}", backgrounds.join(", "));
+}
+
+fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan, switched_on: &mut u16) -> Outcome {
+    let Plan { limit, until_frame, from, trace, press, press_at, press_every } = plan;
     let (limit, from, trace, press_at) = (*limit, *from, *trace, *press_at);
+    let press_every = *press_every;
 
     for step in 0..limit {
         // Down at the given step, up ten frames later. Both edges matter: a
         // game watches for the button coming up as often as for it going down.
-        if !press.is_empty() && (step == press_at || step == press_at + PRESS_STEPS) {
-            let down = step == press_at;
-            for button in press {
-                mem.keypad_mut().set(*button, down);
+        //
+        // And again every so often if asked, because one press reaches one
+        // screen: a game wants the button at its title, and then again at each
+        // menu after it.
+        if !press.is_empty() && step >= press_at {
+            let since = step - press_at;
+            let phase = if press_every > 0 { since % press_every } else { since };
+            if phase == 0 || phase == PRESS_STEPS {
+                let down = phase == 0;
+                for button in press {
+                    mem.keypad_mut().set(*button, down);
+                }
             }
         }
 
@@ -352,6 +398,11 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan) -> Outcome {
                 cpu.regs.get(12),
             );
         }
+
+        // Every enable bit a game ever sets, kept for the report. A feature
+        // switched on that this machine cannot draw is the first thing to
+        // suspect when a picture is wrong in a way the code looks right for.
+        *switched_on |= mem.ppu().dispcnt();
 
         if let Err(fault) = cpu.step(mem) {
             return Outcome::Faulted(fault, step);

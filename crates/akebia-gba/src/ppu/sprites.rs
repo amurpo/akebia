@@ -39,6 +39,7 @@
 //! 32 tiles on regardless of how wide the sprite is. Neither is better; a game
 //! picks the one its tools produce.
 
+use super::blend::{self, Pixel};
 use super::{Ppu, OBJ_BASE_BITMAP, OBJ_BASE_TILED, VRAM_LEN};
 use crate::SCREEN_WIDTH;
 
@@ -78,6 +79,10 @@ const TRANSFORMED_DOUBLE: u16 = 0x0300;
 /// what the hardware does with it as well — it never appears on screen in its
 /// own right.
 const WINDOW: u16 = 0x0800;
+
+/// Graphics mode 1: the sprite is mixed with whatever it is over, and it says
+/// so itself rather than being named in a register. See [`crate::ppu::blend`].
+const SEMI_TRANSPARENT: u16 = 0x0400;
 
 /// The second attribute: where the sprite is across the screen, which way round
 /// it goes, and which of the four sizes of its shape it is.
@@ -142,6 +147,10 @@ struct Sprite {
     tile: usize,
     palette: u8,
     priority: u16,
+    /// Declared in the sprite's own entry, and the one thing about blending
+    /// that does not come out of a register: such a sprite is always mixed with
+    /// what is under it, whatever `BLDCNT` was set to.
+    translucent: bool,
 }
 
 impl Sprite {
@@ -184,6 +193,7 @@ impl Sprite {
             tile: usize::from(attr2 & TILE),
             palette: ((attr2 & PALETTE) >> 12) as u8,
             priority: (attr2 & PRIORITY) >> 10,
+            translucent: attr0 & GRAPHICS == SEMI_TRANSPARENT,
         })
     }
 
@@ -255,9 +265,9 @@ impl Ppu {
                 continue;
             };
             match sprite.kind {
-                Kind::Plain => self.draw_plain_sprite(&sprite, line, row),
+                Kind::Plain => self.draw_plain_sprite(&sprite, row),
                 Kind::Turned | Kind::TurnedInDoubleArea => {
-                    self.draw_transformed_sprite(&sprite, line, row)
+                    self.draw_transformed_sprite(&sprite, row)
                 }
             }
         }
@@ -265,8 +275,7 @@ impl Ppu {
 
     /// A sprite that is only somewhere, not turned: its pixels go straight
     /// across, mirrored if the entry asked for it.
-    fn draw_plain_sprite(&mut self, sprite: &Sprite, line: usize, row: usize) {
-        let at = line * SCREEN_WIDTH;
+    fn draw_plain_sprite(&mut self, sprite: &Sprite, row: usize) {
         for column in 0..sprite.width {
             // Across the screen wraps at 512, which is what puts a sprite with
             // a large coordinate off the left-hand edge instead of the right.
@@ -277,7 +286,8 @@ impl Ppu {
             let (px, py) = sprite.pixel_at(column, row);
             let colour = self.sprite_pixel(sprite, px, py);
             if colour != 0 {
-                self.frame[at + screen_x] = self.sprite_colour(sprite, colour);
+                let pixel = self.sprite_layer(sprite, colour);
+                self.put(screen_x, pixel);
             }
         }
     }
@@ -291,10 +301,9 @@ impl Ppu {
     /// here is measured from a centre rather than from a corner — a sprite
     /// rotating in place has to stay in place, and turning about its top-left
     /// corner would swing it around the screen instead.
-    fn draw_transformed_sprite(&mut self, sprite: &Sprite, line: usize, row: usize) {
+    fn draw_transformed_sprite(&mut self, sprite: &Sprite, row: usize) {
         let (pa, pb, pc, pd) = self.transform(sprite.group);
         let (area_width, area_height) = sprite.area();
-        let at = line * SCREEN_WIDTH;
 
         // How far down the area's middle this line is, and where the middle of
         // the picture is. The two differ whenever the area is doubled.
@@ -321,7 +330,8 @@ impl Ppu {
 
             let colour = self.sprite_pixel(sprite, px as usize, py as usize);
             if colour != 0 {
-                self.frame[at + screen_x] = self.sprite_colour(sprite, colour);
+                let pixel = self.sprite_layer(sprite, colour);
+                self.put(screen_x, pixel);
             }
         }
     }
@@ -406,6 +416,19 @@ impl Ppu {
         };
         let at = OBJ_PALETTE + index * 2;
         (u16::from(self.pram[at]) | (u16::from(self.pram[at + 1]) << 8)) & 0x7FFF
+    }
+
+    /// The same colour, carrying where it came from.
+    ///
+    /// Every sprite is the one sprite layer whatever its priority, which is why
+    /// nothing here varies but the flag: two sprites over each other are not two
+    /// layers, and blending never happens between them.
+    fn sprite_layer(&self, sprite: &Sprite, index: u8) -> Pixel {
+        Pixel {
+            colour: self.sprite_colour(sprite, index),
+            layer: blend::OBJ,
+            translucent: sprite.translucent,
+        }
     }
 }
 

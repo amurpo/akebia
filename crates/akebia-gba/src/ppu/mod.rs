@@ -47,8 +47,11 @@
 //! writing in a number that was measured on someone else's hardware would make
 //! this look more exact than it is.
 
+pub mod blend;
 pub mod render;
 mod sprites;
+
+use blend::Pixel;
 
 use crate::interrupts::{Interrupts, Source};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -87,7 +90,11 @@ pub const FRAME_CYCLES: u32 = LINE_CYCLES * LINES_PER_FRAME as u32;
 /// The first register the picture unit answers, and the last. The bus needs
 /// the pair to know what to hand over.
 pub const DISPCNT: u32 = 0x0400_0000;
-pub const LAST: u32 = 0x0400_003F;
+/// It reaches past the four registers this module was named for: the windows,
+/// the mosaic and the blending live in the same block, and of those only the
+/// blending is answered. The rest read zero as they did when the bus was
+/// dropping them — the difference is only which `_` arm swallows them.
+pub const LAST: u32 = 0x0400_0057;
 
 const GREEN_SWAP: u32 = 0x0400_0002;
 const DISPSTAT: u32 = 0x0400_0004;
@@ -101,6 +108,9 @@ const BG_SCROLL: u32 = 0x0400_0010;
 /// multipliers and two starting points.
 const BG_AFFINE: u32 = 0x0400_0020;
 const AFFINE_STRIDE: u32 = 16;
+/// Where the transformations stop and the windows, the mosaic and the blending
+/// begin. Only the last of those three is answered.
+const BLEND: u32 = 0x0400_0040;
 
 /// `DISPCNT`'s video mode, and the bit that says the screen is being held
 /// blank whatever the mode.
@@ -265,6 +275,19 @@ pub struct Ppu {
     /// The picture, a 15-bit colour per pixel, filled a line at a time as the
     /// beam passes.
     frame: Box<[u16; PIXELS]>,
+    /// Which layers are mixed with which, how, and how far. See [`blend`].
+    bldcnt: u16,
+    bldalpha: u16,
+    bldy: u16,
+    /// The line being built, two pixels deep: what is on top of each column and
+    /// what is directly behind it.
+    ///
+    /// Blending is the reason these exist. Every other effect can be drawn
+    /// straight into the picture and forgotten, because the nearest layer with
+    /// something to say is simply the last to write; mixing needs the one it
+    /// covered, and by then it has been painted over. See [`blend`].
+    top: Box<[Pixel; SCREEN_WIDTH]>,
+    below: Box<[Pixel; SCREEN_WIDTH]>,
 }
 
 impl Default for Ppu {
@@ -288,6 +311,11 @@ impl Ppu {
             vram: Box::new([0; VRAM_LEN]),
             oam: Box::new([0; OAM_LEN]),
             frame: Box::new([0; PIXELS]),
+            bldcnt: 0,
+            bldalpha: 0,
+            bldy: 0,
+            top: Box::new([Pixel::NONE; SCREEN_WIDTH]),
+            below: Box::new([Pixel::NONE; SCREEN_WIDTH]),
         }
     }
 
@@ -409,6 +437,7 @@ impl Ppu {
             DISPSTAT => half(self.status()),
             VCOUNT => half(self.vcount),
             BG_CONTROL..BG_SCROLL => half(self.backgrounds[background_of(addr)].control),
+            blend::BLDCNT..=blend::BLDY => self.read_blend8(addr),
             // The scroll positions are write-only. See [`Background`].
             _ => 0,
         }
@@ -432,8 +461,9 @@ impl Ppu {
                 let index = background_of(addr);
                 self.backgrounds[index].control = widened(self.backgrounds[index].control);
             }
+            blend::BLDCNT..=blend::BLDY => self.write_blend8(addr, value),
             // The transformation, all of it write-only like the scroll.
-            BG_AFFINE..=LAST => {
+            BG_AFFINE..BLEND => {
                 let index = ((addr - BG_AFFINE) / AFFINE_STRIDE) as usize & 1;
                 let offset = (addr - BG_AFFINE) % AFFINE_STRIDE;
                 let affine = &mut self.affine[index];

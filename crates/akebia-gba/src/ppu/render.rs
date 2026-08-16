@@ -44,8 +44,14 @@
 //! and it is why the second kind pays for itself with a map of single bytes:
 //! there is no room left for mirroring or a choice of palette.
 //!
-//! Not here: sprites, which sit on top of everything; and the windows, mosaic
-//! and blending that the rest of the register block is for.
+//! Layers rather than colours, since blending arrived. Each of them is put down
+//! with a note of which layer it came from and what it covered, and the line
+//! becomes a picture once at the end — see [`blend`](super::blend) for why
+//! nothing else would do.
+//!
+//! Not here: the windows and the mosaic that the rest of the register block is
+//! for. The windows are the one of those that games miss: a layer a game
+//! restricted to a rectangle is drawn over the whole screen instead.
 //!
 //! An unwritten mode draws the backdrop rather than nothing, which is what the
 //! hardware does and is also honest: a screen in the backdrop colour says the
@@ -60,6 +66,7 @@
 //! already on screen without clearing it first. The backdrop — the first colour
 //! of the palette — is what shows when nothing at all has anything to say.
 
+use super::blend::{self, Pixel};
 use super::{Ppu, PIXELS};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
 
@@ -134,9 +141,16 @@ impl Ppu {
 
         // Everything not covered by a background shows the first colour of the
         // palette. It is a real colour a game chooses, not a stand-in for
-        // nothing.
-        let backdrop = self.colour(0);
-        self.frame[at..at + SCREEN_WIDTH].fill(backdrop);
+        // nothing — and it is a layer like any other, which a game can fade or
+        // mix with what is over it.
+        //
+        // Underneath it goes nothing at all, and that is not the same thing.
+        // The backdrop is the bottom, so a pixel showing it has nothing behind
+        // it to be mixed with; a second copy of it down there would let the
+        // backdrop blend with itself.
+        let backdrop = Pixel::new(self.colour(0), blend::BACKDROP);
+        self.top.fill(backdrop);
+        self.below.fill(Pixel::NONE);
 
         // Everything on the screen, back to front, one priority at a time.
         //
@@ -149,6 +163,13 @@ impl Ppu {
         for priority in (0..4).rev() {
             self.draw_backgrounds_at(line, priority);
             self.draw_sprites_at(line, priority);
+        }
+
+        // And only now are there colours. Up to here the line has been layers,
+        // because a pixel cannot be mixed with what covered it until the
+        // covering has finished happening.
+        for x in 0..SCREEN_WIDTH {
+            self.frame[at + x] = self.blended(x);
         }
     }
 
@@ -178,7 +199,7 @@ impl Ppu {
                         continue;
                     }
                     if self.is_transformed(index) {
-                        self.draw_affine_background(index, line);
+                        self.draw_affine_background(index);
                     } else {
                         self.draw_text_background(index, line);
                     }
@@ -244,7 +265,6 @@ impl Ppu {
         // The map is a torus: scrolling off one edge brings the other edge
         // round. Both sizes are powers of two, so the wrap is a mask.
         let y = (line + usize::from(background.vofs)) & (height - 1);
-        let at = line * SCREEN_WIDTH;
 
         for x in 0..SCREEN_WIDTH {
             let sx = (x + usize::from(background.hofs)) & (width - 1);
@@ -277,7 +297,8 @@ impl Ppu {
             // Index zero is nothing rather than a colour, and what is behind
             // shows through. It is what lets four backgrounds share a screen.
             if colour != 0 {
-                self.frame[at + x] = self.colour(colour);
+                let pixel = Pixel::new(self.colour(colour), blend::BACKGROUNDS[index]);
+                self.put(x, pixel);
             }
         }
     }
@@ -300,7 +321,7 @@ impl Ppu {
     /// A transformed map is simpler than a scrolling one in every other way:
     /// one byte an entry, no mirroring, no choice of palette, and always 256
     /// colours. There is no room in a byte for anything else.
-    fn draw_affine_background(&mut self, index: usize, line: usize) {
+    fn draw_affine_background(&mut self, index: usize) {
         let control = self.backgrounds[index].control;
         let affine = self.affine[index - 2];
         // 128, 256, 512 or 1024 pixels square.
@@ -312,7 +333,6 @@ impl Ppu {
 
         let mut x = affine.at_x;
         let mut y = affine.at_y;
-        let at = line * SCREEN_WIDTH;
 
         for screen_x in 0..SCREEN_WIDTH {
             let (px, py) = (x >> 8, y >> 8);
@@ -335,7 +355,8 @@ impl Ppu {
             let tile = usize::from(self.background_byte(map_base + (py / 8) * squares as usize + px / 8));
             let colour = self.background_byte(tile_base + tile * 64 + (py % 8) * 8 + px % 8);
             if colour != 0 {
-                self.frame[at + screen_x] = self.colour(colour);
+                let pixel = Pixel::new(self.colour(colour), blend::BACKGROUNDS[index]);
+                self.put(screen_x, pixel);
             }
         }
     }
@@ -375,11 +396,10 @@ impl Ppu {
         if line >= height {
             return;
         }
-        let at = line * SCREEN_WIDTH;
         let row = base + line * width * 2;
         for x in 0..width {
-            let colour = self.halfword(row + x * 2);
-            self.frame[at + x] = colour & WHITE;
+            let colour = self.halfword(row + x * 2) & WHITE;
+            self.put(x, Pixel::new(colour, blend::BG2));
         }
     }
 
@@ -390,12 +410,12 @@ impl Ppu {
     /// anything drawn on top of something else — and it is why a test ROM's
     /// digits can be written without clearing the screen first.
     fn draw_indexed_line(&mut self, line: usize) {
-        let at = line * SCREEN_WIDTH;
         let row = self.picture_base() + line * SCREEN_WIDTH;
         for x in 0..SCREEN_WIDTH {
             let index = self.vram[row + x];
             if index != 0 {
-                self.frame[at + x] = self.colour(index);
+                let pixel = Pixel::new(self.colour(index), blend::BG2);
+                self.put(x, pixel);
             }
         }
     }
