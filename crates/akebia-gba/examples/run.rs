@@ -50,6 +50,8 @@ use std::process::ExitCode;
 use akebia_gba::bus::Memory;
 use akebia_gba::cpu::{Bus, Cpu, Fault};
 use akebia_gba::keypad::Button;
+use akebia_gba::ppu::FRAME_CYCLES;
+use akebia_gba::CLOCK_HZ;
 
 /// Where a cartridge is mapped, and so where a machine with one starts.
 const ROM_BASE: u32 = 0x0800_0000;
@@ -61,13 +63,17 @@ const DEFAULT_STEPS: u64 = 50_000_000;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--trace N] [--from N]");
+        eprintln!("usage: run <rom.gba> [--bios FILE] [--boot] [--steps N] [--frames N]");
+        eprintln!("                       [--trace N] [--from N]");
         eprintln!("                       [--press BUTTONS] [--press-at N] [--ppm FILE]");
         eprintln!("  BUTTONS: comma-separated, from a b select start right left up down r l");
         return ExitCode::FAILURE;
     };
 
-    let mut limit = DEFAULT_STEPS;
+    // Only what was asked for. A frame count sets its own step budget, and
+    // that cannot be worked out until the arguments are all read.
+    let mut limit: Option<u64> = None;
+    let mut until_frame: Option<u64> = None;
     let mut trace = 0u64;
     // Where to begin tracing. A fault a million steps in cannot be seen from
     // the first forty instructions, and printing all million is not reading.
@@ -95,13 +101,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--steps" | "--trace" | "--from" | "--press-at" => {
+            "--steps" | "--frames" | "--trace" | "--from" | "--press-at" => {
                 let Some(n) = args.next().and_then(|v| v.parse().ok()) else {
                     eprintln!("{flag} wants a number");
                     return ExitCode::FAILURE;
                 };
                 match flag.as_str() {
-                    "--steps" => limit = n,
+                    "--steps" => limit = Some(n),
+                    "--frames" => until_frame = Some(n),
                     "--trace" => trace = n,
                     "--from" => from = n,
                     _ => press_at = n,
@@ -189,7 +196,17 @@ fn main() -> ExitCode {
         cpu.regs.set_pc(ROM_BASE);
     }
 
-    let outcome = run(&mut cpu, &mut mem, limit, from, trace, &press, press_at);
+    // A frame count pays for itself in steps. One step charges one cycle, so a
+    // frame is `FRAME_CYCLES` of them at the most — at the most, because any
+    // honest timing later can only make an instruction cost more than one, and
+    // so make a frame cost fewer steps than this.
+    let limit = limit.unwrap_or(match until_frame {
+        Some(frames) => (frames + 1).saturating_mul(u64::from(FRAME_CYCLES)),
+        None => DEFAULT_STEPS,
+    });
+
+    let plan = Plan { limit, until_frame, from, trace, press, press_at };
+    let outcome = run(&mut cpu, &mut mem, &plan);
     report(&cpu, &mem, &outcome);
 
     if let Some(path) = &ppm {
@@ -217,7 +234,15 @@ enum Outcome {
     Faulted(Fault, u64),
     /// The ROM branched to itself, which is how a test suite says it is done.
     Settled { at: u32, steps: u64 },
-    /// Neither happened in time, which tells us nothing.
+    /// The frame count asked for was swept.
+    Reached { steps: u64 },
+    /// The step budget ran out with the machine still going.
+    ///
+    /// On a test suite this is a hang. On a game it is usually just the budget:
+    /// a cartridge needs hundreds of frames to get through its opening, and the
+    /// default is worth about three seconds. Which of the two it is cannot be
+    /// told from here, so the report says how far it got and leaves the reading
+    /// to whoever asked.
     RanOn,
 }
 
@@ -246,15 +271,29 @@ fn button_named(name: &str) -> Option<Button> {
     })
 }
 
-fn run(
-    cpu: &mut Cpu,
-    mem: &mut Memory,
+/// What a run has been asked to do.
+///
+/// Together rather than as seven arguments, because they are one idea: the
+/// budget, where to stop, what to print on the way and what to press.
+struct Plan {
+    /// The most steps to take, whatever else happens.
     limit: u64,
+    /// Stop once this many frames have been swept, if a count was given. The
+    /// natural unit for a game, where the step budget is the natural unit for a
+    /// test suite that finishes in a fraction of one frame.
+    until_frame: Option<u64>,
+    /// Where the trace begins, and how much of it.
     from: u64,
     trace: u64,
-    press: &[Button],
+    /// What to press, and when.
+    press: Vec<Button>,
     press_at: u64,
-) -> Outcome {
+}
+
+fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan) -> Outcome {
+    let Plan { limit, until_frame, from, trace, press, press_at } = plan;
+    let (limit, from, trace, press_at) = (*limit, *from, *trace, *press_at);
+
     for step in 0..limit {
         // Down at the given step, up ten frames later. Both edges matter: a
         // game watches for the button coming up as often as for it going down.
@@ -297,6 +336,12 @@ fn run(
         // working.
         if cpu.regs.pc() == before && !mem.interrupts().halted() {
             return Outcome::Settled { at: before, steps: step + 1 };
+        }
+
+        if let Some(target) = until_frame.as_ref() {
+            if mem.ppu().frames() >= *target {
+                return Outcome::Reached { steps: step + 1 };
+            }
         }
     }
     Outcome::RanOn
@@ -356,6 +401,21 @@ fn write_ppm(path: &str, frame: &[u16]) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
+/// How long the machine thinks it has been running.
+///
+/// Steps are the emulator's unit and seconds are the game's, and the gap
+/// between them is the whole reason a run that looks stuck usually is not: the
+/// default budget is three seconds of machine time, which is not enough for a
+/// cartridge to finish showing its publisher's logo.
+fn machine_time(mem: &Memory) -> String {
+    let seconds = mem.cycles() as f64 / f64::from(CLOCK_HZ);
+    if seconds < 1.0 {
+        format!("{:.0} ms", seconds * 1000.0)
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
 fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
     let irq = mem.interrupts();
     println!();
@@ -365,7 +425,18 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
             println!("settled at {at:08X} after {steps} steps");
             println!("  the instruction there: {:08X}", mem.peek32(*at));
         }
-        Outcome::RanOn => println!("still running when the step limit ran out"),
+        Outcome::Reached { steps } => {
+            println!("swept {} frames in {steps} steps", mem.ppu().frames());
+        }
+        // Worth spelling out, because the state below reads like a hang and
+        // usually is not one. A game asleep in the BIOS waiting for the beam is
+        // a game doing exactly what a game does; it just has not been given
+        // long enough to get anywhere.
+        Outcome::RanOn => {
+            println!("the step limit ran out with the machine still running");
+            println!("  {} frames is about {}", mem.ppu().frames(), machine_time(mem));
+            println!("  for a game that is an opening logo. Try --frames 900");
+        }
     }
 
     println!();
@@ -399,8 +470,9 @@ fn report(cpu: &Cpu, mem: &Memory, outcome: &Outcome) {
     let ppu = mem.ppu();
     println!();
     println!(
-        "  frames={}  line={}  mode={}{}  dispstat={:04X}",
+        "  frames={} ({})  line={}  mode={}{}  dispstat={:04X}",
         ppu.frames(),
+        machine_time(mem),
         ppu.vcount(),
         ppu.mode(),
         if ppu.forced_blank() { " (held blank)" } else { "" },
