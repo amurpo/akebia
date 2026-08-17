@@ -24,6 +24,11 @@ cargo build --release
 ./target/release/akebia path/to/game.gb
 ```
 
+Two system libraries have to be there to compile: ALSA, for the sound, and
+`libudev`, for the controllers — `sudo dnf install alsa-lib-devel
+systemd-devel` on Fedora. Neither is needed to *run* the package: both ship with
+any desktop, and rpm works the dependency out of the binary by itself.
+
 To have it on the `PATH` like any other command:
 
 ```bash
@@ -282,9 +287,27 @@ it can. Perfect symmetry it cannot break.
 | Arrows | D-pad |
 | `Z` / `X` | A / B |
 | `Enter` / `Backspace` | Start / Select |
+| `A` / `S` | L / R (the Advance's shoulders) |
 | `Escape` | Back to the list |
 | `Tab` | Swap consoles (with the cable plugged in) |
 | `D` | Debug capture (with `--debug` only) |
+
+A controller works as well, and works alongside the keyboard rather than
+instead of it: both are read every frame and either can press anything. One
+plugged in while Akebia is running is picked up without restarting. Out of the
+box the d-pad is the d-pad, the shoulders are the shoulders, Start and Select
+are the buttons of those names, and A and B are the east and south face buttons
+— which on a controller with Nintendo's labels are the two that actually say A
+and B, and on any other are the pair the thumb rolls between right to left, the
+way the two sit on the machine. The left stick steers the cross too.
+
+*Controls* in the menu bar says which controller is being listened to and opens
+a dialog to move any of the ten buttons: click a row, press the button it is to
+become. Whoever was on that button takes the one being given up, so the ten
+never end up sharing. Changes are kept as they are made, per controller by the
+name it reports, in `~/.config/akebia/controllers` — a preference somebody sat
+down and expressed, which is why it goes there rather than into
+`XDG_STATE_HOME` with the last folder used.
 
 In the list, the arrows move the cursor, `Home` and `End` go to the ends, and
 `Enter` or a double click starts the game. In the folder dialog the arrows and

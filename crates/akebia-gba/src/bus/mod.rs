@@ -36,12 +36,15 @@
 //! One sat on its title screen because of it. A register whose resting value is
 //! not zero cannot be left to the fallback.
 
+pub mod timing;
+
 use crate::cpu::Bus;
 use crate::dma::{self, Dma};
 use crate::interrupts::Interrupts;
 use crate::keypad::{self, Keypad};
 use crate::ppu::{self, Ppu};
 use crate::save::Save;
+use timing::WAITCNT;
 use crate::sound::{self, Sound};
 use crate::timers::{self, Timers};
 
@@ -96,6 +99,23 @@ pub struct Memory {
     sound: Sound,
     cycles: u64,
     bios_loaded: bool,
+    /// How fast the game has asked its cartridge to be read. See [`timing`].
+    waitcnt: u16,
+    /// Cycles owed for accesses made since the clock was last moved.
+    ///
+    /// The bus counts them rather than the processor, because what an access
+    /// costs is the bus's to know: it depends on the region, on whether the
+    /// address follows the last one, and on a register the game writes. The
+    /// processor asks for the total once an instruction is done.
+    owed: u32,
+    /// The last access, for telling a sequential one from a jump.
+    previous: Option<(u32, bool)>,
+    /// Cycles charged but not yet lived through. See [`Memory::settle`].
+    pending: u32,
+    /// Whether the clock is already being moved, so that a memory mover reading
+    /// a register from inside a lump does not try to move it again from within
+    /// itself.
+    settling: bool,
 }
 
 impl Default for Memory {
@@ -120,6 +140,11 @@ impl Memory {
             sound: Sound::new(),
             cycles: 0,
             bios_loaded: false,
+            waitcnt: 0,
+            owed: 0,
+            previous: None,
+            pending: 0,
+            settling: false,
         }
     }
 
@@ -169,8 +194,14 @@ impl Memory {
         &mut self.save
     }
 
+    /// How much time the machine has been charged for.
+    ///
+    /// Charged and not lived through: some of it may still be owed. From
+    /// outside that is the honest number — the cycles have happened as far as
+    /// anything asking is concerned, and whether the picture unit has caught up
+    /// with them yet is this map's own business. See [`Memory::catch_up`].
     pub fn cycles(&self) -> u64 {
-        self.cycles
+        self.cycles + u64::from(self.pending)
     }
 
     pub fn ppu(&self) -> &Ppu {
@@ -218,6 +249,7 @@ impl Memory {
         match addr & !1 {
             ppu::DISPCNT..=ppu::LAST => self.ppu.read8(addr),
             dma::BASE..=dma::LAST => self.dma.read8(addr),
+            WAITCNT => half(self.waitcnt),
             0x0400_0200 => half(self.irq.enabled()),
             0x0400_0202 => half(self.irq.requested()),
             0x0400_0208 => half(u16::from(self.irq.master())),
@@ -241,6 +273,7 @@ impl Memory {
             keypad::KEYINPUT..=keypad::LAST => self.keypad.write8(addr, value),
             timers::BASE..=timers::LAST => self.timers.write8(addr, value),
             sound::FIRST..=sound::LAST => self.sound.write8(addr, value),
+            WAITCNT => self.waitcnt = widened(self.waitcnt),
             0x0400_0200 => {
                 let updated = widened(self.irq.enabled());
                 self.irq.set_enabled(updated);
@@ -377,6 +410,124 @@ impl Memory {
         }
     }
 
+    /// Runs the machine forward through whatever cycles are owed, a lump at a
+    /// time.
+    ///
+    /// # Why a lump and not a cycle
+    ///
+    /// Because almost nothing happens in almost every cycle, and asking anyway
+    /// was four fifths of what this emulator did. A profile of a game in motion
+    /// put a third of the time in the mixer, a fifth in the timers and a sixth
+    /// in the beam — while the processor those three exist to serve did not
+    /// reach one per cent. They were being asked seventeen million times a
+    /// second to answer that nothing had changed.
+    ///
+    /// So each of them says how long it may be left alone — the next output
+    /// sample, the next counter coming round, the next edge of a line — and the
+    /// clock advances by the soonest of those instead of by one. The lumps are
+    /// hundreds of cycles and the answers are identical, because the bound is
+    /// exactly "the next moment anything is observable".
+    ///
+    /// # Why the cycles wait rather than running ahead
+    ///
+    /// The processor has only lived through the cycles it has been charged for,
+    /// so the machine cannot be moved past them. What can be done is to leave
+    /// them owing: the clock stands still until enough have piled up to reach
+    /// the next thing that happens. Anything that would notice the difference
+    /// — a game reading the line counter, or a timer — settles the debt first.
+    /// See [`Memory::read_bytes`].
+    fn settle(&mut self) {
+        if self.settling {
+            return;
+        }
+        self.settling = true;
+        // Only when enough have piled up to reach something. Fewer than that
+        // and the machine is left exactly as it is: moving it would be a pass
+        // through every part of it to change nothing observable, which is what
+        // this exists to stop.
+        loop {
+            let next = self.until_next();
+            if self.pending < next {
+                break;
+            }
+            self.pending -= next;
+            self.advance(next);
+        }
+        self.settling = false;
+    }
+
+    /// Lives through every cycle owed, whether or not it reaches a boundary.
+    ///
+    /// For the moment something is about to look at the machine and would see
+    /// the difference — a register read, a register written. Everywhere else
+    /// the debt is left standing, which is the whole point of it.
+    ///
+    /// It is public because anything driving this map from outside has the same
+    /// need: [`Bus::tick`] no longer means "the machine has moved", it means
+    /// "the machine has been charged". Whoever then wants to look at what the
+    /// picture unit or the sound has done must say so.
+    pub fn catch_up(&mut self) {
+        if self.settling {
+            return;
+        }
+        self.settling = true;
+        while self.pending > 0 {
+            let step = self.pending.min(self.until_next());
+            self.pending -= step;
+            self.advance(step);
+        }
+        self.settling = false;
+    }
+
+    /// How far the clock may go before something has to be told.
+    fn until_next(&self) -> u32 {
+        self.ppu
+            .until_next()
+            .min(self.timers.until_next())
+            .min(self.sound.until_next())
+            .max(1)
+    }
+
+    /// Everything the clock drives, moved by one lump.
+    fn advance(&mut self, cycles: u32) {
+        self.cycles += u64::from(cycles);
+        let crossed = self.ppu.tick(cycles, &mut self.irq);
+        // The timers report coming round whether or not they interrupt, because
+        // an overflow is also a sound queue's sample clock.
+        let overflowed = self.timers.tick(cycles, &mut self.irq);
+        self.dma.at_blanking(crossed);
+        // Draining comes before asking, so that a queue emptied by this lump is
+        // refilled by it rather than a lump later. What is asked is the queue's
+        // state and not what this lump did to it: a queue nothing has played
+        // from yet is empty, and has to be filled before a first sample can
+        // come out of it.
+        self.sound.at_timers(overflowed);
+        self.dma.at_fifo(self.sound.hungry());
+        // And *then* the mixer, so that the sample this lump took out of a
+        // queue is the one this lump's audio is made of. The other way round,
+        // every sample would be heard one time round of the timer late.
+        self.sound.tick(cycles);
+        self.run_transfers();
+        // The buttons are compared against what the game asked to watch here
+        // rather than where a button is pressed, because the hardware compares
+        // them continuously: it is a level and not an edge, and a game that
+        // starts watching a button already held expects to hear about it.
+        self.keypad.poll(&mut self.irq);
+    }
+
+    /// Notes what an access costs, for the processor to pay once the
+    /// instruction that made it is done.
+    ///
+    /// Every access goes through here, the memory movers' included — which is
+    /// right and is why it lives on this side: a transfer stops the processor
+    /// for as long as it takes, so its cycles are the machine's cycles like any
+    /// others.
+    fn charge(&mut self, addr: u32, wide: bool) {
+        let sequential = timing::follows_on(self.previous, addr, wide);
+        self.owed += timing::access(addr, wide, sequential, self.waitcnt);
+        self.previous = Some((addr, wide));
+    }
+
     /// A read the machine is making, which the save chip may answer differently
     /// the next time it is asked.
     ///
@@ -386,8 +537,15 @@ impl Memory {
     /// EEPROM moves it on to the next. See [`Memory::peek_bytes`] for the
     /// version that must not do that.
     fn read_bytes(&mut self, addr: u32, len: usize) -> u32 {
-        if matches!(self.locate(addr), Where::Save) {
-            return self.save.read(addr, len);
+        match self.locate(addr) {
+            Where::Save => return self.save.read(addr, len),
+            // A register is the only thing here whose answer depends on how far
+            // the clock has got: the line counter, a timer's count, whether a
+            // blanking period has begun. So the cycles owed are lived through
+            // before the question is answered, and the game cannot tell that
+            // they were ever owed. See [`Memory::settle`].
+            Where::Registers => self.catch_up(),
+            _ => {}
         }
         self.peek_bytes(addr, len)
     }
@@ -422,6 +580,10 @@ impl Memory {
     fn write_bytes(&mut self, addr: u32, value: u32, len: usize) {
         match self.locate(addr) {
             Where::Registers => {
+                // Written on the same footing as read: a game that switches a
+                // timer on, or asks for an interrupt, is doing so at the moment
+                // its own cycles have reached, not at the last lump's edge.
+                self.catch_up();
                 for index in 0..len {
                     self.write_io8(addr + index as u32, (value >> (index * 8)) as u8);
                 }
@@ -496,14 +658,17 @@ fn vram_offset(addr: u32) -> usize {
 
 impl Bus for Memory {
     fn read8(&mut self, addr: u32) -> u8 {
+        self.charge(addr, false);
         self.read_bytes(addr, 1) as u8
     }
 
     fn read16(&mut self, addr: u32) -> u16 {
+        self.charge(addr & !1, false);
         self.read_bytes(addr & !1, 2) as u16
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        self.charge(addr & !3, true);
         self.read_bytes(addr & !3, 4)
     }
 
@@ -522,8 +687,10 @@ impl Bus for Memory {
     ///   it the write is dropped.
     /// - Sprite memory drops it always.
     fn write8(&mut self, addr: u32, value: u8) {
+        self.charge(addr, false);
         match self.locate(addr) {
             Where::Registers => {
+                self.catch_up();
                 self.write_io8(addr, value);
                 return;
             }
@@ -559,10 +726,12 @@ impl Bus for Memory {
     }
 
     fn write16(&mut self, addr: u32, value: u16) {
+        self.charge(addr & !1, false);
         self.write_bytes(addr & !1, u32::from(value), 2);
     }
 
     fn write32(&mut self, addr: u32, value: u32) {
+        self.charge(addr & !3, true);
         self.write_bytes(addr & !3, value, 4);
     }
 
@@ -574,29 +743,8 @@ impl Bus for Memory {
     /// never advances the picture would produce a machine that halts on the
     /// first thing it waits for, and would look like a bug in the game.
     fn tick(&mut self, cycles: u32) {
-        self.cycles += u64::from(cycles);
-        let crossed = self.ppu.tick(cycles, &mut self.irq);
-        // The timers report coming round whether or not they interrupt, because
-        // an overflow is also a sound queue's sample clock.
-        let overflowed = self.timers.tick(cycles, &mut self.irq);
-        self.dma.at_blanking(crossed);
-        // Draining comes before asking, so that a queue emptied by this tick is
-        // refilled by it rather than a tick later. What is asked is the queue's
-        // state and not what this tick did to it: a queue nothing has played
-        // from yet is empty, and has to be filled before a first sample can
-        // come out of it.
-        self.sound.at_timers(overflowed);
-        self.dma.at_fifo(self.sound.hungry());
-        // And *then* the mixer, so that the sample this tick took out of a
-        // queue is the one this tick's audio is made of. The other way round,
-        // every sample would be heard one time round of the timer late.
-        self.sound.tick(cycles);
-        self.run_transfers();
-        // The buttons are compared against what the game asked to watch here
-        // rather than where a button is pressed, because the hardware compares
-        // them continuously: it is a level and not an edge, and a game that
-        // starts watching a button already held expects to hear about it.
-        self.keypad.poll(&mut self.irq);
+        self.pending += cycles;
+        self.settle();
     }
 
     fn interrupts(&self) -> &Interrupts {
@@ -609,6 +757,18 @@ impl Bus for Memory {
 
     fn peek32(&self, addr: u32) -> u32 {
         self.peek_bytes(addr & !3, 4)
+    }
+
+    fn owed(&mut self) -> u32 {
+        std::mem::take(&mut self.owed)
+    }
+
+    fn idle(&mut self) {
+        // Straight to the next thing, because there is nothing in between for a
+        // halted processor to miss: what wakes it is an interrupt, and every
+        // source of one is a thing this asked about.
+        self.pending += self.until_next();
+        self.settle();
     }
 }
 
@@ -871,10 +1031,12 @@ mod tests {
         assert_eq!(mem.read16(timers::BASE), 0xFFFC, "switched on, so loaded");
 
         mem.tick(3);
+        mem.catch_up();
         assert_eq!(mem.read16(timers::BASE), 0xFFFF);
         assert_eq!(mem.interrupts().requested(), 0, "one short");
 
         mem.tick(1);
+        mem.catch_up();
         assert_eq!(mem.read16(timers::BASE), 0xFFFC, "back to the reload");
         assert_ne!(mem.interrupts().requested(), 0, "and it said so");
     }
@@ -909,12 +1071,14 @@ mod tests {
         // The queue starts empty, so it is hungry, so the first tick refills it
         // before anything can be played out of it.
         mem.tick(4);
+        mem.catch_up();
         assert_eq!(mem.sound().playing()[0], 0, "nothing was in it to play yet");
 
         // Sixteen bytes arrived. Playing them out gives the tune in order.
         let mut heard = Vec::new();
         for _ in 0..16 {
             mem.tick(4);
+        mem.catch_up();
             heard.push(mem.sound().playing()[0]);
         }
         assert_eq!(heard[0], 0, "the first sample of the tune");
@@ -926,6 +1090,7 @@ mod tests {
         let mut more = Vec::new();
         for _ in 0..16 {
             mem.tick(4);
+        mem.catch_up();
             more.push(mem.sound().playing()[0]);
         }
         assert_eq!(more[0], 16, "straight on into the next sixteen");
@@ -949,13 +1114,16 @@ mod tests {
         // which takes two refills of sixteen. That it stops asking is what says
         // the mark is a level and not a one-off.
         mem.tick(1);
+        mem.catch_up();
         assert!(mem.sound().hungry()[0], "half full is still asking");
         mem.tick(1);
+        mem.catch_up();
         assert!(!mem.sound().hungry()[0], "and now it is full and stops");
 
         // And through all of it nothing was played, because no timer is running
         // to play it. A queue does not empty on its own.
         mem.tick(1000);
+        mem.catch_up();
         assert_eq!(mem.sound().playing()[0], 0, "no timer, so no samples");
         assert!(!mem.sound().hungry()[0], "and it stays full");
     }
@@ -967,10 +1135,12 @@ mod tests {
         let mut mem = Memory::new();
         mem.write16(keypad::KEYCNT, 0x4000 | 0x0008);
         mem.tick(1);
+        mem.catch_up();
         assert_eq!(mem.interrupts().requested(), 0, "nothing held");
 
         mem.keypad_mut().set(Button::Start, true);
         mem.tick(1);
+        mem.catch_up();
         assert_ne!(mem.interrupts().requested(), 0, "and now it is");
     }
 
@@ -1080,6 +1250,7 @@ mod tests {
         mem.write16(0x0400_00DC, 9);
         mem.write16(0x0400_00DE, 0x8000);
         mem.tick(1);
+        mem.catch_up();
 
         // And sixty-eight halfwords back: four to be thrown away, then the
         // block, which on a chip nobody has written to is all ones.
@@ -1088,6 +1259,7 @@ mod tests {
         mem.write16(0x0400_00DC, 68);
         mem.write16(0x0400_00DE, 0x8000);
         mem.tick(1);
+        mem.catch_up();
 
         let bit = |mem: &mut Memory, at: u32| mem.read16(EWRAM + 0x100 + at * 2) & 1;
         assert_eq!(bit(&mut mem, 0), 0, "the padding");
@@ -1120,6 +1292,7 @@ mod tests {
         let mut mem = Memory::new();
         mem.write32(IWRAM, 0x1234_5678);
         mem.tick(6);
+        mem.catch_up();
         let before = mem.cycles();
 
         assert_eq!(mem.peek32(IWRAM), 0x1234_5678);
@@ -1132,7 +1305,9 @@ mod tests {
         let mut mem = Memory::new();
         assert_eq!(mem.cycles(), 0);
         mem.tick(3);
+        mem.catch_up();
         mem.tick(5);
+        mem.catch_up();
         assert_eq!(mem.cycles(), 8);
     }
 
@@ -1149,6 +1324,7 @@ mod tests {
 
         assert_eq!(mem.read16(0x0400_0006), 0, "the beam starts at the top");
         mem.tick(crate::ppu::FRAME_CYCLES / 2);
+        mem.catch_up();
         assert_ne!(mem.read16(0x0400_0006), 0, "and the clock moves it");
         assert_eq!(mem.read16(0x0400_0006), mem.ppu().vcount());
     }
@@ -1170,6 +1346,7 @@ mod tests {
 
         assert_eq!(mem.read32(VRAM), 0, "nothing has moved yet");
         mem.tick(1);
+        mem.catch_up();
 
         for index in 0..8u32 {
             assert_eq!(mem.read32(VRAM + index * 4), 0x1000_0000 + index, "word {index}");
@@ -1192,9 +1369,11 @@ mod tests {
         mem.write16(0x0400_00DE, 0x8400 | 0x1000);
 
         mem.tick(crate::ppu::FRAME_CYCLES / 4);
+        mem.catch_up();
         assert_eq!(mem.read32(PRAM), 0, "the beam is still on the screen");
 
         mem.tick(crate::ppu::FRAME_CYCLES);
+        mem.catch_up();
         assert_eq!(mem.read32(PRAM), 0xABCD_1234, "and now it has been past the bottom");
     }
 
@@ -1211,6 +1390,7 @@ mod tests {
         mem.write16(0x0400_00DC, 1);
         mem.write16(0x0400_00DE, 0x8400);
         mem.tick(1);
+        mem.catch_up();
 
         assert_eq!(mem.read8(0x0E00_0000), 0x44, "the low byte, as with any other write");
         assert_eq!(mem.read8(0x0E00_0001), 0, "and nothing beside it");
@@ -1228,6 +1408,7 @@ mod tests {
 
         assert!(!mem.interrupts().pending());
         mem.tick(crate::ppu::FRAME_CYCLES);
+        mem.catch_up();
         assert!(mem.interrupts().pending(), "the beam reached the bottom");
 
         // And the flag it set is retired the way every other one is.

@@ -150,6 +150,8 @@ impl Ppu {
         // The backdrop is the bottom, so a pixel showing it has nothing behind
         // it to be mixed with; a second copy of it down there would let the
         // backdrop blend with itself.
+        // Object memory once, before anything asks it four times over.
+        self.gather_sprites(line);
         // Which layers are allowed where, before any of them is drawn. It has
         // to come first: the sprites that cut the third region decide where
         // everything else may go, so they are walked before anything else is.
@@ -169,7 +171,7 @@ impl Ppu {
         // priority is not a tie for the sprite to lose.
         for priority in (0..4).rev() {
             self.draw_backgrounds_at(line, priority);
-            self.draw_sprites_at(line, priority);
+            self.draw_sprites_at(priority);
         }
 
         // And only now are there colours. Up to here the line has been layers,

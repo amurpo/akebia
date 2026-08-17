@@ -53,6 +53,7 @@ mod sprites;
 pub mod window;
 
 use blend::Pixel;
+use sprites::Sprite;
 
 use crate::interrupts::{Interrupts, Source};
 use crate::{SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -300,6 +301,10 @@ pub struct Ppu {
     /// Where the sprites that cut a region of their own cover this line. Only
     /// filled when a game asks for that region.
     obj_window: Box<[bool; SCREEN_WIDTH]>,
+    /// The sprites reaching the line being drawn, with the row of each, read
+    /// out of object memory once. Kept between lines only so that its capacity
+    /// is: it is cleared and refilled for every one.
+    on_this_line: Vec<(Sprite, usize)>,
 }
 
 impl Default for Ppu {
@@ -334,6 +339,7 @@ impl Ppu {
             winout: 0,
             allowed: Box::new([window::EVERYTHING; SCREEN_WIDTH]),
             obj_window: Box::new([false; SCREEN_WIDTH]),
+            on_this_line: Vec::new(),
         }
     }
 
@@ -377,6 +383,16 @@ impl Ppu {
     ///
     /// It steps from one boundary to the next rather than a cycle at a time, so
     /// handing it a whole frame's worth costs the same as handing it a line's.
+    /// How many cycles may pass before the beam reaches somewhere that matters.
+    ///
+    /// There are only two such places on a line — where the drawn part ends and
+    /// where the line does — which is what makes this worth asking at all: a
+    /// line is 1232 cycles and nothing happens in 1231 of them.
+    pub fn until_next(&self) -> u32 {
+        let boundary = if self.dot < HBLANK_AT { HBLANK_AT } else { LINE_CYCLES };
+        boundary - self.dot
+    }
+
     pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) -> Crossed {
         let mut crossed = Crossed::default();
         let mut left = cycles;

@@ -381,6 +381,12 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan, switched_on: &mut u16) -> O
         }
 
         let before = cpu.regs.pc();
+        // Whether it was asleep going in. A step that wakes it leaves the
+        // counter exactly where it was — nothing was fetched — and without this
+        // that reads as a branch to itself, which is how a suite says it has
+        // finished. A cartridge waking from its every halt would be reported as
+        // a cartridge that had ended.
+        let was_halted = mem.interrupts().halted();
 
         if step >= from && step < from + trace {
             let flag = |on: bool, name: char| if on { name } else { '-' };
@@ -415,7 +421,7 @@ fn run(cpu: &mut Cpu, mem: &mut Memory, plan: &Plan, switched_on: &mut u16) -> O
         // game waiting for the picture unit and about to carry on, and calling
         // it a finish stops the run three frames into a cartridge that was
         // working.
-        if cpu.regs.pc() == before && !mem.interrupts().halted() {
+        if cpu.regs.pc() == before && !mem.interrupts().halted() && !was_halted {
             return Outcome::Settled { at: before, steps: step + 1 };
         }
 

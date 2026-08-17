@@ -62,6 +62,26 @@ pub trait Bus {
 
     fn interrupts_mut(&mut self) -> &mut crate::interrupts::Interrupts;
 
+    /// The cycles the accesses since the last call cost, and forgets them.
+    ///
+    /// This is the shape the note above predicted. What a read costs is the
+    /// bus's business — the region, whether the address followed the last one,
+    /// and a register the game writes — so the bus counts as it goes and the
+    /// processor asks once an instruction is finished. A processor that tried
+    /// to work it out itself would need to know the memory map, which is the
+    /// dependency this trait exists to invert.
+    fn owed(&mut self) -> u32;
+
+    /// Moves the clock straight to the next thing that happens.
+    ///
+    /// For a halted processor, which has nothing to do until something wakes
+    /// it and no way of knowing when that is. Charging it a cycle at a time
+    /// works and is what it used to do, and it means a game that spends most of
+    /// its frame asleep — which is most games, most of the time — costs the
+    /// emulator a full pass of the machine for every one of those cycles to
+    /// learn that nothing has changed.
+    fn idle(&mut self);
+
     /// Reads without advancing the clock or causing side effects.
     ///
     /// For a debugger and a disassembler only. The emulator must never execute

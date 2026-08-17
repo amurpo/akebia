@@ -22,9 +22,11 @@ pub mod args;
 pub mod audio;
 pub mod bios;
 pub mod debug;
+pub mod gamepad;
 pub mod net;
 pub mod remote;
 pub mod roms;
+pub mod rate;
 pub mod recent;
 pub mod save;
 

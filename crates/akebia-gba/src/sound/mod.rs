@@ -324,6 +324,25 @@ impl Sound {
     /// with them is read the held sample over and over. That is not a waste: it
     /// is the only way an output sample can land between two of the timer's,
     /// which at 48 kHz against a game's 16 kHz is most of them.
+    /// How many cycles may pass before this wants asking again.
+    ///
+    /// The answer is the next output sample, because that is the only thing
+    /// here anybody can observe: the mixing is done once per sample and a
+    /// caller that asked more often would compute the same figure over and
+    /// over. Before this existed it was asked once a cycle — three hundred and
+    /// fifty times per sample — and it was a third of everything the emulator
+    /// did.
+    ///
+    /// The sequencer that shapes the four channels is the other clock in here,
+    /// and it is slower still, so the sample always wins.
+    pub fn until_next(&self) -> u32 {
+        let remaining = self.cycles_per_sample.saturating_sub(self.accumulator);
+        // Rounded up: a lump one cycle short would leave the sample unemitted
+        // and ask again for a single cycle, which is the loop this exists to
+        // avoid.
+        (((remaining + 0xFFFF) >> 16) as u32).max(1)
+    }
+
     pub fn tick(&mut self, cycles: u32) {
         self.run_channels(cycles);
         let (left, right) = self.mix();

@@ -27,6 +27,20 @@ eframe = { version = "0.35.0", default-features = false, features = [
     "x11",
 ] }
 
+# The controller. `winit` reports the keyboard, the mouse and the touchscreen
+# and nothing else — a gamepad is not a window event on any desktop — so the
+# device has to be read by something that goes and looks for it: evdev here,
+# XInput on Windows, IOKit on macOS. What `gilrs` adds on top of that is SDL's
+# controller database, which is the difference between "button 3 of device 0"
+# and "the east face button" for every pad anybody owns.
+#
+# It costs a system library: on Linux it links `libudev`, so whoever compiles
+# Akebia needs its headers (`systemd-devel` on Fedora). What ships is
+# `libudev.so.1`, which is part of systemd and therefore already on any desktop
+# — and unlike the OpenGL and X11 libraries it lands in the ELF, so rpm finds
+# the dependency by itself and `akebia.spec` says nothing about it.
+gilrs = "0.11.2"
+
 # Android reaches `winit`'s event loop through a different door: there is no
 # `main`, only the `android_main` that `NativeActivity` calls, and this feature
 # is what wires the two together. The alternative, `android-game-activity`, asks

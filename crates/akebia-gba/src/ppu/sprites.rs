@@ -130,7 +130,7 @@ enum Kind {
 /// picking bits out where they are used, is what keeps the drawing loops about
 /// pixels instead of about masks.
 #[derive(Clone, Copy)]
-struct Sprite {
+pub(super) struct Sprite {
     /// Where the top-left corner goes. Across is signed in nine bits, so this
     /// is kept as the raw value and wrapped as it is used.
     x: usize,
@@ -248,12 +248,21 @@ fn size(shape: u16, size: u16) -> Option<(usize, usize)> {
 }
 
 impl Ppu {
-    /// Every sprite of one priority, drawn over whatever is already there.
+    /// Reads object memory once and keeps the sprites that reach this line.
     ///
-    /// Counting down is the whole of the ordering rule: the lower the entry
-    /// number the nearer the sprite, so entry 0 is written last and covers the
-    /// rest.
-    pub(super) fn draw_sprites_at(&mut self, line: usize, priority: u16) {
+    /// # Why once
+    ///
+    /// Because the answer cannot change while a line is being drawn, and it was
+    /// being asked five times: once per priority, and once more for the window
+    /// mask. Each ask decoded all 128 entries — six bytes, a dozen fields, four
+    /// shapes and sizes — to use a handful of them, which came to some eighty
+    /// thousand decodings a frame for a list that is the same list every time.
+    ///
+    /// Nothing about what is drawn changes. The order is kept exactly: entries
+    /// are walked downwards so that entry 0 is drawn last and covers the rest,
+    /// and the collected list preserves that.
+    pub(super) fn gather_sprites(&mut self, line: usize) {
+        self.on_this_line.clear();
         if self.dispcnt & OBJ_ENABLED == 0 {
             return;
         }
@@ -261,41 +270,48 @@ impl Ppu {
             let Some(sprite) = Sprite::read(&self.oam[..], entry) else {
                 continue;
             };
-            // The ones that cut a window are not pictures and have no
-            // priority worth honouring: they were walked before the line
-            // started, into the mask that decided where everything else is
-            // allowed.
-            if sprite.cuts_window || sprite.priority != priority {
-                continue;
-            }
             let Some(row) = sprite.row_on(line) else {
                 continue;
             };
+            self.on_this_line.push((sprite, row));
+        }
+    }
+
+    /// Every sprite of one priority, drawn over whatever is already there.
+    ///
+    /// Counting down is the whole of the ordering rule: the lower the entry
+    /// number the nearer the sprite, so entry 0 is written last and covers the
+    /// rest. [`gather_sprites`](Self::gather_sprites) already collected them in
+    /// that order.
+    pub(super) fn draw_sprites_at(&mut self, priority: u16) {
+        for index in 0..self.on_this_line.len() {
+            // Copied out before the drawing borrows the machine. A sprite is a
+            // dozen small fields and copying one is cheaper than the borrow
+            // dance that would avoid it.
+            let (sprite, row) = self.on_this_line[index];
+            // The ones that cut a window are not pictures and have no priority
+            // worth honouring: they were walked before the line started, into
+            // the mask that decided where everything else is allowed.
+            if sprite.cuts_window || sprite.priority != priority {
+                continue;
+            }
             self.draw_sprite(&sprite, row, Target::Picture);
         }
     }
 
-    /// Walks the sprites that cut the third window region, marking where they
-    /// cover this line.
+    /// Marks where the sprites that cut the third window region cover this
+    /// line.
     ///
     /// It has to happen before anything is drawn, because what it marks is what
     /// decides whether the other layers are allowed at all. And it ignores
     /// priority entirely: this is not a sprite going in front of or behind
     /// anything, it is a shape.
-    pub(super) fn mark_window_sprites(&mut self, line: usize) {
-        if self.dispcnt & OBJ_ENABLED == 0 {
-            return;
-        }
-        for entry in (0..SPRITES).rev() {
-            let Some(sprite) = Sprite::read(&self.oam[..], entry) else {
-                continue;
-            };
+    pub(super) fn mark_window_sprites(&mut self) {
+        for index in 0..self.on_this_line.len() {
+            let (sprite, row) = self.on_this_line[index];
             if !sprite.cuts_window {
                 continue;
             }
-            let Some(row) = sprite.row_on(line) else {
-                continue;
-            };
             self.draw_sprite(&sprite, row, Target::WindowMask);
         }
     }

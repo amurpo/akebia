@@ -36,8 +36,10 @@ use eframe::egui::{
 };
 
 use crate::args::Args;
+use crate::gamepad::Gamepads;
 use crate::remote::{Remote, Trouble};
-use crate::{audio, debug, net, recent, remote, roms, save};
+use crate::rate::Rate;
+use crate::{audio, debug, gamepad, net, rate, recent, remote, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
 pub const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
@@ -91,6 +93,16 @@ const KEYS: [(Key, Pad); 10] = [
     (Key::A, Pad::L),
     (Key::S, Pad::R),
 ];
+
+/// What is being held down, on the keyboard and on any controller at once.
+///
+/// The two are ORed rather than chosen between. A controller does not take the
+/// keyboard away: whoever is holding one still has Escape, the menu and the
+/// capture key under their other hand, and a second player on the keyboard is
+/// nobody's mistake to correct.
+fn held(ctx: &egui::Context, pads: &Gamepads) -> [(Pad, bool); KEYS.len()] {
+    ctx.input(|i| KEYS.map(|(key, button)| (button, i.key_down(key) || pads.down(button))))
+}
 
 /// Opens the window and does not return until it is closed.
 pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
@@ -159,6 +171,9 @@ pub struct Settings {
     grayscale: bool,
     /// Window size as a multiple of 160×144, or `0` to fill the screen.
     scale: u32,
+    /// Show how fast the emulator is going. Off by default: it answers a
+    /// question nobody has while the game is running properly.
+    fps: bool,
 }
 
 impl Settings {
@@ -168,6 +183,7 @@ impl Settings {
             speaker_filter: !args.raw_audio,
             grayscale: args.grayscale,
             scale: args.scale,
+            fps: false,
         }
     }
 
@@ -270,6 +286,11 @@ struct App {
     connecting: Option<net::Pending>,
     /// The address box, open with whatever is in it.
     address: Option<String>,
+    /// The controllers, polled once a frame whatever is on screen.
+    pads: Gamepads,
+    /// The controller dialog, open, and which console button it is waiting to
+    /// hear a controller button for.
+    controls: Option<Wait>,
     /// What was typed there last. Going back to the same machine is far and away
     /// the commonest thing to want, and retyping an address is a poor way to
     /// spend the moment before a trade.
@@ -292,6 +313,13 @@ struct App {
     /// no list left to leave them on: the end of the menu bar is where the
     /// session already speaks from.
     notice: Option<String>,
+}
+
+/// The controller dialog while it is open: nothing, until a row is clicked and
+/// it is listening for the button that row is to be moved onto.
+#[derive(Default)]
+struct Wait {
+    button: Option<Pad>,
 }
 
 enum Screen {
@@ -346,6 +374,8 @@ impl App {
             textures,
             connecting: None,
             address: None,
+            pads: Gamepads::open(),
+            controls: None,
             last_address: String::new(),
             recent: recent::path().map(|list| recent::load(&list)).unwrap_or_default(),
             notice,
@@ -408,10 +438,14 @@ impl App {
         let mut listen = false;
         let mut dial = false;
         let mut give_up = false;
+        let mut configure = false;
         // A game chosen off the recent menu, and whether the menu was emptied.
         let mut replay: Option<PathBuf> = None;
         let mut forget = false;
         let mut settings = self.settings.clone();
+        // Read out here because the menu is drawn inside a closure that already
+        // holds the whole of `self`.
+        let pad = self.pads.active().map(str::to_owned);
 
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -455,6 +489,11 @@ impl App {
                         ui.radio_value(&mut settings.grayscale, false, "Game Boy green");
                         ui.radio_value(&mut settings.grayscale, true, "Greys");
                     });
+                    ui.separator();
+                    ui.checkbox(&mut settings.fps, "Frame rate").on_hover_text(
+                        "How many of the console's frames a second are being produced, \
+                         and the share of the time it takes to produce them",
+                    );
                 });
                 ui.menu_button("Audio", |ui| {
                     ui.checkbox(&mut settings.sound, "Sound");
@@ -466,6 +505,25 @@ impl App {
                         egui::Checkbox::new(&mut settings.speaker_filter, "Speaker filter"),
                     )
                     .on_hover_text("Rolls off the treble the way the console's speaker did");
+                });
+                ui.menu_button("Controls", |ui| {
+                    // Which controller is being listened to, said before
+                    // anything can be done to it: half of "the controller does
+                    // nothing" is Akebia never having seen one, and that is not
+                    // a question a dialog full of bindings answers.
+                    match &pad {
+                        Some(name) => {
+                            ui.add_enabled(false, egui::Button::new(name));
+                        }
+                        None => {
+                            ui.add_enabled(false, egui::Button::new("No controller"))
+                                .on_disabled_hover_text(
+                                    "Plug one in and it is picked up without restarting",
+                                );
+                        }
+                    }
+                    ui.separator();
+                    configure = ui.button("Configure…").clicked();
                 });
                 ui.menu_button("Link", |ui| {
                     connect = ui
@@ -504,10 +562,29 @@ impl App {
                 // covered by a full screen, cut short by some window managers
                 // and not looked at by anybody in the middle of a game: what it
                 // came to was choosing it and seeing nothing happen.
-                if let Some(said) = self.status() {
+                let said = self.status();
+                let speed = self.settings.fps.then(|| self.speed()).flatten();
+                if said.is_some() || speed.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(8.0);
-                        ui.label(RichText::new(said).color(ACCENT));
+                        if let Some(said) = said {
+                            ui.label(RichText::new(said).color(ACCENT));
+                        }
+                        // The rate goes left of whatever the session is saying,
+                        // and turns the colour of a warning once the emulator
+                        // has no room left — which is the moment it stops being
+                        // a curiosity and becomes the answer to "why is this
+                        // slow".
+                        if let Some(speed) = speed {
+                            let colour =
+                                if speed.flat_out() { ACCENT } else { Color32::GRAY };
+                            ui.label(RichText::new(speed.to_line()).small().color(colour))
+                                .on_hover_text(
+                                    "Console frames a second, and the share of real time \
+                                     spent producing them",
+                                );
+                            ui.add_space(8.0);
+                        }
                     });
                 }
             });
@@ -515,6 +592,9 @@ impl App {
 
         if settings != self.settings {
             self.apply(&settings, ctx);
+        }
+        if configure {
+            self.controls = Some(Wait::default());
         }
         if open_dialog {
             self.open_dialog();
@@ -570,6 +650,18 @@ impl App {
     /// yet" look identical from a chair —the game sits there in both— and the
     /// difference is exactly what a player needs to know before deciding the
     /// thing is broken.
+    /// How fast whichever session is running is going, if it has been going
+    /// long enough to say. Nothing on the list, where there is nothing being
+    /// emulated to measure.
+    fn speed(&self) -> Option<rate::Reading> {
+        match &self.screen {
+            Screen::Playing(session) => session.rate(),
+            Screen::Linked(pair) => pair.consoles[0].rate(),
+            Screen::Networked(wired) => wired.console.rate(),
+            Screen::List(_) => None,
+        }
+    }
+
     fn status(&self) -> Option<String> {
         // Waiting has to say *where*, because the other machine has to be told
         // an address and this is the end that knows it.
@@ -714,6 +806,115 @@ impl App {
         } else if !cancelled {
             // Still being typed into.
             self.address = Some(typed);
+        }
+    }
+
+    /// The controller's ten buttons, and what each one is on it.
+    ///
+    /// A dialog like the other two, and for the same reason: it opens over a
+    /// game without ending it, so a button that turned out to be the wrong one
+    /// can be moved where it was noticed rather than back at the list.
+    ///
+    /// Every change is kept the moment it is made — there is no accepting or
+    /// cancelling. A row shows what it is on; clicking it makes the row listen,
+    /// and the next button pressed on the controller is what it becomes.
+    fn controls_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut wait) = self.controls.take() else {
+            return;
+        };
+
+        // A button pressed while a row was listening is the answer that row was
+        // waiting for. Taken before the dialog is drawn so the new binding is
+        // what gets shown, rather than a frame of the old one.
+        if let (Some(button), Some(pressed)) = (wait.button, self.pads.take_caught()) {
+            self.pads.bind(button, pressed);
+            wait.button = None;
+        }
+
+        let mapping = self.pads.mapping();
+        let pad = self.pads.active().map(str::to_owned);
+        let mut stick = mapping.stick();
+        let mut listen_for = None;
+        let mut restore = false;
+        let mut done = false;
+
+        let response = egui::Modal::new(egui::Id::new("controls")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(RichText::new("Controller").size(18.0).strong());
+            ui.add_space(6.0);
+            let said = match &pad {
+                Some(name) => name.clone(),
+                None => "Nothing plugged in — these are what it would use".to_owned(),
+            };
+            ui.label(RichText::new(said).size(13.0).color(Color32::from_gray(0x9A)));
+            ui.add_space(10.0);
+
+            // Nothing can be changed with no controller plugged in, and the
+            // rows say so by being dead rather than by accepting a click and
+            // then listening for ever to a controller that is not there.
+            ui.add_enabled_ui(pad.is_some(), |ui| {
+                egui::Grid::new("bindings").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for button in Pad::ALL {
+                        ui.label(button.name());
+                        let listening = wait.button == Some(button);
+                        let label = if listening {
+                            RichText::new("press a button…").color(ACCENT)
+                        } else {
+                            RichText::new(gamepad::name_of(mapping.of(button)))
+                        };
+                        let row = egui::Button::new(label).min_size(Vec2::new(150.0, 0.0));
+                        if ui.add(row).clicked() {
+                            listen_for = Some(button);
+                        }
+                        ui.end_row();
+                    }
+                });
+
+                ui.add_space(10.0);
+                // Named after what it does and not after the hardware: whoever
+                // has to decide whether they want it is thinking about the
+                // cross, not about an axis pair.
+                ui.checkbox(&mut stick, "The left stick steers the cross too");
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "The face buttons are named by where they sit, because what is\n\
+                     printed on them is not the same on two controllers: South is\n\
+                     the one under the thumb, East the one to the right of it.",
+                )
+                .size(12.0)
+                .color(Color32::from_gray(0x8A)),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                done = ui.button("Done").clicked();
+                restore =
+                    ui.add_enabled(pad.is_some(), egui::Button::new("Defaults")).clicked();
+            });
+        });
+
+        if let Some(button) = listen_for {
+            // Clicking the row that is already listening stops it listening,
+            // which is the only way out of a row bound to a button that has
+            // since been unplugged.
+            wait.button = (wait.button != Some(button)).then_some(button);
+        }
+        if restore {
+            self.pads.restore();
+            wait.button = None;
+        }
+        if stick != mapping.stick() {
+            self.pads.use_stick(stick);
+        }
+        // While a row is listening nothing on screen changes until the
+        // controller is touched, and a controller is not something egui wakes up
+        // for. Without this the dialog would sit there until the mouse moved.
+        if wait.button.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if !done && !response.should_close() {
+            self.controls = Some(wait);
         }
     }
 
@@ -880,12 +1081,16 @@ impl eframe::App for App {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.collect_connection(ctx);
+        // Before anything returns early: the dialog is asking which button was
+        // just pressed, and it can be open over the list as well as over a
+        // game.
+        self.pads.poll();
         // A connection being made has to be looked at again soon, and nothing on
         // the list screen would otherwise ask for a repaint.
         if self.connecting.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        let dialog = self.dialog.is_some() || self.address.is_some();
+        let dialog = self.dialog.is_some() || self.address.is_some() || self.controls.is_some();
 
         if matches!(self.screen, Screen::List(_)) {
             return;
@@ -895,6 +1100,9 @@ impl eframe::App for App {
         // before anything else is read: `logic` runs before `ui`, so without
         // this the Escape that closes the dialog would first be taken here as
         // "back to the list", and the path being typed would drive the joypad.
+        // The controller dialog counts for the same reason twice over: the
+        // buttons being pressed at it are being pressed *at it*, and a game
+        // left running underneath would take every one of them as well.
         if dialog {
             match &mut self.screen {
                 Screen::Playing(session) => session.pause(),
@@ -920,16 +1128,16 @@ impl eframe::App for App {
         // below, once the borrow on the screen is over.
         let mut cable_ended = None;
 
-        // The keyboard is read here and not inside the session because the
-        // session no longer knows what a keyboard is. Right before emulating, so
-        // that the buttons are set when the game reads the joypad.
+        // The keyboard and the controller are read here and not inside the
+        // session because the session no longer knows what either of them is:
+        // it is handed ten buttons and told which are down. Right before
+        // emulating, so that they are set when the game reads the joypad.
+        let pressed = held(ctx, &self.pads);
         let (result, frames) = match &mut self.screen {
             Screen::Playing(session) => {
-                ctx.input(|i| {
-                    for (key, button) in KEYS {
-                        session.press(button, i.key_down(key));
-                    }
-                });
+                for (button, down) in pressed {
+                    session.press(button, down);
+                }
                 if ctx.input(|i| i.key_pressed(Key::D)) {
                     session.capture();
                 }
@@ -954,19 +1162,18 @@ impl eframe::App for App {
                 // Only the console holding the keyboard is told about the keys.
                 // The other one is not merely ignored, it is told nothing is
                 // pressed, which is not the same thing: see `swap_keyboard`.
-                ctx.input(|i| {
-                    for (key, button) in KEYS {
-                        pair.active().press(button, i.key_down(key));
-                    }
-                });
+                // The controller goes wherever the keyboard is: there is one of
+                // each and one player, and splitting them would leave whoever
+                // swapped playing two consoles at once.
+                for (button, down) in pressed {
+                    pair.active().press(button, down);
+                }
                 (pair.advance(ctx, &mut self.textures), pair.frames())
             }
             Screen::Networked(wired) => {
-                ctx.input(|i| {
-                    for (key, button) in KEYS {
-                        wired.console.press(button, i.key_down(key));
-                    }
-                });
+                for (button, down) in pressed {
+                    wired.console.press(button, down);
+                }
                 if ctx.input(|i| i.key_pressed(Key::D)) {
                     wired.console.capture();
                 }
@@ -1011,6 +1218,7 @@ impl eframe::App for App {
             self.change_folder(dir);
         }
         self.address_dialog(&ctx);
+        self.controls_dialog(&ctx);
 
         let request = match &mut self.screen {
             Screen::List(list) => list.ui(ui),
@@ -1701,6 +1909,15 @@ pub struct Session {
     pixels: Vec<Color32>,
     /// When the next frame is due to be emulated.
     next: Instant,
+    /// How fast this is actually going. Measured always and shown only when
+    /// asked: the cost is two clock readings a pass, and a meter that only ran
+    /// while it was on screen would have nothing to say for the first half
+    /// second after being switched on — which is exactly the half second
+    /// somebody switching it on wants to see.
+    rate: Rate,
+    /// When the last pass through the loop was, for the meter to measure
+    /// against.
+    last_pass: Instant,
     frames: u64,
     trace: Option<debug::LiveTrace>,
     captures: u32,
@@ -1743,6 +1960,8 @@ impl Session {
             audio: None,
             pixels: vec![Color32::BLACK; width * height],
             next: Instant::now(),
+            rate: Rate::default(),
+            last_pass: Instant::now(),
             frames: 0,
             trace: args.debug.then(debug::LiveTrace::new),
             captures: 0,
@@ -1798,6 +2017,8 @@ impl Session {
             audio: None,
             pixels: self.pixels.clone(),
             next: Instant::now(),
+            rate: Rate::default(),
+            last_pass: Instant::now(),
             frames: self.frames,
             trace: args.debug.then(debug::LiveTrace::new),
             captures: 0,
@@ -1895,6 +2116,7 @@ impl Session {
         let mut stalled = false;
         let mut failure = None;
 
+        let started = Instant::now();
         while self.next <= now && emulated < MAX_CATCH_UP {
             let Some(gb) = self.console.gameboy_mut() else {
                 break;
@@ -1920,6 +2142,7 @@ impl Session {
                 }
             }
         }
+        self.measure(emulated, started.elapsed());
         if emulated == MAX_CATCH_UP {
             self.next = Instant::now();
         }
@@ -1949,6 +2172,23 @@ impl Session {
     /// the session owing every frame the user spent reading.
     pub fn pause(&mut self) {
         self.next = Instant::now();
+        // And the meter forgets the pause with it, or a dialog left open would
+        // be reported as a machine that had slowed to nothing.
+        self.last_pass = Instant::now();
+        self.rate.interrupted();
+    }
+
+    /// Notes a pass of the loop for the meter.
+    fn measure(&mut self, emulated: u32, spent: Duration) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_pass);
+        self.last_pass = now;
+        self.rate.pass(elapsed, emulated, spent);
+    }
+
+    /// How fast this session is going, once there has been long enough to say.
+    pub fn rate(&self) -> Option<rate::Reading> {
+        self.rate.reading()
     }
 
     /// Presses or releases a joypad button.
@@ -1973,6 +2213,10 @@ impl Session {
         let now = Instant::now();
         let mut emulated = 0;
         let mut failure = None;
+        // What the emulating itself costs, measured around the loop and not
+        // around the whole pass: the rest of a pass is egui drawing a window,
+        // which is not what anybody is asking about.
+        let started = Instant::now();
         while self.next <= now && emulated < MAX_CATCH_UP {
             if let Err(f) = self.frame() {
                 failure = Some(f);
@@ -1981,6 +2225,7 @@ impl Session {
             self.next += period;
             emulated += 1;
         }
+        self.measure(emulated, started.elapsed());
         if emulated == MAX_CATCH_UP {
             // We are running really late: the debt is dropped instead of running
             // faster over the next few seconds.
@@ -2249,7 +2494,7 @@ impl Pair {
     /// one— and the abandoned game would spend the rest of the session walking
     /// into a wall.
     fn swap_keyboard(&mut self, settings: &Settings) {
-        for (_, button) in KEYS {
+        for button in Pad::ALL {
             self.consoles[self.focus].press(button, false);
         }
         self.focus ^= 1;
@@ -2314,6 +2559,7 @@ impl Pair {
         let mut emulated = 0;
         let mut failure = None;
 
+        let started = Instant::now();
         while self.next <= now && emulated < MAX_CATCH_UP {
             let [a, b] = &mut self.consoles;
             if let Err(f) = Session::linked_frame(a, b) {
@@ -2323,6 +2569,10 @@ impl Pair {
             self.next += period;
             emulated += 1;
         }
+        // A pair is one loop producing two consoles' frames, so the cost of
+        // both is charged to the one that is being watched.
+        let spent = started.elapsed();
+        self.consoles[0].measure(emulated, spent);
         if emulated == MAX_CATCH_UP {
             self.next = Instant::now();
         }

@@ -115,7 +115,7 @@ impl Ppu {
         let by_sprites = self.dispcnt & OBJ_WIN_ON != 0;
         if by_sprites {
             self.obj_window.fill(false);
-            self.mark_window_sprites(line);
+            self.mark_window_sprites();
         }
 
         let first = (self.dispcnt & WIN0_ON != 0).then(|| self.columns(0, line)).flatten();

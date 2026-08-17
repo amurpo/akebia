@@ -47,6 +47,11 @@ pub struct Cpu {
     pub regs: Registers,
 }
 
+/// What entering an exception costs, in cycles. The processor saves what it
+/// needs and refills its pipeline from the vector; there is no fetch here for
+/// the bus to have counted.
+const EXCEPTION: u32 = 3;
+
 impl Cpu {
     pub fn new() -> Self {
         Self { regs: Registers::new() }
@@ -85,12 +90,6 @@ impl Cpu {
     /// count comes from here and only this line changes. Pinned by a test, so
     /// that the test is what has to change with it.
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<(), Fault> {
-        // Before anything else, and before the halt below in particular. The
-        // machine goes on whether or not the processor does, and a halted
-        // processor that stopped the clock could never be woken by the picture
-        // unit it halted to wait for.
-        bus.tick(1);
-
         // Asked before the fetch, so the address left in the link register is
         // the instruction that has not run yet rather than the one that just
         // did. The processor's own mask is checked here and not in the
@@ -98,27 +97,45 @@ impl Cpu {
         // it.
         if bus.interrupts().pending() && !self.regs.irq_disabled() {
             arm::enter_irq(&mut self.regs);
+            bus.tick(EXCEPTION);
             return Ok(());
         }
 
         // Stopped until something arrives. Nothing is fetched and nothing
-        // advances, which is the whole point: a game halts to save the battery
-        // and to leave the picture unit the bus to itself.
+        // advances — but the clock does, and it has to: a game halts to save
+        // the battery and to leave the picture unit the bus to itself, and a
+        // halted processor that stopped the clock could never be woken by the
+        // thing it halted to wait for.
         if bus.interrupts().halted() {
+            bus.idle();
             return Ok(());
         }
 
         let addr = self.regs.pc();
 
-        if self.regs.thumb() {
+        let outcome = if self.regs.thumb() {
             let instruction = bus.read16(addr);
             self.regs.set_pc(addr.wrapping_add(2));
-            return thumb::execute(&mut self.regs, bus, addr, instruction);
-        }
+            thumb::execute(&mut self.regs, bus, addr, instruction)
+        } else {
+            let instruction = bus.read32(addr);
+            self.regs.set_pc(addr.wrapping_add(4));
+            arm::execute(&mut self.regs, bus, addr, instruction)
+        };
 
-        let instruction = bus.read32(addr);
-        self.regs.set_pc(addr.wrapping_add(4));
-        arm::execute(&mut self.regs, bus, addr, instruction)
+        // And now the bill. Every access the instruction made — its own fetch
+        // first of all — has been counted by the bus as it went, because what
+        // an access costs is the bus's to know and not the processor's. See
+        // [`Bus::owed`].
+        //
+        // Charging afterwards rather than before is the one thing that changed
+        // about the order here, and it is forced: the cost cannot be known
+        // until the instruction has said what it touched. The floor is kept for
+        // the instruction that touches nothing at all, which cannot happen —
+        // every one is fetched — but which would otherwise stop the clock.
+        let cost = bus.owed().max(1);
+        bus.tick(cost);
+        outcome
     }
 }
 
@@ -293,18 +310,61 @@ mod tests {
         assert_eq!(cpu.regs.pc(), BASE + 4, "awake, and running the next instruction");
     }
 
-    /// One cycle a step is the floor and not a measurement: nothing costs less,
-    /// and almost everything costs more. Pinned here so that when the real
-    /// numbers arrive this is the test that has to change with them.
+    /// An instruction costs what its memory costs, and the same instruction
+    /// costs different amounts in different places.
+    ///
+    /// This is what replaced "one cycle a step", which was a floor and said so.
+    /// Internal RAM answers a word in one cycle; a cartridge at its default
+    /// settings takes eight for the first word and six for each one after,
+    /// which is the whole reason a game copies the code it cares about into
+    /// internal RAM before running it.
     #[test]
-    fn a_step_charges_the_bus_one_cycle_whatever_the_instruction() {
+    fn an_instruction_costs_what_the_memory_it_came_out_of_costs() {
         let (mut cpu, mut mem) = machine();
-        assert_eq!(mem.cycles(), 0);
+        // The setup wrote to memory through the same bus, and those accesses
+        // are owed like any others; they are not this instruction's.
+        let _ = Bus::owed(&mut mem);
+        let before = mem.cycles();
 
-        for step in 1..=8 {
-            cpu.step(&mut mem).unwrap();
-            assert_eq!(mem.cycles(), step, "after {step} instructions");
-        }
+        cpu.step(&mut mem).unwrap();
+        assert_eq!(mem.cycles() - before, 1, "out of internal RAM, one cycle");
+
+        // The same instruction, out of a cartridge.
+        let mut mem = Memory::new();
+        mem.load_rom(&NOTHING_MUCH.to_le_bytes().repeat(8));
+        let _ = Bus::owed(&mut mem);
+        let mut cpu = Cpu::new();
+        cpu.regs.set_mode(Mode::System);
+        cpu.regs.set_pc(0x0800_0000);
+        let before = mem.cycles();
+
+        cpu.step(&mut mem).unwrap();
+        let first = mem.cycles() - before;
+        cpu.step(&mut mem).unwrap();
+        let next = mem.cycles() - before - first;
+
+        assert_eq!(first, 8, "a word out of a cartridge, opening a row");
+        assert_eq!(next, 6, "and the next word along, which follows on");
+    }
+
+    /// And the game can make its own cartridge faster, which is what `WAITCNT`
+    /// is for. A machine that ignored it would run every game at the speed of
+    /// the slowest cartridge ever made.
+    #[test]
+    fn the_game_can_buy_itself_a_faster_cartridge() {
+        let mut mem = Memory::new();
+        mem.load_rom(&NOTHING_MUCH.to_le_bytes().repeat(8));
+        let mut cpu = Cpu::new();
+        cpu.regs.set_mode(Mode::System);
+        cpu.regs.set_pc(0x0800_0000);
+
+        // The fastest first access and the fastest one after it.
+        mem.write16(crate::bus::timing::WAITCNT, 0b110);
+        let _ = Bus::owed(&mut mem);
+        let before = mem.cycles();
+        cpu.step(&mut mem).unwrap();
+
+        assert!(mem.cycles() - before < 8, "faster than the default eight");
     }
 
     /// And a halted processor is charged too. It has to be: the thing it is
@@ -320,7 +380,11 @@ mod tests {
             cpu.step(&mut mem).unwrap();
         }
         assert_eq!(cpu.regs.pc(), BASE, "the processor went nowhere");
-        assert_eq!(mem.cycles(), 10, "and the machine went on regardless");
+        // Each step went straight to the next thing that could wake it rather
+        // than a cycle at a time: there is nothing in between for a halted
+        // processor to miss, and asking the whole machine once per cycle to be
+        // told nothing had changed was most of what this emulator did.
+        assert!(mem.cycles() > 10, "the machine went on, in strides: {}", mem.cycles());
     }
 
     /// The whole reason the clock had to start moving: a game asks to be told
@@ -349,6 +413,12 @@ mod tests {
 
         assert!(!mem.interrupts().halted(), "the beam woke it");
         assert_eq!(mem.ppu().vcount(), 160, "at the line below the screen");
+
+        // Waking and taking the interrupt are two steps and not one. The clock
+        // moves at the end of a step now — the cost of an instruction cannot be
+        // known before it has run — so the beam arrives as the halted step
+        // finishes and the handler is entered by the one after it.
+        cpu.step(&mut mem).unwrap();
         assert_eq!(cpu.regs.pc(), 0x18, "and it went to the handler");
     }
 

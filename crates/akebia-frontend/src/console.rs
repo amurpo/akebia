@@ -47,6 +47,49 @@ pub enum Pad {
 }
 
 impl Pad {
+    /// Every button, in the order everything that keeps one flag per button
+    /// counts in.
+    ///
+    /// The order is the declaration's, and [`Pad::index`] relies on that. The
+    /// test below pins the two together: a button inserted in the middle of the
+    /// enum without being inserted here as well would silently give the
+    /// controller somebody else's d-pad.
+    pub const ALL: [Pad; 10] = [
+        Pad::Up,
+        Pad::Down,
+        Pad::Left,
+        Pad::Right,
+        Pad::A,
+        Pad::B,
+        Pad::Start,
+        Pad::Select,
+        Pad::L,
+        Pad::R,
+    ];
+
+    /// Where this button sits in [`Pad::ALL`], for whoever keeps an array of
+    /// them.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// What it is called on the machine, which is what a person remapping it
+    /// reads.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Pad::Up => "Up",
+            Pad::Down => "Down",
+            Pad::Left => "Left",
+            Pad::Right => "Right",
+            Pad::A => "A",
+            Pad::B => "B",
+            Pad::Start => "Start",
+            Pad::Select => "Select",
+            Pad::L => "L",
+            Pad::R => "R",
+        }
+    }
+
     /// What this means to a Game Boy, if anything.
     fn on_gameboy(self) -> Option<akebia_core::Button> {
         use akebia_core::Button as Gb;
@@ -223,6 +266,17 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// [`Pad::index`] is the enum's own discriminant, so the list and the
+    /// declaration have to say the same thing. They are two places and nothing
+    /// but this holds them together: an array of ten flags indexed by a button
+    /// that moved would answer for the button beside it.
+    #[test]
+    fn a_button_knows_where_it_sits_in_the_list() {
+        for (i, pad) in Pad::ALL.into_iter().enumerate() {
+            assert_eq!(pad.index(), i, "{pad:?} is not where the list has it");
+        }
+    }
+
     #[test]
     fn the_shoulders_are_the_advances_alone() {
         assert_eq!(Pad::L.on_gameboy(), None);
@@ -234,20 +288,8 @@ mod tests {
     /// list was drawn from.
     #[test]
     fn every_button_reaches_the_advance() {
-        let all = [
-            Pad::Up,
-            Pad::Down,
-            Pad::Left,
-            Pad::Right,
-            Pad::A,
-            Pad::B,
-            Pad::Start,
-            Pad::Select,
-            Pad::L,
-            Pad::R,
-        ];
         let mut seen = Vec::new();
-        for pad in all {
+        for pad in Pad::ALL {
             let button = pad.on_advance();
             assert!(!seen.contains(&button), "{pad:?} collides with something");
             seen.push(button);

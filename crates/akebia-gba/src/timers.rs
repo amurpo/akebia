@@ -140,6 +140,29 @@ impl Timers {
     /// In order, and that matters: a cascading timer counts the one below it
     /// coming round, so the one below has to have been moved first. Going the
     /// other way would delay every cascade by a tick.
+    /// How many cycles may pass before one of these comes round.
+    ///
+    /// Only coming round is observable from outside: it is what raises an
+    /// interrupt, what drives the timer above, and what clocks a sound queue.
+    /// The counter climbing in between is not — anything that reads one settles
+    /// the clock first.
+    ///
+    /// A cascading timer is not asked. It moves when the one below it comes
+    /// round, so the one below is already the answer.
+    pub fn until_next(&self) -> u32 {
+        let mut soonest = u32::MAX;
+        for (index, timer) in self.channels.iter().enumerate() {
+            if !timer.enabled() || timer.cascades(index) {
+                continue;
+            }
+            let period = timer.period();
+            let until_step = period - (timer.spare % period);
+            let steps_left = u32::from(u16::MAX - timer.counter);
+            soonest = soonest.min(until_step + steps_left * period);
+        }
+        soonest
+    }
+
     pub fn tick(&mut self, cycles: u32, irq: &mut Interrupts) -> u8 {
         let mut came_round_bits = 0u8;
         let mut from_below = 0;
