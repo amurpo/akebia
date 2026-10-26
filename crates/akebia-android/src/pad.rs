@@ -5,21 +5,50 @@
 //! egui hands out one pointer, because a mouse is one. A console needs at least
 //! two at once —nobody runs and jumps otherwise— so the raw touch events are
 //! read instead: each finger arrives with an identifier that lasts from the
-//! moment it lands to the moment it lifts, and what this module keeps is the set
-//! of positions currently on the glass. Which buttons those positions fall on is
-//! then a question of geometry, and a finger that slides from one button onto
-//! the next presses the next one, which is what a thumb on real plastic does.
+//! moment it lands to the moment it lifts, and what this module keeps is where
+//! every finger on the glass came down and where it is now. Which buttons those
+//! positions fall on is then a question of geometry, and a finger that slides
+//! from one button onto the next presses the next one, which is what a thumb on
+//! real plastic does.
+//!
+//! The cross is the exception, and it is why the landing is kept at all. A thumb
+//! leaning on a direction drifts outwards —leaning is drifting— and a cross read
+//! only by where the finger is this instant lets go the moment it passes the
+//! edge: a walk that stops for no reason the player can see. Whichever finger
+//! came down on the cross goes on steering it until it lifts, and presses
+//! nothing else on its way.
 
 use std::collections::HashMap;
 
-use akebia_core::Button;
 use egui::{
-    Align2, Color32, Context, Event, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, TouchPhase,
-    Vec2,
+    Align2, Color32, Context, Event, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+    TouchPhase, Vec2,
 };
 
+/// Every button painted on the glass.
+///
+/// Its own type, for the same reason the frontend has one: neither core's
+/// covers both machines. The older machine's `Button` has no shoulders — a Game
+/// Boy has none to have — and this module is compiled on a desktop as well, so
+/// that its arithmetic can be tested away from a telephone, where the
+/// frontend's own ten-button type is not a dependency to be named. So the glass
+/// says what the glass paints, and `ui` translates the one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Up,
+    Down,
+    Left,
+    Right,
+    A,
+    B,
+    Start,
+    Select,
+    L,
+    R,
+}
+
 /// The order everything in this module counts in.
-pub const BUTTONS: [Button; 8] = [
+pub const BUTTONS: [Button; 10] = [
     Button::Up,
     Button::Down,
     Button::Left,
@@ -28,14 +57,27 @@ pub const BUTTONS: [Button; 8] = [
     Button::B,
     Button::Start,
     Button::Select,
+    Button::L,
+    Button::R,
 ];
 
-/// How far from the middle of the cross a finger has to be for the direction to
-/// count, as a fraction of its arm.
+/// How much further a finger already out along one arm has to lean before the
+/// arm beside it comes in too, as a share of how far out it is.
 ///
-/// Without a dead zone the exact centre would fire two opposite directions at
-/// once, and a thumb resting in the middle would jitter between them.
-const DEAD_ZONE: f32 = 0.22;
+/// At nought the cross is a plain board: a stem in x and a stem in y, and every
+/// corner square answers both. At one it has no diagonals left at all —whichever
+/// axis is further ahead silences the other— and in between the wedge narrows.
+/// The point of it is that near the middle the cross measures a lean in
+/// millimetres, as a board does, and away from the middle it measures one in
+/// degrees, as a thumb means it: out at the end of an arm a hair of drift is
+/// drift, not a diagonal.
+///
+/// The rule is EmuFramework's, out of `VControllerDPad::getInput` — GBC.emu and
+/// the rest of Robert Broglia's emulators, GPL-3.0-or-later, which is this
+/// program's own licence. The idea is theirs and the arithmetic below is written
+/// afresh; what Akebia adds is drawing the wedge the rule carves, so that the
+/// two go on saying the same thing at any setting.
+const DIAGONAL_BIAS: f32 = 0.30;
 
 /// Room left between a cluster of buttons and the edge of the glass.
 const MARGIN: f32 = 16.0;
@@ -54,6 +96,9 @@ const SCREEN_MIN: f32 = 144.0 * 2.0;
 const FACE: Color32 = Color32::from_rgb(0x26, 0x26, 0x2C);
 const EDGE: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x42);
 const LABEL: Color32 = Color32::from_rgb(0x9A, 0x9A, 0xA6);
+/// The corners of the cross, a shade darker than its arms: they belong to the
+/// pad and they light like it, but the plus is what the eye should find first.
+const CORNER: Color32 = Color32::from_rgb(0x1D, 0x1D, 0x22);
 
 /// Where every control ended up, once the space left over was divided.
 pub struct Pad {
@@ -65,8 +110,21 @@ pub struct Pad {
     b: Rect,
     start: Rect,
     select: Rect,
+    /// The two shoulders, which only the Advance has. They are painted whatever
+    /// is running: a Game Boy handed one does nothing, which is what a Game Boy
+    /// does when a button it has not got is pressed, and controls that appear
+    /// and vanish with the cartridge would be worse than two that are sometimes
+    /// quiet.
+    l: Rect,
+    r: Rect,
     /// The way back to the list.
     pub menu: Rect,
+    /// The cable: waiting for another machine, or going to one.
+    ///
+    /// Next to the way out and as quiet, for the same reason. A telephone has no
+    /// menu bar to hide it in, and the two things one reaches for while a game
+    /// is running are leaving it and joining somebody.
+    pub link: Rect,
 }
 
 impl Pad {
@@ -96,16 +154,35 @@ impl Pad {
         // The row of small buttons is taken off the bottom first: it is the one
         // thing that must not move when the rest grows.
         let pills_row = (band.height() * 0.16).clamp(40.0, 58.0);
+        // And the shoulders off the top, out at either edge. Not at the top of
+        // the telephone, which is where the hardware has them and where no
+        // thumb goes while a game is running: at the top of the controls, a
+        // reach above the cross and above the buttons. It is where RetroArch's
+        // own Advance overlay puts them, at a tenth of the width in from each
+        // side and a little past three fifths of the way down the glass, and
+        // where every emulator that paints a pair has settled.
+        //
+        // They take their strip out of the band and not out of the picture, and
+        // what is left over is what the cross and the buttons then divide.
+        let shoulder_row = shoulder_height(band.height());
         let play = Rect::from_min_max(
-            band.min,
+            Pos2::new(band.left(), band.top() + shoulder_row + band.height() * 0.03),
             Pos2::new(band.right(), band.bottom() - pills_row - band.height() * 0.06),
         );
+        let (l, r) = shoulders(band, band.top(), shoulder_row);
         // Both clusters hang off their own edge instead of being centred in half
         // the width each. Centred, they grow towards each other: on a telephone
         // 393 points wide the cross and the B button end up overlapping by a few
         // points, and a thumb landing in between presses both.
         let half = play.width() * 0.5;
-        let cross_side = (half * 0.80).min(play.height() * 0.80).clamp(120.0, 240.0);
+        // The floor of a hundred and twenty is what a cross needs to be steered
+        // with a thumb, and the last `min` is what happens when the telephone
+        // has not got it to give: on a short screen the cross takes the room
+        // there is rather than the room it wants, because a cross that
+        // overflowed its own share would reach up under the shoulder above it
+        // and press two things with one thumb.
+        let cross_side =
+            (half * 0.80).min(play.height() * 0.80).clamp(120.0, 240.0).min(play.height());
         let button = (half * 0.36).min(play.height() * 0.34).clamp(62.0, 104.0);
 
         let cross =
@@ -115,7 +192,18 @@ impl Pad {
             button,
         );
         let (start, select) = pills(band, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area) }
+        Self {
+            screen,
+            cross,
+            a,
+            b,
+            start,
+            select,
+            l,
+            r,
+            menu: menu_corner(area, 0),
+            link: menu_corner(area, 1),
+        }
     }
 
     fn turned(area: Rect) -> Self {
@@ -127,9 +215,25 @@ impl Pad {
         let (left, rest) = split_left(area, side);
         let (screen, right) = split_left(rest, rest.width() - side);
 
-        let cross_side = (side * 0.80).min(area.height() * 0.62).clamp(120.0, 250.0);
-        let button = (side * 0.36).min(area.height() * 0.30).clamp(62.0, 108.0);
-        let height = area.center().y - side * 0.06;
+        // Turned, the top of each column **is** the top corner of the glass,
+        // which is where the index fingers land when a telephone is held like a
+        // controller — and where the hardware keeps them. They are dropped by
+        // the height of the way out, which lives in that corner: a finger
+        // reaching for R and overshooting must not find the button that ends
+        // the game.
+        let quiet = menu_corner(area, 0);
+        let shoulder_row = shoulder_height(area.height());
+        let (l, r) = shoulders(area, quiet.bottom() + MARGIN * 0.5, shoulder_row);
+
+        // What is left once the shoulders have their strip, and it is what the
+        // hands then divide. Measuring the clusters against the whole window
+        // instead put a cross tall enough to reach up under L: on a landscape
+        // telephone the height is the scarce direction, and everything that
+        // takes some of it has to take it from the same total.
+        let hands = Rect::from_min_max(Pos2::new(area.left(), r.bottom()), area.max);
+        let cross_side = (side * 0.80).min(hands.height() * 0.80).clamp(120.0, 250.0);
+        let button = (side * 0.36).min(hands.height() * 0.38).clamp(62.0, 108.0);
+        let height = hands.center().y - side * 0.06;
 
         let cross = square(Pos2::new(left.left() + MARGIN + cross_side * 0.5, height), cross_side);
         let (a, b) = action_buttons(
@@ -140,34 +244,94 @@ impl Pad {
         // Underneath the picture, which is the only strip of nothing left.
         let pills_row = (area.height() * 0.12).clamp(38.0, 54.0);
         let (start, select) = pills(screen, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area) }
+        Self {
+            screen,
+            cross,
+            a,
+            b,
+            start,
+            select,
+            l,
+            r,
+            menu: quiet,
+            link: menu_corner(area, 1),
+        }
     }
 
-    /// Which of the eight are held down by the fingers currently on the glass.
-    pub fn pressed(&self, touches: &Touches) -> [bool; 8] {
-        let mut down = [false; 8];
-        for point in touches.positions() {
-            if self.cross.contains(point) {
-                let arm = self.cross.width() * 0.5;
-                let offset = point - self.cross.center();
-                down[0] |= offset.y < -arm * DEAD_ZONE;
-                down[1] |= offset.y > arm * DEAD_ZONE;
-                down[2] |= offset.x < -arm * DEAD_ZONE;
-                down[3] |= offset.x > arm * DEAD_ZONE;
+    /// Half the width of an arm of the cross, which is the one number both the
+    /// reading and the painting are made of.
+    ///
+    /// Further than this from the middle in x is left or right, further in y is
+    /// up or down, and further in both is the two of them at once: nine squares
+    /// of a noughts and crosses board, of which the middle one says nothing,
+    /// four are directions and four are diagonals. `DIAGONAL_BIAS` then bends the
+    /// four lines between them outwards, and `corner` bends the painting with
+    /// them.
+    ///
+    /// The two used to disagree, and that is what made a diagonal so hard to
+    /// mean. Each arm was painted a sixth of the cross wide to either side and
+    /// read at a ninth, so the outer third of every arm answered with the
+    /// diagonal beside it: aiming at the middle of the right arm and landing a
+    /// little high walked the player up and to the right. And the diagonals, for
+    /// their part, took three fifths of the whole cross and were painted nowhere
+    /// at all — a player hunting for one had nothing to aim at but the gap
+    /// between two arms.
+    fn stem(&self) -> f32 {
+        self.cross.width() / 6.0
+    }
+
+    /// Which of the ten are held down by the fingers currently on the glass.
+    pub fn pressed(&self, touches: &Touches) -> [bool; 10] {
+        let mut down = [false; 10];
+        let stem = self.stem();
+        for finger in touches.fingers() {
+            // Either it came down on the cross —and then it is the cross's until
+            // it lifts, wherever it has wandered to since— or it is over it now,
+            // having slid there off something else.
+            if self.cross.contains(finger.landed) || self.cross.contains(finger.at) {
+                let offset = finger.at - self.cross.center();
+                // Each axis waits out its own stem, and then a share of however
+                // far past its stem the other axis has already gone: `lean` is
+                // what x has to beat, given y, and the other way about.
+                let lean = |other: f32| stem + (other.abs() - stem).max(0.0) * DIAGONAL_BIAS;
+                down[0] |= offset.y < -lean(offset.x);
+                down[1] |= offset.y > lean(offset.x);
+                down[2] |= offset.x < -lean(offset.y);
+                down[3] |= offset.x > lean(offset.y);
+                // A thumb steering does not also press whatever it has drifted
+                // over: the two clusters are a hand apart and reaching from one
+                // to the other is not a thing a player does by accident.
+                continue;
             }
-            down[4] |= inside_circle(self.a, point);
-            down[5] |= inside_circle(self.b, point);
-            down[6] |= self.start.contains(point);
-            down[7] |= self.select.contains(point);
+            down[4] |= inside_circle(self.a, finger.at);
+            down[5] |= inside_circle(self.b, finger.at);
+            down[6] |= self.start.contains(finger.at);
+            down[7] |= self.select.contains(finger.at);
+            down[8] |= self.l.contains(finger.at);
+            down[9] |= self.r.contains(finger.at);
         }
         down
     }
 
     /// Draws them, lit where a finger is.
-    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32) {
+    pub fn paint(&self, painter: &Painter, down: &[bool; 10], accent: Color32, cable: Cable) {
         let arm = self.cross.width() / 3.0;
         let centre = self.cross.center();
         let lit = |on: bool| if on { accent } else { FACE };
+
+        // The corners go down first, so the arms lie over the ends of them. Each
+        // bridges the two arms it sits between and lights when both of those do,
+        // which is what turns a diagonal from a bare patch of glass into
+        // something a thumb can be aimed at and watched to answer.
+        for (one, other, towards) in [
+            (0usize, 3usize, Vec2::new(1.0, -1.0)),
+            (1, 3, Vec2::new(1.0, 1.0)),
+            (1, 2, Vec2::new(-1.0, 1.0)),
+            (0, 2, Vec2::new(-1.0, -1.0)),
+        ] {
+            let face = if down[one] && down[other] { accent } else { CORNER };
+            painter.add(Shape::convex_polygon(corner(self.cross, towards), face, Stroke::NONE));
+        }
 
         // The cross is four arms and not one shape so that each can light up on
         // its own: pressing up must not look like pressing the whole thing.
@@ -187,23 +351,56 @@ impl Pad {
         circle(painter, self.b, "B", down[5], accent);
         pill(painter, self.start, "START", down[6], accent);
         pill(painter, self.select, "SELECT", down[7], accent);
+        // The same pill as Start and Select, which is what a shoulder looks
+        // like: a bar with a letter in it. Nothing says they do nothing on a
+        // Game Boy, and nothing needs to — a button that answers on one
+        // cartridge and not on the next is the cartridge's difference, not the
+        // interface's.
+        pill(painter, self.l, "L", down[8], accent);
+        pill(painter, self.r, "R", down[9], accent);
 
-        // The way out, kept quiet: it is not something one reaches for while
-        // playing, and a bright button there would be pressed by accident.
+        // The way out and the cable, kept quiet: neither is something one reaches
+        // for while playing, and bright buttons there would be pressed by
+        // accident.
         painter.rect_filled(self.menu, 6.0, FACE);
-        painter.text(
-            self.menu.center(),
-            Align2::CENTER_CENTER,
-            "≡",
-            FontId::proportional(self.menu.height() * 0.6),
-            LABEL,
-        );
+        strokes(painter, &menu_icon(self.menu), self.menu, LABEL);
+
+        // Three states and not two. Filled the moment the button was pressed, it
+        // said "connecting" and "trading with somebody" in exactly the same red,
+        // and a link that never came up looked from the outside like one that
+        // had: the button went red at the start and stayed red for ever.
+        let (face, icon) = match cable {
+            Cable::Out => (FACE, LABEL),
+            Cable::Joining => (FACE, accent),
+            Cable::In => (accent, FACE),
+        };
+        painter.rect_filled(self.link, 6.0, face);
+        strokes(painter, &link_icon(self.link), self.link, icon);
     }
+}
+
+/// What the cable button has to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cable {
+    /// Nothing plugged in.
+    Out,
+    /// A connection being made, or made and not yet answered. Either way the
+    /// other console is not trading anything yet.
+    Joining,
+    /// Joined, greeted, and carrying bytes.
+    In,
+}
+
+/// One finger, from where it came down to where it is now.
+#[derive(Clone, Copy)]
+struct Touch {
+    landed: Pos2,
+    at: Pos2,
 }
 
 /// The fingers currently on the glass.
 #[derive(Default)]
-pub struct Touches(HashMap<u64, Pos2>);
+pub struct Touches(HashMap<u64, Touch>);
 
 impl Touches {
     /// Takes in what happened since the last frame.
@@ -214,9 +411,8 @@ impl Touches {
                     continue;
                 };
                 match phase {
-                    TouchPhase::Start | TouchPhase::Move => {
-                        self.0.insert(id.0, *pos);
-                    }
+                    TouchPhase::Start => self.land(id.0, *pos),
+                    TouchPhase::Move => self.slide(id.0, *pos),
                     TouchPhase::End | TouchPhase::Cancel => {
                         self.0.remove(&id.0);
                     }
@@ -225,7 +421,20 @@ impl Touches {
         });
     }
 
-    fn positions(&self) -> impl Iterator<Item = Pos2> + '_ {
+    /// A finger coming down.
+    fn land(&mut self, id: u64, at: Pos2) {
+        self.0.insert(id, Touch { landed: at, at });
+    }
+
+    /// A finger already down, moved. One nobody saw land is taken to have landed
+    /// where it is now: `clear` throws the fingers away in the middle of a
+    /// gesture —that is what it is for— and the moves that follow are all that
+    /// is left of it.
+    fn slide(&mut self, id: u64, to: Pos2) {
+        self.0.entry(id).or_insert(Touch { landed: to, at: to }).at = to;
+    }
+
+    fn fingers(&self) -> impl Iterator<Item = Touch> + '_ {
         self.0.values().copied()
     }
 
@@ -256,6 +465,30 @@ fn square(centre: Pos2, side: f32) -> Rect {
     Rect::from_center_size(centre, Vec2::splat(side))
 }
 
+/// The wedge filling one corner of the cross, between the two arms it joins.
+///
+/// Its point is the corner of the middle square, where the reading stops calling
+/// a finger one direction and starts calling it two; its outer edge chamfers the
+/// corner of the frame, which leaves the whole an octagon: eight faces for the
+/// eight things a cross can say. `towards` is which of the four corners, as a
+/// pair of signs.
+///
+/// The two long sides are the very lines `pressed` draws, `DIAGONAL_BIAS` and
+/// all: at nought they lie flat along the arms and the wedge is the widest it
+/// gets, and as the bias rises they close in on each other and the wedge narrows
+/// to match. Not a point of what is painted here falls outside what answers the
+/// diagonal, at any setting.
+fn corner(cross: Rect, towards: Vec2) -> Vec<Pos2> {
+    let stem = cross.width() / 6.0;
+    // How far the wedge would reach along an arm if the bias were nought, and
+    // then where the two sides actually cut the chamfer instead.
+    let span = cross.width() * 0.5 - stem;
+    let long = span / (1.0 + DIAGONAL_BIAS);
+    let short = long * DIAGONAL_BIAS;
+    let at = |x: f32, y: f32| cross.center() + Vec2::new(x * towards.x, y * towards.y);
+    vec![at(stem, stem), at(stem + long, stem + short), at(stem + short, stem + long)]
+}
+
 /// A above and to the right of B, the way they sit on the console itself: the
 /// thumb rolls between them instead of reaching across.
 fn action_buttons(centre: Pos2, diameter: f32) -> (Rect, Rect) {
@@ -272,6 +505,37 @@ fn action_reach(diameter: f32) -> f32 {
     diameter * 0.62 + diameter * 0.5
 }
 
+/// How tall a shoulder is, given the strip it is being laid into.
+///
+/// A twelfth of it, and never less than a finger. The floor is what matters:
+/// RetroArch's overlay draws them at about a thirtieth of the screen's height,
+/// which on a telephone is some twenty-five points — under half a fingertip,
+/// and a control that cannot be hit is worse than one that is not there.
+fn shoulder_height(span: f32) -> f32 {
+    (span * 0.12).clamp(44.0, 62.0)
+}
+
+/// The two shoulders, hanging off either edge of `area` at the given height.
+///
+/// Wide and flat, because a shoulder **is** a bar: on the machine it runs along
+/// the top edge, and every emulator that paints a pair paints them long. The
+/// proportion is RetroArch's own — a little over three times as wide as tall —
+/// and out at the edge rather than in towards the middle, where the hand
+/// already is.
+fn shoulders(area: Rect, top: f32, height: f32) -> (Rect, Rect) {
+    // The floor is the one that does the work, and it is not about the width of
+    // the telephone but about the height of the bar: on a tall screen the strip
+    // is a comfortable fifty points deep, and a bar as wide as a quarter of a
+    // narrow window comes out very nearly square — which is a button, not a
+    // shoulder.
+    let width = (area.width() * 0.30).clamp(120.0, 220.0).min(area.width() * 0.5 - MARGIN * 2.0);
+    let size = Vec2::new(width, height);
+    (
+        Rect::from_min_size(Pos2::new(area.left() + MARGIN, top), size),
+        Rect::from_min_size(Pos2::new(area.right() - MARGIN - width, top), size),
+    )
+}
+
 /// START and SELECT, side by side along the bottom edge of whatever they are
 /// given: small, because they are pressed between games and not during them.
 fn pills(band: Rect, height: f32) -> (Rect, Rect) {
@@ -284,9 +548,65 @@ fn pills(band: Rect, height: f32) -> (Rect, Rect) {
     )
 }
 
-fn menu_corner(area: Rect) -> Rect {
+/// The `index`-th small button along the top right corner, counting inwards.
+fn menu_corner(area: Rect, index: usize) -> Rect {
     let side = 44.0;
-    Rect::from_min_size(Pos2::new(area.right() - side, area.top()), Vec2::splat(side))
+    let gap = 6.0;
+    let offset = (side + gap) * index as f32;
+    Rect::from_min_size(Pos2::new(area.right() - side - offset, area.top()), Vec2::splat(side))
+}
+
+/// The three lines of a menu.
+///
+/// Drawn and not written, and that is the whole point of these two. What was
+/// here before was `≡` and `⇄`, one character each and no code at all — and both
+/// came out as the empty box a font puts in place of a character it does not
+/// carry. egui brings its own fonts and neither of those two symbols is in any
+/// of them; Android's are never asked. Lines and arrowheads are there on every
+/// telephone because they are drawn by hand.
+fn menu_icon(rect: Rect) -> Vec<[Pos2; 2]> {
+    let centre = rect.center();
+    let half = rect.width() * 0.22;
+    let gap = rect.height() * 0.15;
+    [-1.0, 0.0, 1.0]
+        .into_iter()
+        .map(|step| {
+            let y = centre.y + gap * step;
+            [Pos2::new(centre.x - half, y), Pos2::new(centre.x + half, y)]
+        })
+        .collect()
+}
+
+/// Two arrows passing each other, which is what a cable between two consoles is
+/// for: something goes each way.
+fn link_icon(rect: Rect) -> Vec<[Pos2; 2]> {
+    let centre = rect.center();
+    let half = rect.width() * 0.22;
+    let gap = rect.height() * 0.12;
+    let head = rect.width() * 0.10;
+
+    let mut lines = Vec::with_capacity(6);
+    // The upper one points right and the lower one left, mirrored through the
+    // middle: `towards` is which way each is going.
+    for (step, towards) in [(-1.0, 1.0), (1.0, -1.0)] {
+        let y = centre.y + gap * step;
+        let tip = Pos2::new(centre.x + half * towards, y);
+        lines.push([Pos2::new(centre.x - half * towards, y), tip]);
+        // The head as two strokes off the tip and not as a filled triangle: at
+        // this size a triangle is a handful of pixels and comes out a blob.
+        for slant in [-1.0, 1.0] {
+            lines.push([tip, Pos2::new(tip.x - head * towards, tip.y + head * slant)]);
+        }
+    }
+    lines
+}
+
+/// Draws an icon, with a line thick enough to be seen on glass.
+fn strokes(painter: &Painter, lines: &[[Pos2; 2]], rect: Rect, colour: Color32) {
+    let stroke = Stroke::new((rect.height() * 0.055).max(1.5), colour);
+    for line in lines {
+        painter.line_segment(*line, stroke);
+    }
 }
 
 fn inside_circle(rect: Rect, point: Pos2) -> bool {
@@ -346,14 +666,17 @@ mod tests {
     }
 
     /// Every control, as a rectangle, with the name to complain about.
-    fn controls(pad: &Pad) -> [(&'static str, Rect); 6] {
+    fn controls(pad: &Pad) -> [(&'static str, Rect); 9] {
         [
             ("cross", pad.cross),
             ("A", pad.a),
             ("B", pad.b),
             ("start", pad.start),
             ("select", pad.select),
+            ("L", pad.l),
+            ("R", pad.r),
             ("menu", pad.menu),
+            ("link", pad.link),
         ]
     }
 
@@ -413,6 +736,65 @@ mod tests {
         }
     }
 
+    /// A shoulder is a bar and it is out at the edge. Both are what the
+    /// hardware looks like and what every emulator that paints a pair agrees
+    /// on, and neither survives a layout that quietly turns them into two more
+    /// square buttons somewhere in the middle.
+    #[test]
+    fn the_shoulders_are_bars_along_the_outer_edges() {
+        for (name, width, height) in SCREENS {
+            let area = area(width, height);
+            let pad = Pad::lay_out(area);
+            for (side, rect) in [("L", pad.l), ("R", pad.r)] {
+                assert!(
+                    rect.width() >= rect.height() * 2.0,
+                    "{name}: {side} is {:.0}×{:.0}, which is not a bar",
+                    rect.width(),
+                    rect.height()
+                );
+            }
+            assert!(pad.l.left() - area.left() <= MARGIN, "{name}: L has left the edge");
+            assert!(area.right() - pad.r.right() <= MARGIN, "{name}: R has left the edge");
+            // And above the hands, not below them: a shoulder reached for by
+            // letting go of the cross is a shoulder nobody uses.
+            assert!(pad.l.bottom() <= pad.cross.center().y, "{name}: L is not above the cross");
+            assert!(pad.r.bottom() <= pad.a.center().y, "{name}: R is not above the buttons");
+        }
+    }
+
+    /// What one finger, come down at `at` and gone nowhere since, is holding.
+    fn press(pad: &Pad, at: Pos2) -> [bool; 10] {
+        let mut touches = Touches::default();
+        touches.land(1, at);
+        pad.pressed(&touches)
+    }
+
+    /// The four arms of the cross, as `paint` lays them out. The reading and the
+    /// painting have to be given the same numbers or the test proves nothing, so
+    /// these are the numbers, in one place, and both sides are held to them.
+    fn arms(pad: &Pad) -> [(usize, Rect); 4] {
+        let arm = pad.cross.width() / 3.0;
+        let centre = pad.cross.center();
+        [
+            (0usize, Vec2::new(0.0, -arm)),
+            (1, Vec2::new(0.0, arm)),
+            (2, Vec2::new(-arm, 0.0)),
+            (3, Vec2::new(arm, 0.0)),
+        ]
+        .map(|(index, offset)| (index, Rect::from_center_size(centre + offset, Vec2::splat(arm))))
+    }
+
+    /// The four corners, likewise, each with the two directions it stands for.
+    fn corners(pad: &Pad) -> [(usize, usize, Vec<Pos2>); 4] {
+        [
+            (0usize, 3usize, Vec2::new(1.0, -1.0)),
+            (1, 3, Vec2::new(1.0, 1.0)),
+            (1, 2, Vec2::new(-1.0, 1.0)),
+            (0, 2, Vec2::new(-1.0, -1.0)),
+        ]
+        .map(|(one, other, towards)| (one, other, corner(pad.cross, towards)))
+    }
+
     /// The cross answers with one direction in each quarter and two on the
     /// diagonals, and with nothing at all in the middle.
     #[test]
@@ -420,12 +802,7 @@ mod tests {
         let pad = Pad::lay_out(area(393.0, 797.0));
         let centre = pad.cross.center();
         let arm = pad.cross.width() * 0.5;
-
-        let press = |offset: Vec2| {
-            let mut touches = Touches::default();
-            touches.0.insert(1, centre + offset);
-            pad.pressed(&touches)
-        };
+        let press = |offset: Vec2| press(&pad, centre + offset);
 
         // up, down, left, right, in that order.
         assert_eq!(press(Vec2::new(0.0, -arm * 0.7))[..4], [true, false, false, false]);
@@ -445,17 +822,132 @@ mod tests {
         );
     }
 
+    /// The two corner icons are drawn and not written, which turns them into
+    /// arithmetic — and arithmetic is what this module is here to check.
+    #[test]
+    fn the_corner_icons_stay_inside_their_buttons() {
+        for (name, width, height) in SCREENS {
+            let pad = Pad::lay_out(area(width, height));
+            for (control, rect, lines) in [
+                ("menu", pad.menu, menu_icon(pad.menu)),
+                ("link", pad.link, link_icon(pad.link)),
+            ] {
+                assert!(!lines.is_empty(), "{name}: {control} came out with no icon at all");
+                for [from, to] in lines {
+                    assert!(
+                        rect.contains(from) && rect.contains(to),
+                        "{name}: the {control} icon runs {from:?} to {to:?}, outside {rect:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Two fingers at once, which is the whole reason the touches are tracked by
     /// hand instead of through egui's single pointer.
     #[test]
     fn the_cross_and_a_button_can_be_held_together() {
         let pad = Pad::lay_out(area(393.0, 797.0));
         let mut touches = Touches::default();
-        touches.0.insert(1, pad.cross.center() + Vec2::new(pad.cross.width() * 0.35, 0.0));
-        touches.0.insert(2, pad.a.center());
+        touches.land(1, pad.cross.center() + Vec2::new(pad.cross.width() * 0.35, 0.0));
+        touches.land(2, pad.a.center());
 
         let down = pad.pressed(&touches);
         assert!(down[3], "right");
         assert!(down[4], "A");
+    }
+
+    /// Everywhere an arm is painted it answers with that direction and nothing
+    /// else. The corners of the arm are the point of it: they are where the old
+    /// reading gave the diagonal to a thumb that had asked for a direction.
+    #[test]
+    fn every_point_of_a_painted_arm_reads_one_direction_alone() {
+        for (name, width, height) in SCREENS {
+            let pad = Pad::lay_out(area(width, height));
+            for (index, arm) in arms(&pad) {
+                // A hair in from the edges, which is as close as a promise about
+                // a painted shape can be held without arguing over the outline.
+                let inside = arm.shrink(0.5);
+                let mut wanted = [false; 4];
+                wanted[index] = true;
+                for at in [
+                    inside.left_top(),
+                    inside.right_top(),
+                    inside.left_bottom(),
+                    inside.right_bottom(),
+                    inside.center(),
+                ] {
+                    assert_eq!(
+                        press(&pad, at)[..4],
+                        wanted,
+                        "{name}: the arm painted at {arm:?} does not read {index} at {at:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And everywhere a corner is painted it answers with both of the directions
+    /// beside it, which is the thing that could not be aimed at before because
+    /// nothing was painted there.
+    #[test]
+    fn every_point_of_a_painted_corner_reads_both_its_directions() {
+        for (name, width, height) in SCREENS {
+            let pad = Pad::lay_out(area(width, height));
+            for (one, other, triangle) in corners(&pad) {
+                let middle = triangle.iter().fold(Vec2::ZERO, |sum, at| sum + at.to_vec2()) / 3.0;
+                let mut wanted = [false; 4];
+                wanted[one] = true;
+                wanted[other] = true;
+                // The middle of the triangle and a step in from each of its
+                // points: a diagonal has to answer in the thin of it as well.
+                for vertex in &triangle {
+                    let at = *vertex + (middle - vertex.to_vec2()) * 0.1;
+                    assert_eq!(
+                        press(&pad, at)[..4],
+                        wanted,
+                        "{name}: the corner painted at {triangle:?} does not read {one} and \
+                         {other} at {at:?}"
+                    );
+                    assert!(
+                        pad.cross.contains(*vertex),
+                        "{name}: the corner painted at {triangle:?} leaves the cross"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Near the middle the cross measures a lean in points and away from it in
+    /// degrees, which is what `DIAGONAL_BIAS` buys. The same lean, sideways, is
+    /// a diagonal close in and mere drift out at the end of the arm.
+    #[test]
+    fn the_same_lean_counts_for_less_further_out_along_an_arm() {
+        let pad = Pad::lay_out(area(393.0, 797.0));
+        let stem = pad.stem();
+        let lean = |along: f32| {
+            press(&pad, pad.cross.center() + Vec2::new(stem * along, -stem * 1.2))[..4].to_vec()
+        };
+
+        assert_eq!(lean(1.2), [true, false, false, true], "a lean of the same size, close in");
+        assert_eq!(lean(2.8), [false, false, false, true], "and out at the end of the arm");
+    }
+
+    /// A thumb leaning on a direction drifts off the edge, and used to take the
+    /// direction with it. Whichever finger came down on the cross keeps it.
+    #[test]
+    fn a_finger_that_lands_on_the_cross_keeps_it_wherever_it_goes() {
+        let pad = Pad::lay_out(area(393.0, 797.0));
+        let mut touches = Touches::default();
+        touches.land(1, pad.cross.center() + Vec2::new(pad.cross.width() * 0.4, 0.0));
+        assert!(pad.pressed(&touches)[3], "right, to begin with");
+
+        touches.slide(1, pad.cross.center() + Vec2::new(pad.cross.width(), 0.0));
+        assert!(pad.pressed(&touches)[3], "right, a whole cross past the edge of it");
+
+        touches.slide(1, pad.a.center());
+        let down = pad.pressed(&touches);
+        assert!(down[3], "right, all the way across the glass");
+        assert!(!down[4], "and A, which the thumb is sitting on, is not pressed by it");
     }
 }

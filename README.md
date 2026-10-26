@@ -24,6 +24,11 @@ cargo build --release
 ./target/release/akebia path/to/game.gb
 ```
 
+Two system libraries have to be there to compile: ALSA, for the sound, and
+`libudev`, for the controllers — `sudo dnf install alsa-lib-devel
+systemd-devel` on Fedora. Neither is needed to *run* the package: both ship with
+any desktop, and rpm works the dependency out of the binary by itself.
+
 To have it on the `PATH` like any other command:
 
 ```bash
@@ -51,7 +56,7 @@ akebia --raw-audio game.gb       # no speaker low-pass: brighter, harsher
 akebia --save other.sav game.gb  # saved game at another path
 akebia --no-save game.gb         # do not load or write the saved game
 akebia --debug game.gb           # PPU registers line by line
-cargo test                   # 322 tests
+cargo test                   # 364 tests
 ```
 
 ### The game list
@@ -241,6 +246,47 @@ that fast, so the emulation has to stall until the other end catches up. None of
 that exists yet. What does exist is the part that has to be right first, because
 over a wire the same bug would look like a network fault.
 
+### The cable over a network
+
+`Link` → `Wait for a console…` leaves this machine listening on
+[the usual port](https://bgb.bircd.org/bgblink.html); `Connect to a console…`
+asks for an address and goes looking. Whichever way round, the game carries on
+while the connection is made, and the title bar says what the window is doing.
+From then on each machine shows **its own screen and keeps its own keyboard** —
+there is no second picture to fit anywhere and no saved game to share, because
+the other console belongs to somebody else.
+
+What crosses is [BGB's link protocol](https://bgb.bircd.org/bgblink.html), so
+the far end may be BGB itself or any emulator that already speaks it — or the
+Android build, where the same two choices live behind the `⇄` button in the
+corner, next to the way back to the list. A telephone has no menu bar to put
+them in and needs no second screen either, which is the whole reason the network
+is the right shape for it and a second console in the same window is not.
+
+The address itself is asked for by a dialog belonging to the activity, and not
+by a text field in the interface. It has to be: the window is a
+`NativeActivity`, which has no editable view in it, so an input method has
+nowhere to put what is typed — the keyboard rises over an `egui` field and every
+character goes nowhere. Anything the emulator needs told in words is asked for
+from Java, where there is a real `EditText`, and the clipboard comes with it.
+
+Either end may be the one that waits. On a home network the machine that is
+easier to name should be the one waiting, which usually means the desktop.
+
+Measured against a real cartridge over the loopback: two consoles walked to the
+Cable Club, linked, and ran 3400 frames apiece stopping to wait for each other
+**four times**. The cost of the network is not in the byte, it is in how far
+ahead a console is allowed to get, and a frame of that is free on any link
+faster than a frame.
+
+There is one case it does not handle, and it is worth naming because it is easy
+to construct on purpose: two copies of the *same* saved game, fed the *same*
+buttons on the *same* frames, decide to take the clock as master on the same
+frame for ever and neither is ever the one listening. Two people cannot do that
+— nobody presses a button on the same frame as somebody else — and the end that
+dialled steps its console aside by a fraction of a frame to break what symmetry
+it can. Perfect symmetry it cannot break.
+
 ### Controls
 
 | Key | Button |
@@ -248,9 +294,27 @@ over a wire the same bug would look like a network fault.
 | Arrows | D-pad |
 | `Z` / `X` | A / B |
 | `Enter` / `Backspace` | Start / Select |
+| `A` / `S` | L / R (the Advance's shoulders) |
 | `Escape` | Back to the list |
 | `Tab` | Swap consoles (with the cable plugged in) |
 | `D` | Debug capture (with `--debug` only) |
+
+A controller works as well, and works alongside the keyboard rather than
+instead of it: both are read every frame and either can press anything. One
+plugged in while Akebia is running is picked up without restarting. Out of the
+box the d-pad is the d-pad, the shoulders are the shoulders, Start and Select
+are the buttons of those names, and A and B are the east and south face buttons
+— which on a controller with Nintendo's labels are the two that actually say A
+and B, and on any other are the pair the thumb rolls between right to left, the
+way the two sit on the machine. The left stick steers the cross too.
+
+*Controls* in the menu bar says which controller is being listened to and opens
+a dialog to move any of the ten buttons: click a row, press the button it is to
+become. Whoever was on that button takes the one being given up, so the ten
+never end up sharing. Changes are kept as they are made, per controller by the
+name it reports, in `~/.config/akebia/controllers` — a preference somebody sat
+down and expressed, which is why it goes there rather than into
+`XDG_STATE_HOME` with the last folder used.
 
 In the list, the arrows move the cursor, `Home` and `End` go to the ends, and
 `Enter` or a double click starts the game. In the folder dialog the arrows and
@@ -416,10 +480,19 @@ factory in `Cartridge::load`. Adding MBC3 is writing one file and one line.
 | `ppu/render.rs` | scanline rendering: background, window and sprites |
 | `timer.rs` | 16-bit counter and edge detection |
 | `joypad.rs`, `serial.rs` | input and the serial shift register |
-| `link.rs` | two consoles on one cable, advanced in lockstep |
-| `examples/link_trace.rs` | drives a linked pair from a script and prints the cable |
+| `link/mod.rs` | two consoles on one cable, advanced in lockstep |
+| `link/bgb.rs` | BGB's link protocol: the packets, and the clock they carry |
+| `link/session.rs` | the rule that decides when a console may run |
 | `cartridge/header.rs` | cartridge metadata |
 | `cartridge/mapper/` | the four MBCs, plus the shared SRAM |
+
+And in the frontend, the two adapters the cable needs to leave the machine:
+
+| Module | Contents |
+|---|---|
+| `net.rs` | packets over a socket, on a thread of their own |
+| `remote.rs` | a console, a session and a wire, driven together |
+| `examples/link_trace.rs` | drives a link from a script and prints the cable |
 
 ## Status
 
@@ -512,12 +585,16 @@ Pending, in the recommended order:
    means rewriting `render`. The variable mode 3 duration is already there; what
    is missing is validating both against `dmg-acid2` and `mooneye-gb`, which have
    to be downloaded.
-2. **The cable over a network.** The port and the lockstep are done; what is
-   missing is the transport. A byte lasts a millisecond and no link answers that
-   fast —a LAN takes several, Bluetooth tens— so it cannot be a matter of sending
-   and hoping: each end has to send its cycle count along with the byte and stall
-   until the other catches up. Speaking BGB's link protocol rather than inventing
-   one would also mean being able to trade against other emulators.
+2. **The cable over a network.** The wire format is in —Akebia speaks
+   [BGB's link protocol](https://bgb.bircd.org/bgblink.html), so the other end
+   may be BGB itself or any emulator that already talks to it— and what is
+   missing is the session on top of it and the sockets underneath. A byte lasts a
+   millisecond and no link answers that fast —a LAN takes several, Bluetooth
+   tens— so it cannot be a matter of sending and hoping. What makes it work is
+   that every packet carries a timestamp, and there is one whose only content is
+   a timestamp: knowing how far the other end has already lived, this one may run
+   freely up to that instant. The wait is not per byte, it is per how far ahead
+   one end gets.
 3. **Keyboard in `--tui`**: the terminal mode draws but does not read input.
 
 ## Reference tests
@@ -528,6 +605,11 @@ Pending, in the recommended order:
 - [dmg-acid2](https://github.com/mattcurrie/dmg-acid2) — the PPU in one frame.
 - [mooneye-gb](https://github.com/Gekkio/mooneye-test-suite) — cycle accuracy;
   leave for last.
+- [BGB](https://bgb.bircd.org/), by **beware** — its
+  [link protocol](https://bgb.bircd.org/bgblink.html) is the one Akebia speaks
+  over a network, packet for packet. None of its code is used and none is
+  needed: what is borrowed is the format, and borrowing it is the point. A
+  protocol only one program speaks is not a protocol.
 
 ## Licence
 
@@ -541,7 +623,5 @@ into GPLv3. Two are worth remembering when adding another dependency:
 default fonts come under OFL-1.1 and the Ubuntu font licence, which cover the
 font files rather than the program.
 
-No ROM is covered by this licence or distributed here: `.gitignore` drops every
-`.gb`, `.gbc` and `.sav`, so nothing from the `roms/` folder is ever committed.
 The freely redistributable test suites are downloaded from their own projects,
 listed above.

@@ -1,17 +1,28 @@
 package org.akebia;
 
+import android.Manifest;
+import android.app.AlertDialog;
 import android.app.NativeActivity;
+import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.OpenableColumns;
+import android.provider.Settings;
+import android.text.InputType;
 import android.view.View;
 import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -26,16 +37,60 @@ import java.io.OutputStream;
  * all.
  *
  * <p>Everything it does is: open the picker, copy whatever came back into the
- * application's own folder, and leave the path where the emulator can pick it
- * up. The emulator asks for it once per frame, which is cheaper than it sounds
- * and saves registering native methods for a callback.
+ * folder the cartridges live in, and leave the path where the emulator can pick
+ * it up. The emulator asks for it once per frame, which is cheaper than it
+ * sounds and saves registering native methods for a callback.
+ *
+ * <p>Saying where that folder is turns out to be the other thing only Java can
+ * do, and the reason is the saved games: the application's own folder is erased
+ * with the application, so the folder is asked for out in the shared storage,
+ * which is not.
+ *
+ * <p>And typing is the third. A native activity has no editable view in it, so
+ * an input method has nowhere to put what is typed: the keyboard comes up and
+ * the characters go nowhere. Anything the emulator has to be told in words — so
+ * far, the address of the machine at the other end of the link cable — is
+ * therefore asked for in a dialog from here. See {@link #askForAddress}.
  */
 public class AkebiaActivity extends NativeActivity {
 
     private static final int PICK_ROM = 1;
 
+    /** Asking for the storage, on a telephone older than Android 11. */
+    private static final int ASK_STORAGE = 2;
+
+    /**
+     * The folder cartridges and saved games live in, at the top of the shared
+     * storage — {@code /sdcard/Akebia} on nearly every telephone.
+     *
+     * <p>It is out there and not in the application's own folder for one reason:
+     * Android erases everything the application owns when it is uninstalled, and
+     * what it erases includes the saved game. A folder in the shared storage
+     * belongs to whoever holds the telephone, survives the uninstall, and can be
+     * copied off over USB without asking Akebia for anything.
+     */
+    private static final String SHARED = "Akebia";
+
     /** Path of the ROM just imported, waiting to be collected. */
     private String imported;
+
+    /**
+     * What the address box was closed with, waiting to be collected.
+     *
+     * <p>Empty when it was closed without an address, which is not the same as
+     * null: a box that was cancelled has been answered, and the emulator has to
+     * stop waiting on it.
+     */
+    private String address;
+
+    /**
+     * Whether what was inside the application's folder has already been carried
+     * out to the shared one.
+     *
+     * <p>Read and written from the emulator's thread only, which is the one that
+     * asks where the cartridges are.
+     */
+    private boolean migrated;
 
     /**
      * How deep the system's own furniture reaches into the window, in pixels,
@@ -159,14 +214,218 @@ public class AkebiaActivity extends NativeActivity {
         return path;
     }
 
+    /**
+     * Asks for the address of the machine to link to, with a real keyboard.
+     *
+     * <p>It is here for the same kind of reason the picker is: a {@code
+     * NativeActivity} has no editable view in it, so an input method has
+     * nothing to write into. Android will raise the keyboard over one happily
+     * enough — {@code showSoftInput} works — but there is no {@code
+     * InputConnection} behind it, and what the emulator gets back is nothing at
+     * all. From the outside that is a text box that cannot be typed in, and a
+     * Connect button that does nothing.
+     *
+     * <p>A dialog belongs to Java, has a real {@link EditText} in it, and comes
+     * with the clipboard as well as the keyboard — which matters, because an
+     * address is the kind of thing that arrives in a message.
+     *
+     * <p>The answer does not come back from here; it arrives later, through
+     * {@link #pollAddress}, exactly like the picker's.
+     *
+     * @param current what to start it off with, so a second attempt at the same
+     *     address is not typed twice. May be null.
+     */
+    public void askForAddress(final String current) {
+        // Whatever a previous box was closed with, before a new one can be
+        // closed with anything. Without this, a box opened and then abandoned —
+        // leaving the game for the list is one way— would have its answer
+        // handed back as the answer to the next one, and the emulator would
+        // dial an address nobody typed.
+        forget();
+        // Dialogs belong to the UI thread, and the emulator runs on another
+        // one: `android_main` is given a thread of its own.
+        runOnUiThread(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        show(current);
+                    }
+                });
+    }
+
+    /**
+     * The address the box was closed with, or null while it is still open.
+     *
+     * <p>Handed over once, like the imported ROM: reading it clears it.
+     */
+    public synchronized String pollAddress() {
+        String typed = address;
+        address = null;
+        return typed;
+    }
+
+    /** Records what the box was closed with. Null and blank both mean nothing. */
+    private synchronized void answered(String typed) {
+        address = typed == null ? "" : typed.trim();
+    }
+
+    /** Back to having no answer at all, which is not the same as an empty one. */
+    private synchronized void forget() {
+        address = null;
+    }
+
+    /** The box itself, on the thread that is allowed to put one up. */
+    private void show(String current) {
+        final EditText box = new EditText(this);
+        // A URI and not a number: an address may be a name, and the numeric
+        // keyboard has neither letters nor the colon that a port needs. What
+        // the variation is really for is the rest of it — no autocorrect, no
+        // capital at the start, and a dot on the main row.
+        box.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                        | InputType.TYPE_TEXT_VARIATION_URI
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        box.setSingleLine(true);
+        box.setHint("192.168.1.20");
+        box.setText(current == null ? "" : current);
+        box.setSelection(box.getText().length());
+
+        // A bare EditText sits flush against the sides of a dialog. The padding
+        // is in points and the method wants pixels, which is what the density
+        // is for.
+        int margin = Math.round(24 * getResources().getDisplayMetrics().density);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setPadding(margin, margin / 2, margin, 0);
+        frame.addView(box);
+
+        // Whether the box was closed by the Connect button or by anything else.
+        // The dismiss listener runs either way and would otherwise wipe out the
+        // address the button had just recorded.
+        final boolean[] taken = {false};
+        AlertDialog dialog =
+                new AlertDialog.Builder(this)
+                        .setTitle("Connect to")
+                        .setView(frame)
+                        .setPositiveButton(
+                                "Connect",
+                                new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface which, int button) {
+                                        taken[0] = true;
+                                        answered(box.getText().toString());
+                                    }
+                                })
+                        .setNegativeButton("Cancel", null)
+                        .setOnDismissListener(
+                                new DialogInterface.OnDismissListener() {
+                                    @Override
+                                    public void onDismiss(DialogInterface which) {
+                                        // Cancelled, dismissed with the back
+                                        // key, or tapped away. All three are an
+                                        // answer of «no address», and every one
+                                        // of them has to be one: an emulator
+                                        // still waiting on a box that is no
+                                        // longer there would wait for ever.
+                                        if (!taken[0]) {
+                                            answered(null);
+                                        }
+                                    }
+                                })
+                        .create();
+        // Asked for outright rather than left to the input method's judgement:
+        // the box is the only thing in the dialog, so there is nothing else the
+        // person opening it could have meant to do.
+        dialog.getWindow()
+                .setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+        dialog.show();
+    }
+
     /** The folder the imported cartridges live in. */
     public String getRomsDir() {
         return romsDir().getAbsolutePath();
     }
 
     /**
-     * Copies the document into the application's folder and returns where it
-     * landed, or null if it could not be read.
+     * Whether the saved games are being kept where the uninstall cannot reach.
+     *
+     * <p>The permission is the usual reason for a no, but it is deliberately not
+     * what is asked here: what the emulator shows on the strength of this answer
+     * is a warning about losing saved games, and a folder that could not be made
+     * loses them just as thoroughly as one that was never allowed.
+     */
+    public boolean hasStorage() {
+        return sharedDir() != null;
+    }
+
+    /**
+     * Whether the shared storage may be written to.
+     *
+     * <p>Two different questions under one name. From Android 11 it is the "all
+     * files access" the user grants in the system's settings; before that it is
+     * the old runtime permission, which a dialog is enough for.
+     */
+    private boolean granted() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return manager();
+        }
+        return checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * The Android 11 form of the question, kept apart so that a telephone older
+     * than that never looks inside it.
+     */
+    private static boolean manager() {
+        return Environment.isExternalStorageManager();
+    }
+
+    /** Asks for it. Called from the emulator's thread. */
+    public void requestStorage() {
+        runOnUiThread(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            askManager();
+                        } else {
+                            requestPermissions(
+                                    new String[] {Manifest.permission.WRITE_EXTERNAL_STORAGE},
+                                    ASK_STORAGE);
+                        }
+                    }
+                });
+    }
+
+    /**
+     * Sends the user to the settings screen where "all files access" is given.
+     *
+     * <p>There is no dialog for this one: from Android 11 the system will not
+     * let an application ask for it in passing, and the only way through is the
+     * settings. Nothing is waited for here — the answer is noticed later, when
+     * the emulator asks {@link #hasStorage} again on coming back.
+     */
+    private void askManager() {
+        Uri self = Uri.fromParts("package", getPackageName(), null);
+        try {
+            startActivity(
+                    new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, self));
+        } catch (Exception e) {
+            // A few telephones carry no screen for one application on its own.
+            // The list of every application is a worse place to be left in, and
+            // it is what there is.
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            } catch (Exception nowhere) {
+                // Nothing more to try: Akebia goes on saving in its own folder,
+                // which works and is only lost on uninstalling.
+            }
+        }
+    }
+
+    /**
+     * Copies the document into the cartridge folder and returns where it landed,
+     * or null if it could not be read.
      *
      * <p>It is copied and not merely remembered because the permission over the
      * URI dies with the process: what the user picked today would not open
@@ -219,9 +478,100 @@ public class AkebiaActivity extends NativeActivity {
         return name;
     }
 
+    /**
+     * Where the cartridges and their saved games are kept.
+     *
+     * <p>The shared folder if there is one to be had, and the application's own
+     * otherwise. The second is not a lesser arrangement in the day to day —it is
+     * where everything used to live and everything worked— but it goes with the
+     * application when it is uninstalled, saved games and all.
+     */
     private File romsDir() {
+        File shared = sharedDir();
+        if (shared != null) {
+            migrate(shared);
+            return shared;
+        }
         File dir = new File(getFilesDir(), "roms");
         dir.mkdirs();
         return dir;
+    }
+
+    /**
+     * The folder in the shared storage, or null if it cannot be used.
+     *
+     * <p>Null covers three cases that come to the same thing here: the access
+     * has not been granted, the storage is not mounted, and the folder could not
+     * be made.
+     */
+    // `getExternalStorageDirectory` is deprecated in favour of asking through
+    // `MediaStore`, and that is not an option: what is wanted is a real path,
+    // because the emulator underneath opens files and knows nothing of Android.
+    @SuppressWarnings("deprecation")
+    private File sharedDir() {
+        if (!granted()
+                || !Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState())) {
+            return null;
+        }
+        File dir = new File(Environment.getExternalStorageDirectory(), SHARED);
+        return dir.isDirectory() || dir.mkdirs() ? dir : null;
+    }
+
+    /**
+     * Carries what is in the application's folder out to the shared one, once.
+     *
+     * <p>This is what the access being granted actually does for somebody who
+     * was already playing: the cartridges they had imported and the games they
+     * had saved move out to where the next uninstall cannot take them. It is a
+     * copy and a delete and not a rename, because the two are on different
+     * filesystems and no rename crosses that.
+     *
+     * <p>Nothing already in the shared folder is overwritten. A file out there
+     * with the same name is, as far as this can tell, the saved game of a
+     * previous installation — which is the very thing this whole arrangement
+     * exists to protect. The copy inside is left alone rather than deleted, so
+     * that whichever of the two is worth keeping is still there to be looked at.
+     *
+     * <p>It runs from the list of cartridges and never mid-game: it is reached
+     * through {@link #getRomsDir}, which nothing asks for while a console is
+     * running. Moving a `.sav` out from under a game in progress would leave the
+     * autosave writing to a file nobody would read again.
+     */
+    private void migrate(File shared) {
+        if (migrated) {
+            return;
+        }
+        migrated = true;
+        File[] inside = new File(getFilesDir(), "roms").listFiles();
+        if (inside == null) {
+            return;
+        }
+        for (File file : inside) {
+            File out = new File(shared, file.getName());
+            if (!file.isFile() || out.exists()) {
+                continue;
+            }
+            if (copy(file, out)) {
+                file.delete();
+            }
+        }
+    }
+
+    /** Copies one file over another that does not exist yet. */
+    private boolean copy(File from, File to) {
+        try (InputStream in = new FileInputStream(from);
+                OutputStream os = new FileOutputStream(to)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) > 0) {
+                os.write(buffer, 0, read);
+            }
+        } catch (Exception e) {
+            // Half a file is worse than none: what is left behind would be read
+            // as a saved game later on.
+            to.delete();
+            return false;
+        }
+        return true;
     }
 }

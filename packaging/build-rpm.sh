@@ -20,7 +20,12 @@ if [ -z "$VER" ]; then
 fi
 
 echo "==> Building akebia v$VER..."
-cargo build --release --manifest-path "$ROOT/Cargo.toml"
+# The one crate that goes in the package, and not the whole workspace. Without
+# `-p` cargo also builds `akebia-android`, which on a desktop is the arithmetic
+# of the eight buttons and nothing else - it is built everywhere on purpose, so
+# that `cargo test` can check it away from a telephone. The shared object that
+# comes out here is of no use to anybody and is not packaged.
+cargo build --release --manifest-path "$ROOT/Cargo.toml" -p akebia-frontend
 
 RPMBUILD="$ROOT/target/rpmbuild"
 echo "==> Preparing the sources..."

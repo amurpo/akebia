@@ -28,14 +28,18 @@ use akebia_core::cartridge::CgbSupport;
 use akebia_core::gameboy::FRAMES_PER_SECOND;
 use akebia_core::link::{self, LinkFault, Side};
 use akebia_core::ports::{Palette, VideoOutput};
-use akebia_core::{Button, FrameBuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use akebia_core::{FrameBuffer, GameBoy, SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::console::{Console, Pad};
 use eframe::egui::{
     self, Align, Color32, ColorImage, Key, Label, Layout, RichText, Sense, TextureHandle,
     TextureOptions, UiBuilder, Vec2, ViewportCommand,
 };
 
 use crate::args::Args;
-use crate::{audio, debug, roms, save};
+use crate::gamepad::Gamepads;
+use crate::remote::{Remote, Trouble};
+use crate::rate::Rate;
+use crate::{audio, debug, gamepad, net, rate, recent, remote, roms, save};
 
 /// The red of the Akebia logo. It is the colour of everything selected.
 pub const ACCENT: Color32 = Color32::from_rgb(0xCF, 0x1A, 0x30);
@@ -72,16 +76,33 @@ const MAX_CATCH_UP: u32 = 4;
 
 /// Joypad keys. The layout is the usual one in emulators: the d-pad on the
 /// arrows and the action buttons under the left hand.
-const KEYS: [(Key, Button); 8] = [
-    (Key::ArrowUp, Button::Up),
-    (Key::ArrowDown, Button::Down),
-    (Key::ArrowLeft, Button::Left),
-    (Key::ArrowRight, Button::Right),
-    (Key::Z, Button::A),
-    (Key::X, Button::B),
-    (Key::Enter, Button::Start),
-    (Key::Backspace, Button::Select),
+///
+/// The two shoulders are here for the Advance and do nothing on a Game Boy,
+/// which is what a Game Boy does when a button it has not got is pressed. One
+/// list for both machines is the point: a person does not want the keys to move
+/// when the cartridge does.
+const KEYS: [(Key, Pad); 10] = [
+    (Key::ArrowUp, Pad::Up),
+    (Key::ArrowDown, Pad::Down),
+    (Key::ArrowLeft, Pad::Left),
+    (Key::ArrowRight, Pad::Right),
+    (Key::Z, Pad::A),
+    (Key::X, Pad::B),
+    (Key::Enter, Pad::Start),
+    (Key::Backspace, Pad::Select),
+    (Key::A, Pad::L),
+    (Key::S, Pad::R),
 ];
+
+/// What is being held down, on the keyboard and on any controller at once.
+///
+/// The two are ORed rather than chosen between. A controller does not take the
+/// keyboard away: whoever is holding one still has Escape, the menu and the
+/// capture key under their other hand, and a second player on the keyboard is
+/// nobody's mistake to correct.
+fn held(ctx: &egui::Context, pads: &Gamepads) -> [(Pad, bool); KEYS.len()] {
+    ctx.input(|i| KEYS.map(|(key, button)| (button, i.key_down(key) || pads.down(button))))
+}
 
 /// Opens the window and does not return until it is closed.
 pub fn run(args: Args, limit: Option<u64>) -> Result<(), String> {
@@ -102,9 +123,9 @@ pub fn run_with(args: Args, limit: Option<u64>, base: eframe::NativeOptions) -> 
     // like that of any other command, not inside a window.
     let initial = match &args.rom {
         Some(path) => {
-            let gb = crate::load(path, &args)?;
+            let console = crate::load_console(path, &args)?;
             crate::remember_dir(path);
-            Some(Session::new(gb, path.clone(), &args, &settings))
+            Some(Session::new(console, path.clone(), &args, &settings))
         }
         None => None,
     };
@@ -150,6 +171,9 @@ pub struct Settings {
     grayscale: bool,
     /// Window size as a multiple of 160×144, or `0` to fill the screen.
     scale: u32,
+    /// Show how fast the emulator is going. Off by default: it answers a
+    /// question nobody has while the game is running properly.
+    fps: bool,
 }
 
 impl Settings {
@@ -159,6 +183,7 @@ impl Settings {
             speaker_filter: !args.raw_audio,
             grayscale: args.grayscale,
             scale: args.scale,
+            fps: false,
         }
     }
 
@@ -171,9 +196,20 @@ impl Settings {
     }
 }
 
-/// The window that leaves the console's screen at exactly `scale`.
+/// The window that leaves a screen of that size at exactly `scale`.
+///
+/// The size is passed in rather than assumed: the two machines are 160×144 and
+/// 240×160, and a window built for the wrong one either wastes half its width
+/// or shrinks the picture to fit.
+fn window_size_for(screen: (usize, usize), scale: f32) -> Vec2 {
+    let (width, height) = screen;
+    Vec2::new(width as f32 * scale, height as f32 * scale + MENU_BAR_ROOM)
+}
+
+/// The window for the older machine, which is what the list and an empty
+/// window are sized to.
 fn window_size(scale: f32) -> Vec2 {
-    Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale + MENU_BAR_ROOM)
+    window_size_for((SCREEN_WIDTH, SCREEN_HEIGHT), scale)
 }
 
 /// Gap left between two linked screens. Without it the two pictures read as one
@@ -245,6 +281,45 @@ struct App {
     /// second one is only painted while a cable is plugged in, but it costs
     /// 160×144 pixels to keep and saves creating a texture mid-game.
     textures: [TextureHandle; 2],
+    /// A connection being made, while the game carries on. Both waiting and
+    /// dialling take as long as they take, so neither stops the window.
+    connecting: Option<net::Pending>,
+    /// The address box, open with whatever is in it.
+    address: Option<String>,
+    /// The controllers, polled once a frame whatever is on screen.
+    pads: Gamepads,
+    /// The controller dialog, open, and which console button it is waiting to
+    /// hear a controller button for.
+    controls: Option<Wait>,
+    /// What was typed there last. Going back to the same machine is far and away
+    /// the commonest thing to want, and retyping an address is a poor way to
+    /// spend the moment before a trade.
+    last_address: String,
+    /// The games opened lately, as the menu offers them.
+    ///
+    /// Held rather than read from disk each time the menu is opened: it is
+    /// drawn every frame that the mouse is over it, and a file read per frame
+    /// to show ten lines that change once a session is not a trade worth
+    /// making.
+    recent: Vec<PathBuf>,
+    /// The last thing worth saying about the session that is not the picture
+    /// itself, kept on the menu bar until something replaces it.
+    ///
+    /// Two kinds of thing end up here, and they have the same shape. A link
+    /// ends for reasons that are nobody's mistake —the other player put their
+    /// telephone down— and the game carries on. An Advance started without a
+    /// BIOS runs and draws nothing, which needs saying more than most things
+    /// do. Neither is a question, so neither belongs in a dialog, and there is
+    /// no list left to leave them on: the end of the menu bar is where the
+    /// session already speaks from.
+    notice: Option<String>,
+}
+
+/// The controller dialog while it is open: nothing, until a row is clicked and
+/// it is listening for the button that row is to be moved onto.
+#[derive(Default)]
+struct Wait {
+    button: Option<Pad>,
 }
 
 enum Screen {
@@ -254,6 +329,8 @@ enum Screen {
     Playing(Box<Session>),
     /// Two consoles joined by a link cable.
     Linked(Box<Pair>),
+    /// One console, with the other end of the cable on another machine.
+    Networked(Box<Wired>),
 }
 
 impl App {
@@ -281,6 +358,7 @@ impl App {
         let textures = [screen_texture("screen"), screen_texture("screen-linked")];
 
         let folder = roms::initial_dir(args.roms_dir.as_deref(), roms::state_path().as_deref());
+        let notice = initial.as_ref().and_then(Session::warning);
         let screen = match initial {
             Some(session) => Screen::Playing(Box::new(session)),
             None => Screen::List(List::new(folder.clone())),
@@ -294,21 +372,39 @@ impl App {
             screen,
             dialog: None,
             textures,
+            connecting: None,
+            address: None,
+            pads: Gamepads::open(),
+            controls: None,
+            last_address: String::new(),
+            recent: recent::path().map(|list| recent::load(&list)).unwrap_or_default(),
+            notice,
         }
     }
 
     /// Loads the chosen ROM and starts playing, or leaves the warning in the
     /// list.
     fn play(&mut self, ctx: &egui::Context, path: PathBuf) {
-        match crate::load(&path, &self.args) {
-            Ok(gb) => {
+        match crate::load_console(&path, &self.args) {
+            Ok(console) => {
                 crate::remember_dir(&path);
+                // Re-read rather than pushed onto the front here: what was
+                // written is what the menu should show, including the pruning
+                // of anything that has since gone away.
+                self.recent = recent::path().map(|list| recent::load(&list)).unwrap_or_default();
                 if let Some(dir) = path.parent() {
                     self.folder = dir.to_owned();
                 }
-                let session = Session::new(gb, path, &self.args, &self.settings);
+                let session = Session::new(console, path, &self.args, &self.settings);
                 ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                // Whatever a previous game or a previous cable left there is
+                // gone; what this one has to say about itself takes its place.
+                self.notice = session.warning();
                 self.screen = Screen::Playing(Box::new(session));
+                // The window follows the machine. Starting an Advance in a Game
+                // Boy-shaped window would letterbox a picture that has a window
+                // of its own to be shown in.
+                self.resize_for(ctx, false);
             }
             // Loading can fail because of a mapper not implemented yet or a file
             // that is not a ROM. It is shown in the list and not on stderr:
@@ -332,16 +428,45 @@ impl App {
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let playing = matches!(self.screen, Screen::Playing(_));
         let linked = matches!(self.screen, Screen::Linked(_));
+        let networked = matches!(self.screen, Screen::Networked(_));
+        let waiting = self.connecting.is_some();
         let mut open_dialog = false;
         let mut back_to_list = false;
         let mut connect = false;
         let mut swap = false;
         let mut unplug = false;
+        let mut listen = false;
+        let mut dial = false;
+        let mut give_up = false;
+        let mut configure = false;
+        // A game chosen off the recent menu, and whether the menu was emptied.
+        let mut replay: Option<PathBuf> = None;
+        let mut forget = false;
         let mut settings = self.settings.clone();
+        // Read out here because the menu is drawn inside a closure that already
+        // holds the whole of `self`.
+        let pad = self.pads.active().map(str::to_owned);
 
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
+                    // The games lately played, above the way of finding one
+                    // that is not in the list: going back to a game is far
+                    // commoner than going looking for a new one.
+                    ui.menu_button("Recent games", |ui| {
+                        let paths = self.recent.clone();
+                        if paths.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("Nothing yet"));
+                            return;
+                        }
+                        for (path, label) in paths.iter().zip(recent::labels(&paths)) {
+                            if ui.button(label).clicked() {
+                                replay = Some(path.clone());
+                            }
+                        }
+                        ui.separator();
+                        forget = ui.button("Clear the list").clicked();
+                    });
                     open_dialog = ui.button("ROM folder…").clicked();
                     ui.separator();
                     back_to_list =
@@ -364,6 +489,11 @@ impl App {
                         ui.radio_value(&mut settings.grayscale, false, "Game Boy green");
                         ui.radio_value(&mut settings.grayscale, true, "Greys");
                     });
+                    ui.separator();
+                    ui.checkbox(&mut settings.fps, "Frame rate").on_hover_text(
+                        "How many of the console's frames a second are being produced, \
+                         and the share of the time it takes to produce them",
+                    );
                 });
                 ui.menu_button("Audio", |ui| {
                     ui.checkbox(&mut settings.sound, "Sound");
@@ -376,9 +506,28 @@ impl App {
                     )
                     .on_hover_text("Rolls off the treble the way the console's speaker did");
                 });
+                ui.menu_button("Controls", |ui| {
+                    // Which controller is being listened to, said before
+                    // anything can be done to it: half of "the controller does
+                    // nothing" is Akebia never having seen one, and that is not
+                    // a question a dialog full of bindings answers.
+                    match &pad {
+                        Some(name) => {
+                            ui.add_enabled(false, egui::Button::new(name));
+                        }
+                        None => {
+                            ui.add_enabled(false, egui::Button::new("No controller"))
+                                .on_disabled_hover_text(
+                                    "Plug one in and it is picked up without restarting",
+                                );
+                        }
+                    }
+                    ui.separator();
+                    configure = ui.button("Configure…").clicked();
+                });
                 ui.menu_button("Link", |ui| {
                     connect = ui
-                        .add_enabled(playing, egui::Button::new("Second console"))
+                        .add_enabled(playing && !waiting, egui::Button::new("Second console"))
                         .on_hover_text("Copy this console and join the two with a link cable")
                         .clicked();
                     swap = ui
@@ -386,19 +535,82 @@ impl App {
                         .on_hover_text("Hand the keyboard to the other console")
                         .clicked();
                     ui.separator();
+                    // Over a network the second console is somebody else's, so
+                    // there is nothing to copy and nothing to swap to: each
+                    // machine shows its own screen and keeps its own keyboard.
+                    listen = ui
+                        .add_enabled(playing && !waiting, egui::Button::new("Wait for a console…"))
+                        .on_hover_text("Let another machine connect to this one")
+                        .clicked();
+                    dial = ui
+                        .add_enabled(playing && !waiting, egui::Button::new("Connect to a console…"))
+                        .on_hover_text("Go to another machine that is already waiting")
+                        .clicked();
+                    give_up = ui
+                        .add_enabled(waiting, egui::Button::new("Stop waiting"))
+                        .clicked();
+                    ui.separator();
                     unplug = ui
-                        .add_enabled(linked, egui::Button::new("Unplug the cable"))
-                        .on_hover_text("Keep playing on the console that has the keyboard")
+                        .add_enabled(linked || networked, egui::Button::new("Unplug the cable"))
+                        .on_hover_text("Keep playing on this console alone")
                         .clicked();
                 });
+
+                // Whatever the cable is doing says so here, at the far end of the
+                // same row. Until this, the only sign that "Wait for a console"
+                // had done anything at all was the window's title, which is
+                // covered by a full screen, cut short by some window managers
+                // and not looked at by anybody in the middle of a game: what it
+                // came to was choosing it and seeing nothing happen.
+                let said = self.status();
+                let speed = self.settings.fps.then(|| self.speed()).flatten();
+                if said.is_some() || speed.is_some() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        if let Some(said) = said {
+                            ui.label(RichText::new(said).color(ACCENT));
+                        }
+                        // The rate goes left of whatever the session is saying,
+                        // and turns the colour of a warning once the emulator
+                        // has no room left — which is the moment it stops being
+                        // a curiosity and becomes the answer to "why is this
+                        // slow".
+                        if let Some(speed) = speed {
+                            let colour =
+                                if speed.flat_out() { ACCENT } else { Color32::GRAY };
+                            ui.label(RichText::new(speed.to_line()).small().color(colour))
+                                .on_hover_text(
+                                    "Console frames a second, and the share of real time \
+                                     spent producing them",
+                                );
+                            ui.add_space(8.0);
+                        }
+                    });
+                }
             });
         });
 
         if settings != self.settings {
             self.apply(&settings, ctx);
         }
+        if configure {
+            self.controls = Some(Wait::default());
+        }
         if open_dialog {
             self.open_dialog();
+        }
+        if let Some(path) = replay {
+            // Straight into the game, whatever is on screen now. A game chosen
+            // from the menu is a game asked for, and dropping back to the list
+            // first would make the menu a slower way of doing what the list
+            // already does.
+            self.play(ctx, path);
+        }
+        if forget {
+            if let Some(list) = recent::path() {
+                recent::clear(&list);
+            }
+            self.recent.clear();
         }
         if back_to_list {
             self.back_to_list(ctx, None);
@@ -411,8 +623,298 @@ impl App {
                 pair.swap_keyboard(&self.settings);
             }
         }
+        if listen {
+            self.start_waiting(ctx);
+        }
+        if dial {
+            // Whatever was typed last: reconnecting to the same machine is far
+            // and away the commonest thing to want.
+            self.address = Some(self.last_address.clone());
+        }
+        if give_up {
+            self.connecting = None;
+            self.notice = None;
+            self.retitle(ctx);
+        }
         if unplug {
             self.unplug(ctx);
+        }
+    }
+
+    /// One line about the session, or nothing when there is nothing to say.
+    ///
+    /// A live cable outranks whatever [`App::notice`] is holding, because it is
+    /// happening now and the notice is something that happened. A connection
+    /// has four states worth telling apart and the interface used to show one
+    /// of them: "connecting" and "connected but the other end has not answered
+    /// yet" look identical from a chair —the game sits there in both— and the
+    /// difference is exactly what a player needs to know before deciding the
+    /// thing is broken.
+    /// How fast whichever session is running is going, if it has been going
+    /// long enough to say. Nothing on the list, where there is nothing being
+    /// emulated to measure.
+    fn speed(&self) -> Option<rate::Reading> {
+        match &self.screen {
+            Screen::Playing(session) => session.rate(),
+            Screen::Linked(pair) => pair.consoles[0].rate(),
+            Screen::Networked(wired) => wired.console.rate(),
+            Screen::List(_) => None,
+        }
+    }
+
+    fn status(&self) -> Option<String> {
+        // Waiting has to say *where*, because the other machine has to be told
+        // an address and this is the end that knows it.
+        if let Some(pending) = &self.connecting {
+            return Some(match &pending.here {
+                Some(here) => format!("{} — this machine is {here}", pending.what),
+                None => pending.what.clone(),
+            });
+        }
+        if let Screen::Networked(wired) = &self.screen {
+            let peer = wired.remote.peer();
+            return Some(if wired.remote.is_ready() {
+                format!("Linked to {peer}")
+            } else {
+                format!("Connected to {peer} — waiting for it to answer")
+            });
+        }
+        self.notice.clone()
+    }
+
+    /// Starts waiting for another machine to connect to this one.
+    fn start_waiting(&mut self, ctx: &egui::Context) {
+        if !matches!(self.screen, Screen::Playing(_)) {
+            return;
+        }
+        self.notice = None;
+        self.connecting = Some(net::Pending::listen(akebia_core::link::bgb::DEFAULT_PORT));
+        self.retitle(ctx);
+    }
+
+    /// Goes looking for a machine that is already waiting.
+    fn start_dialling(&mut self, ctx: &egui::Context, address: String) {
+        if !matches!(self.screen, Screen::Playing(_)) || address.trim().is_empty() {
+            return;
+        }
+        self.notice = None;
+        self.last_address = address.clone();
+        self.connecting = Some(net::Pending::connect(address));
+        self.retitle(ctx);
+    }
+
+    /// Picks up a connection once it has been made, and plugs the cable in.
+    fn collect_connection(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.connecting.as_mut() else {
+            return;
+        };
+        let dialled = pending.dialled;
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.connecting = None;
+        let role = if dialled { remote::Role::Dialled } else { remote::Role::Waited };
+
+        let wire = match result {
+            Ok(wire) => wire,
+            Err(failure) => {
+                // The game is not thrown away to say a connection failed: it
+                // goes on the menu bar, next to where the attempt was announced.
+                self.notice = Some(first_line(&failure.to_string()));
+                self.retitle(ctx);
+                return;
+            }
+        };
+
+        // Whatever the cable was for is no longer on screen: a second console
+        // was copied in the meantime, or the game was left for the list. Taking
+        // the screen apart here regardless would drop a session without saving
+        // it, which is a great deal worse than a connection nobody uses.
+        if !matches!(self.screen, Screen::Playing(_)) {
+            return;
+        }
+        let aside = Screen::List(List::new(self.folder.clone()));
+        if let Screen::Playing(mut session) = std::mem::replace(&mut self.screen, aside) {
+            // The cable is the older machine's. Nothing should have offered it
+            // for anything else, and if something did, the game carries on
+            // rather than the connection taking it away.
+            let Some(gb) = session.gb_mut() else {
+                self.notice = Some("only a Game Boy has a link cable".to_string());
+                self.screen = Screen::Playing(session);
+                return;
+            };
+            let remote = Remote::new(wire, gb, role);
+            self.screen = Screen::Networked(Box::new(Wired { console: *session, remote }));
+            self.retitle(ctx);
+        }
+    }
+
+    /// Puts on the title bar whatever the window is doing.
+    fn retitle(&mut self, ctx: &egui::Context) {
+        let name = match (&self.screen, &self.connecting) {
+            (_, Some(pending)) => format!("Akebia — {}", pending.what),
+            (Screen::Networked(wired), None) => {
+                format!("Akebia — {} ↔ {}", wired.console.title, wired.remote.peer())
+            }
+            (Screen::Linked(pair), None) => linked_title(pair),
+            (Screen::Playing(session), None) => title(Some(session)),
+            (Screen::List(_), None) => title(None),
+        };
+        ctx.send_viewport_cmd(ViewportCommand::Title(name));
+    }
+
+    /// The box the address is typed into.
+    ///
+    /// A dialog and not a screen of its own, like the folder chooser: whatever
+    /// is being played stays where it is, and cancelling costs nothing.
+    fn address_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut typed) = self.address.take() else {
+            return;
+        };
+        let mut go = false;
+        let mut cancelled = false;
+
+        let response = egui::Modal::new(egui::Id::new("address")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Connect to a console").size(18.0).strong());
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("The address of the machine that is waiting. Without a port it\nuses the usual one for a link cable.")
+                    .size(13.0)
+                    .color(Color32::from_gray(0x9A)),
+            );
+            ui.add_space(10.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut typed)
+                    .hint_text("192.168.1.20")
+                    .desired_width(f32::INFINITY),
+            );
+            field.request_focus();
+            go |= field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                go |= ui.button("Connect").clicked();
+                cancelled |= ui.button("Cancel").clicked();
+            });
+        });
+
+        if response.should_close() {
+            cancelled = true;
+        }
+        if go {
+            self.start_dialling(ctx, typed);
+        } else if !cancelled {
+            // Still being typed into.
+            self.address = Some(typed);
+        }
+    }
+
+    /// The controller's ten buttons, and what each one is on it.
+    ///
+    /// A dialog like the other two, and for the same reason: it opens over a
+    /// game without ending it, so a button that turned out to be the wrong one
+    /// can be moved where it was noticed rather than back at the list.
+    ///
+    /// Every change is kept the moment it is made — there is no accepting or
+    /// cancelling. A row shows what it is on; clicking it makes the row listen,
+    /// and the next button pressed on the controller is what it becomes.
+    fn controls_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut wait) = self.controls.take() else {
+            return;
+        };
+
+        // A button pressed while a row was listening is the answer that row was
+        // waiting for. Taken before the dialog is drawn so the new binding is
+        // what gets shown, rather than a frame of the old one.
+        if let (Some(button), Some(pressed)) = (wait.button, self.pads.take_caught()) {
+            self.pads.bind(button, pressed);
+            wait.button = None;
+        }
+
+        let mapping = self.pads.mapping();
+        let pad = self.pads.active().map(str::to_owned);
+        let mut stick = mapping.stick();
+        let mut listen_for = None;
+        let mut restore = false;
+        let mut done = false;
+
+        let response = egui::Modal::new(egui::Id::new("controls")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(RichText::new("Controller").size(18.0).strong());
+            ui.add_space(6.0);
+            let said = match &pad {
+                Some(name) => name.clone(),
+                None => "Nothing plugged in — these are what it would use".to_owned(),
+            };
+            ui.label(RichText::new(said).size(13.0).color(Color32::from_gray(0x9A)));
+            ui.add_space(10.0);
+
+            // Nothing can be changed with no controller plugged in, and the
+            // rows say so by being dead rather than by accepting a click and
+            // then listening for ever to a controller that is not there.
+            ui.add_enabled_ui(pad.is_some(), |ui| {
+                egui::Grid::new("bindings").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for button in Pad::ALL {
+                        ui.label(button.name());
+                        let listening = wait.button == Some(button);
+                        let label = if listening {
+                            RichText::new("press a button…").color(ACCENT)
+                        } else {
+                            RichText::new(gamepad::name_of(mapping.of(button)))
+                        };
+                        let row = egui::Button::new(label).min_size(Vec2::new(150.0, 0.0));
+                        if ui.add(row).clicked() {
+                            listen_for = Some(button);
+                        }
+                        ui.end_row();
+                    }
+                });
+
+                ui.add_space(10.0);
+                // Named after what it does and not after the hardware: whoever
+                // has to decide whether they want it is thinking about the
+                // cross, not about an axis pair.
+                ui.checkbox(&mut stick, "The left stick steers the cross too");
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "The face buttons are named by where they sit, because what is\n\
+                     printed on them is not the same on two controllers: South is\n\
+                     the one under the thumb, East the one to the right of it.",
+                )
+                .size(12.0)
+                .color(Color32::from_gray(0x8A)),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                done = ui.button("Done").clicked();
+                restore =
+                    ui.add_enabled(pad.is_some(), egui::Button::new("Defaults")).clicked();
+            });
+        });
+
+        if let Some(button) = listen_for {
+            // Clicking the row that is already listening stops it listening,
+            // which is the only way out of a row bound to a button that has
+            // since been unplugged.
+            wait.button = (wait.button != Some(button)).then_some(button);
+        }
+        if restore {
+            self.pads.restore();
+            wait.button = None;
+        }
+        if stick != mapping.stick() {
+            self.pads.use_stick(stick);
+        }
+        // While a row is listening nothing on screen changes until the
+        // controller is touched, and a controller is not something egui wakes up
+        // for. Without this the dialog would sit there until the mouse moved.
+        if wait.button.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if !done && !response.should_close() {
+            self.controls = Some(wait);
         }
     }
 
@@ -438,15 +940,26 @@ impl App {
     /// Pulls the cable out, keeping whichever console has the keyboard and
     /// saving the other one on its way out.
     fn unplug(&mut self, ctx: &egui::Context) {
-        if !matches!(self.screen, Screen::Linked(_)) {
+        if !matches!(self.screen, Screen::Linked(_) | Screen::Networked(_)) {
             return;
         }
+        self.notice = None;
         let list = Screen::List(List::new(self.folder.clone()));
-        if let Screen::Linked(pair) = std::mem::replace(&mut self.screen, list) {
-            let session = pair.split(&self.settings);
-            ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
-            self.resize_for(ctx, false);
-            self.screen = Screen::Playing(Box::new(session));
+        match std::mem::replace(&mut self.screen, list) {
+            Screen::Linked(pair) => {
+                let session = pair.split(&self.settings);
+                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                self.resize_for(ctx, false);
+                self.screen = Screen::Playing(Box::new(session));
+            }
+            Screen::Networked(wired) => {
+                // No resizing: a networked pair never took a second screen's
+                // worth of window in the first place.
+                let session = wired.split();
+                ctx.send_viewport_cmd(ViewportCommand::Title(title(Some(&session))));
+                self.screen = Screen::Playing(Box::new(session));
+            }
+            other => self.screen = other,
         }
     }
 
@@ -461,8 +974,19 @@ impl App {
         if scale == 0 {
             return;
         }
-        let size =
-            if linked { linked_window_size(scale as f32) } else { window_size(scale as f32) };
+        // A linked pair is two Game Boys, so its size is the older machine's
+        // twice over. Otherwise the window is sized to whatever is playing —
+        // and to the older machine when nothing is.
+        let size = if linked {
+            linked_window_size(scale as f32)
+        } else {
+            let screen = match &self.screen {
+                Screen::Playing(session) => session.console().screen_size(),
+                Screen::Networked(wired) => wired.console.console().screen_size(),
+                _ => (SCREEN_WIDTH, SCREEN_HEIGHT),
+            };
+            window_size_for(screen, scale as f32)
+        };
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
     }
 
@@ -482,6 +1006,7 @@ impl App {
         match &mut self.screen {
             Screen::Playing(session) => session.apply(&self.settings),
             Screen::Linked(pair) => pair.apply(&self.settings),
+            Screen::Networked(wired) => wired.console.apply(&self.settings),
             Screen::List(_) => {}
         }
     }
@@ -534,8 +1059,12 @@ impl App {
         match &mut self.screen {
             Screen::Playing(session) => session.close(),
             Screen::Linked(pair) => pair.close(),
+            Screen::Networked(wired) => wired.console.close(),
             Screen::List(_) => {}
         }
+        // A connection half made has nobody left to hand a console to.
+        self.connecting = None;
+        self.notice = None;
         let mut list = List::new(self.folder.clone());
         list.warning = warning;
         self.screen = Screen::List(list);
@@ -551,7 +1080,17 @@ impl eframe::App for App {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dialog = self.dialog.is_some();
+        self.collect_connection(ctx);
+        // Before anything returns early: the dialog is asking which button was
+        // just pressed, and it can be open over the list as well as over a
+        // game.
+        self.pads.poll();
+        // A connection being made has to be looked at again soon, and nothing on
+        // the list screen would otherwise ask for a repaint.
+        if self.connecting.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let dialog = self.dialog.is_some() || self.address.is_some() || self.controls.is_some();
 
         if matches!(self.screen, Screen::List(_)) {
             return;
@@ -561,10 +1100,18 @@ impl eframe::App for App {
         // before anything else is read: `logic` runs before `ui`, so without
         // this the Escape that closes the dialog would first be taken here as
         // "back to the list", and the path being typed would drive the joypad.
+        // The controller dialog counts for the same reason twice over: the
+        // buttons being pressed at it are being pressed *at it*, and a game
+        // left running underneath would take every one of them as well.
         if dialog {
             match &mut self.screen {
                 Screen::Playing(session) => session.pause(),
                 Screen::Linked(pair) => pair.pause(),
+                // Not paused: the other machine is still running, and a console
+                // that stops while a dialog is open is one that stops answering
+                // its partner. Pausing here would look to them like a link that
+                // died because somebody opened a menu.
+                Screen::Networked(_) => {}
                 Screen::List(_) => {}
             }
             return;
@@ -577,16 +1124,20 @@ impl eframe::App for App {
             return;
         }
 
-        // The keyboard is read here and not inside the session because the
-        // session no longer knows what a keyboard is. Right before emulating, so
-        // that the buttons are set when the game reads the joypad.
+        // A cable that ended while the game did not. Noted here and acted on
+        // below, once the borrow on the screen is over.
+        let mut cable_ended = None;
+
+        // The keyboard and the controller are read here and not inside the
+        // session because the session no longer knows what either of them is:
+        // it is handed ten buttons and told which are down. Right before
+        // emulating, so that they are set when the game reads the joypad.
+        let pressed = held(ctx, &self.pads);
         let (result, frames) = match &mut self.screen {
             Screen::Playing(session) => {
-                ctx.input(|i| {
-                    for (key, button) in KEYS {
-                        session.press(button, i.key_down(key));
-                    }
-                });
+                for (button, down) in pressed {
+                    session.press(button, down);
+                }
                 if ctx.input(|i| i.key_pressed(Key::D)) {
                     session.capture();
                 }
@@ -611,16 +1162,46 @@ impl eframe::App for App {
                 // Only the console holding the keyboard is told about the keys.
                 // The other one is not merely ignored, it is told nothing is
                 // pressed, which is not the same thing: see `swap_keyboard`.
-                ctx.input(|i| {
-                    for (key, button) in KEYS {
-                        pair.active().press(button, i.key_down(key));
-                    }
-                });
+                // The controller goes wherever the keyboard is: there is one of
+                // each and one player, and splitting them would leave whoever
+                // swapped playing two consoles at once.
+                for (button, down) in pressed {
+                    pair.active().press(button, down);
+                }
                 (pair.advance(ctx, &mut self.textures), pair.frames())
+            }
+            Screen::Networked(wired) => {
+                for (button, down) in pressed {
+                    wired.console.press(button, down);
+                }
+                if ctx.input(|i| i.key_pressed(Key::D)) {
+                    wired.console.capture();
+                }
+                let Wired { console, remote } = &mut **wired;
+                let outcome = match console.advance_over(remote, ctx, &mut self.textures[0]) {
+                    Ok(()) => Ok(()),
+                    // The console itself fell over: there is no game to keep.
+                    Err(Trouble::Fault(fault)) => Err(crate::describe_fault(fault)),
+                    // The cable ended and the game did not. Throwing the session
+                    // away here is what sent a player back to the list of ROMs
+                    // because somebody else closed their window — and with it
+                    // went everything the game had not saved. The cable comes
+                    // out instead, and the reason is put where it can be read.
+                    Err(trouble) => {
+                        cable_ended = Some(trouble.to_string());
+                        Ok(())
+                    }
+                };
+                (outcome, console.frames)
             }
             Screen::List(_) => return,
         };
 
+        if let Some(why) = cable_ended {
+            self.unplug(ctx);
+            self.notice = Some(why);
+            return;
+        }
         if let Err(failure) = result {
             self.back_to_list(ctx, Some(first_line(&failure)));
             return;
@@ -636,6 +1217,8 @@ impl eframe::App for App {
         if let Some(dir) = self.folder_dialog(&ctx) {
             self.change_folder(dir);
         }
+        self.address_dialog(&ctx);
+        self.controls_dialog(&ctx);
 
         let request = match &mut self.screen {
             Screen::List(list) => list.ui(ui),
@@ -645,6 +1228,10 @@ impl eframe::App for App {
             }
             Screen::Linked(pair) => {
                 pair.ui(ui, &self.textures);
+                None
+            }
+            Screen::Networked(wired) => {
+                wired.console.ui(ui, &self.textures[0]);
                 None
             }
         };
@@ -660,6 +1247,7 @@ impl eframe::App for App {
         match &mut self.screen {
             Screen::Playing(session) => session.close(),
             Screen::Linked(pair) => pair.close(),
+            Screen::Networked(wired) => wired.console.close(),
             Screen::List(_) => {}
         }
     }
@@ -747,6 +1335,11 @@ struct List {
     dir: PathBuf,
     entries: Vec<roms::Entry>,
     filter: String,
+    /// Which machines' games to show. All three at once is the resting state
+    /// and the one a collection is normally looked at through — the toggles are
+    /// for the moment somebody wants only one of them, not a setting to be
+    /// configured before the list is usable.
+    showing: [bool; roms::Kind::ALL.len()],
     /// Index **within what is visible**, not within `entries`.
     selection: usize,
     /// Ask for the chosen row to be brought into the visible part of the scroll.
@@ -757,21 +1350,48 @@ struct List {
 impl List {
     fn new(dir: PathBuf) -> Self {
         let entries = roms::scan(&dir);
-        Self { dir, entries, filter: String::new(), selection: 0, follow: false, warning: None }
+        Self {
+            dir,
+            entries,
+            filter: String::new(),
+            showing: [true; roms::Kind::ALL.len()],
+            selection: 0,
+            follow: false,
+            warning: None,
+        }
     }
 
-    /// Indices of `entries` that pass the typed filter.
+    /// Indices of `entries` that pass the typed filter and the machine
+    /// toggles.
     fn visible(&self) -> Vec<usize> {
-        if self.filter.trim().is_empty() {
-            return (0..self.entries.len()).collect();
-        }
-        let wanted = self.filter.to_lowercase();
+        let wanted = self.filter.trim().to_lowercase();
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.name.to_lowercase().contains(&wanted))
+            .filter(|(_, e)| self.shows(e.kind))
+            .filter(|(_, e)| wanted.is_empty() || e.name.to_lowercase().contains(&wanted))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn shows(&self, kind: roms::Kind) -> bool {
+        roms::Kind::ALL.iter().position(|k| *k == kind).is_some_and(|at| self.showing[at])
+    }
+
+    /// How many games of each machine the folder holds.
+    ///
+    /// Counted over everything and not over what is visible, so the number on a
+    /// switched-off button says how many would come back — a zero there is the
+    /// answer to "where are my Advance games", and a count that fell to zero
+    /// because the button is off would not be.
+    fn totals(&self) -> [usize; roms::Kind::ALL.len()] {
+        let mut totals = [0; roms::Kind::ALL.len()];
+        for entry in &self.entries {
+            if let Some(at) = roms::Kind::ALL.iter().position(|k| *k == entry.kind) {
+                totals[at] += 1;
+            }
+        }
+        totals
     }
 
     /// Draws the whole screen. Returns what it is asking for, if anything.
@@ -822,9 +1442,42 @@ impl List {
                     .hint_text("Search")
                     .desired_width(f32::INFINITY),
             );
+            ui.add_space(8.0);
+            self.machines(ui);
             ui.add_space(10.0);
         });
         change_folder
+    }
+
+    /// The three machine toggles, each with how many games of its kind the
+    /// folder holds.
+    ///
+    /// The counts are half the point. A column of names sorted alphabetically
+    /// says nothing about what is in the folder, and "GBA 6" beside the button
+    /// answers the question somebody is usually asking when they reach for a
+    /// filter at all.
+    ///
+    /// A machine the folder has none of is shown greyed rather than hidden: a
+    /// row of buttons that changes shape from folder to folder is a row nobody
+    /// can learn, and "GBA 0" is a useful thing to be told.
+    fn machines(&mut self, ui: &mut egui::Ui) {
+        let totals = self.totals();
+        ui.horizontal(|ui| {
+            for (at, kind) in roms::Kind::ALL.into_iter().enumerate() {
+                let label = format!("{}  {}", kind.label(), totals[at]);
+                let toggle = ui.add_enabled_ui(totals[at] > 0, |ui| {
+                    ui.toggle_value(&mut self.showing[at], label)
+                });
+                toggle.inner.on_hover_text(kind.machine());
+            }
+            // Turning the last one off would leave an empty list explained by
+            // nothing on screen, so the last one on cannot be turned off. It is
+            // not a rule to be learnt: with one showing, that button simply
+            // does not respond, and every other one does.
+            if self.showing.iter().filter(|on| **on).count() == 0 {
+                self.showing = [true; roms::Kind::ALL.len()];
+            }
+        });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, how_many: usize) {
@@ -899,8 +1552,16 @@ impl List {
                 // command line to add a flag to, and this screen is precisely
                 // the one they are looking at when the guess went wrong.
                 change_folder = accept(ui, "Choose the folder with the games").clicked();
-            } else {
+            } else if self.showing.iter().all(|on| *on) {
                 ui.label(RichText::new("No game matches the search").color(Color32::GRAY));
+            } else {
+                // Saying which one is off matters: the search box is visible
+                // and its contents obvious, and a button pressed some minutes
+                // ago is neither.
+                ui.label(
+                    RichText::new("No game matches the search on the machines shown")
+                        .color(Color32::GRAY),
+                );
             }
         });
         change_folder
@@ -1234,7 +1895,10 @@ impl Browser {
 
 /// Everything that lasts as long as a play session does.
 pub struct Session {
-    gb: GameBoy,
+    /// Which machine this is. Everything below that is the older machine's
+    /// alone — the cable, the saved game, the sound — asks this for a Game Boy
+    /// and does nothing when there is not one.
+    console: Console,
     pub title: String,
     /// The file this console was loaded from. Kept because the saved game's name
     /// is derived from it, and a linked pair may have to derive a second one.
@@ -1245,6 +1909,15 @@ pub struct Session {
     pixels: Vec<Color32>,
     /// When the next frame is due to be emulated.
     next: Instant,
+    /// How fast this is actually going. Measured always and shown only when
+    /// asked: the cost is two clock readings a pass, and a meter that only ran
+    /// while it was on screen would have nothing to say for the first half
+    /// second after being switched on — which is exactly the half second
+    /// somebody switching it on wants to see.
+    rate: Rate,
+    /// When the last pass through the loop was, for the meter to measure
+    /// against.
+    last_pass: Instant,
     frames: u64,
     trace: Option<debug::LiveTrace>,
     captures: u32,
@@ -1261,26 +1934,34 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(mut gb: GameBoy, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
-        gb.set_trace_enabled(args.debug);
-        gb.set_write_log_enabled(args.debug);
+    pub fn new(mut console: Console, rom: PathBuf, args: &Args, settings: &Settings) -> Self {
+        if let Some(gb) = console.gameboy_mut() {
+            gb.set_trace_enabled(args.debug);
+            gb.set_write_log_enabled(args.debug);
+        }
 
-        let save = if args.no_save {
-            None
-        } else {
-            let path = args.save.clone().unwrap_or_else(|| save::default_path(&rom));
-            save::SaveFile::open(&mut gb, path)
-        };
-        let title = gb.header().title.clone();
+        // Both machines keep a saved game, in memories that have nothing in
+        // common; what they agree on is a file, which is all this needs. See
+        // [`save::Battery`].
+        let save = (!args.no_save)
+            .then(|| {
+                let path = args.save.clone().unwrap_or_else(|| save::default_path(&rom));
+                save::SaveFile::open(&mut console, path)
+            })
+            .flatten();
+        let title = console.title();
+        let (width, height) = console.screen_size();
 
         let mut session = Self {
-            gb,
+            console,
             title,
             rom,
             save,
             audio: None,
-            pixels: vec![Color32::BLACK; SCREEN_WIDTH * SCREEN_HEIGHT],
+            pixels: vec![Color32::BLACK; width * height],
             next: Instant::now(),
+            rate: Rate::default(),
+            last_pass: Instant::now(),
             frames: 0,
             trace: args.debug.then(debug::LiveTrace::new),
             captures: 0,
@@ -1291,6 +1972,18 @@ impl Session {
         // touched has to come up the way the menu left things.
         session.apply(settings);
         session
+    }
+
+    /// What is wrong with this session that the player should hear about
+    /// before wondering, if anything.
+    ///
+    /// Only one thing so far: an Advance with no BIOS, which draws nothing and
+    /// gives no other sign of why. It goes on the menu bar rather than into a
+    /// dialog because it is a fact about the session and not a question — the
+    /// game does start, and stopping it to be told so every time would be worse
+    /// than the black screen it explains.
+    pub fn warning(&self) -> Option<String> {
+        self.console.missing_bios().then(|| crate::bios::ADVICE.to_string())
     }
 
     /// A second console in the state this one is in, down to the frame.
@@ -1307,7 +2000,9 @@ impl Session {
     /// games are the same save, with the same team in it. What it does not copy
     /// is where that save is written: see [`save::linked_path`].
     fn duplicate(&self, args: &Args, settings: &Settings) -> Self {
-        let gb = self.gb.clone();
+        // Only a Game Boy gets here: the cable is the older machine's alone and
+        // the menu entry that leads here is greyed out for anything else.
+        let gb = self.gb().expect("only a Game Boy has a link cable").clone();
         let save = self.save.as_ref().and_then(|_| {
             let path = save::linked_path(&self.rom);
             eprintln!("the second console saves to {}", path.display());
@@ -1315,13 +2010,15 @@ impl Session {
         });
 
         let mut copy = Self {
-            gb,
+            console: Console::Gb(Box::new(gb)),
             title: self.title.clone(),
             rom: self.rom.clone(),
             save,
             audio: None,
             pixels: self.pixels.clone(),
             next: Instant::now(),
+            rate: Rate::default(),
+            last_pass: Instant::now(),
             frames: self.frames,
             trace: args.debug.then(debug::LiveTrace::new),
             captures: 0,
@@ -1349,14 +2046,125 @@ impl Session {
 
     /// Pushes the menu's settings into the running console.
     pub fn apply(&mut self, settings: &Settings) {
-        self.gb.set_dmg_shades(settings.palette().shades);
-        self.gb.set_speaker_filter(settings.speaker_filter);
-        match (settings.sound && !self.muted, self.audio.is_some()) {
+        let sound = settings.sound && !self.muted;
+        match (sound, self.audio.is_some()) {
             // Dropping the output stops the stream, and from then on the frame's
             // samples are discarded instead of piling up.
             (false, true) => self.audio = None,
-            (true, false) => self.audio = crate::open_audio(&mut self.gb, true),
+            (true, false) => {
+                self.audio = crate::open_audio(true);
+                if let Some(output) = &self.audio {
+                    self.console.set_sample_rate(output.sample_rate());
+                }
+            }
             _ => {}
+        }
+
+        // The rest of the settings are the older machine's alone: the shades
+        // are a DMG palette and the filter stands in for its speaker. The
+        // Advance has neither, and takes none of this rather than being given a
+        // stand-in for something it has not got.
+        let (filter, shades) = (settings.speaker_filter, settings.palette().shades);
+        if let Some(gb) = self.console.gameboy_mut() {
+            gb.set_dmg_shades(shades);
+            gb.set_speaker_filter(filter);
+        }
+    }
+
+    /// The console itself, for whoever has to ask it the time or step it aside.
+    pub fn console_mut(&mut self) -> &mut Console {
+        &mut self.console
+    }
+
+    pub fn console(&self) -> &Console {
+        &self.console
+    }
+
+    /// The Game Boy inside, if this is one.
+    ///
+    /// Everything that reaches through this is the older machine's alone: the
+    /// link cable, the mapper's saved game, the sound, the debug captures. None
+    /// of it exists on the Advance yet, and where it does not, the answer is
+    /// nothing rather than a stand-in.
+    fn gb(&self) -> Option<&GameBoy> {
+        self.console.gameboy()
+    }
+
+    fn gb_mut(&mut self) -> Option<&mut GameBoy> {
+        self.console.gameboy_mut()
+    }
+
+    /// Emulates whatever is due, with the far end of a cable saying how far.
+    ///
+    /// The wall clock still decides *when* a frame is owed —a link that answers
+    /// instantly must not run the game at a thousand frames a second— and the
+    /// link decides whether it can be delivered.
+    ///
+    /// The trouble comes back whole rather than as a sentence, because the two
+    /// kinds are not the same news: a console that fell over has no game left to
+    /// go back to, and a cable that ended has the same game it had a moment ago.
+    /// Only the caller knows what to do about each.
+    pub fn advance_over(
+        &mut self,
+        remote: &mut Remote,
+        ctx: &egui::Context,
+        texture: &mut TextureHandle,
+    ) -> Result<(), Trouble> {
+        let period = self.frame_period();
+        let now = Instant::now();
+        let mut emulated = 0;
+        let mut stalled = false;
+        let mut failure = None;
+
+        let started = Instant::now();
+        while self.next <= now && emulated < MAX_CATCH_UP {
+            let Some(gb) = self.console.gameboy_mut() else {
+                break;
+            };
+            match remote.run_frame(gb, &mut FrameSink { pixels: &mut self.pixels }) {
+                Ok(true) => {
+                    self.after_frame();
+                    self.next += period;
+                    emulated += 1;
+                }
+                // The other console has not got this far yet. The clock is put
+                // back rather than left owing: a wait is not a debt, and running
+                // it off at double speed afterwards would be a worse answer than
+                // having waited.
+                Ok(false) => {
+                    self.next = Instant::now();
+                    stalled = true;
+                    break;
+                }
+                Err(trouble) => {
+                    failure = Some(trouble);
+                    break;
+                }
+            }
+        }
+        self.measure(emulated, started.elapsed());
+        if emulated == MAX_CATCH_UP {
+            self.next = Instant::now();
+        }
+        if emulated > 0 {
+            texture.set(
+                ColorImage::new(self.screen_size(), self.pixels.clone()),
+                TextureOptions::NEAREST,
+            );
+        }
+        // Stalled, come straight back: `run_frame` does its waiting on the wire
+        // rather than spinning, so asking again at once is what turns a link
+        // answering in a millisecond into a millisecond of waiting instead of a
+        // frame of it.
+        ctx.request_repaint_after(if stalled {
+            Duration::ZERO
+        } else {
+            self.next.saturating_duration_since(Instant::now())
+        });
+
+        match failure {
+            Some(f) => Err(f),
+            None => Ok(()),
         }
     }
 
@@ -1364,6 +2172,23 @@ impl Session {
     /// the session owing every frame the user spent reading.
     pub fn pause(&mut self) {
         self.next = Instant::now();
+        // And the meter forgets the pause with it, or a dialog left open would
+        // be reported as a machine that had slowed to nothing.
+        self.last_pass = Instant::now();
+        self.rate.interrupted();
+    }
+
+    /// Notes a pass of the loop for the meter.
+    fn measure(&mut self, emulated: u32, spent: Duration) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last_pass);
+        self.last_pass = now;
+        self.rate.pass(elapsed, emulated, spent);
+    }
+
+    /// How fast this session is going, once there has been long enough to say.
+    pub fn rate(&self) -> Option<rate::Reading> {
+        self.rate.reading()
     }
 
     /// Presses or releases a joypad button.
@@ -1374,8 +2199,8 @@ impl Session {
     /// console is not to know which. Whoever calls this must do so **before**
     /// [`Session::advance`], so the buttons are already set when the game reads
     /// 0xFF00 during VBlank.
-    pub fn press(&mut self, button: Button, down: bool) {
-        self.gb.set_button(button, down);
+    pub fn press(&mut self, button: Pad, down: bool) {
+        self.console.press(button, down);
     }
 
     /// Emulates whatever is due and uploads the result to the texture.
@@ -1384,10 +2209,14 @@ impl Session {
         ctx: &egui::Context,
         texture: &mut TextureHandle,
     ) -> Result<(), String> {
-        let period = Duration::from_secs_f64(1.0 / FRAMES_PER_SECOND);
+        let period = self.frame_period();
         let now = Instant::now();
         let mut emulated = 0;
         let mut failure = None;
+        // What the emulating itself costs, measured around the loop and not
+        // around the whole pass: the rest of a pass is egui drawing a window,
+        // which is not what anybody is asking about.
+        let started = Instant::now();
         while self.next <= now && emulated < MAX_CATCH_UP {
             if let Err(f) = self.frame() {
                 failure = Some(f);
@@ -1396,6 +2225,7 @@ impl Session {
             self.next += period;
             emulated += 1;
         }
+        self.measure(emulated, started.elapsed());
         if emulated == MAX_CATCH_UP {
             // We are running really late: the debt is dropped instead of running
             // faster over the next few seconds.
@@ -1404,7 +2234,7 @@ impl Session {
 
         if emulated > 0 {
             texture.set(
-                ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], self.pixels.clone()),
+                ColorImage::new(self.screen_size(), self.pixels.clone()),
                 TextureOptions::NEAREST,
             );
         }
@@ -1419,12 +2249,29 @@ impl Session {
         }
     }
 
+    /// One frame of whichever machine this is.
+    ///
+    /// The two arrive at a picture differently — the older core pushes a
+    /// finished frame into a sink, the Advance draws into a buffer of its own
+    /// and hands it over — so this is where the difference lives and the only
+    /// place it does.
     fn frame(&mut self) -> Result<(), String> {
-        // `gb` and `pixels` are distinct fields, so both borrows coexist; the
-        // sink only exists during this call.
-        let result = self.gb.run_frame(&mut FrameSink { pixels: &mut self.pixels });
+        let result = match &mut self.console {
+            // `console` and `pixels` are distinct fields, so both borrows
+            // coexist; the sink only exists during this call.
+            Console::Gb(gb) => gb
+                .run_frame(&mut FrameSink { pixels: &mut self.pixels })
+                .map_err(crate::describe_fault),
+            Console::Gba(gba) => {
+                let outcome = gba.run_frame().map_err(|stopped| stopped.to_string());
+                for (target, &colour) in self.pixels.iter_mut().zip(gba.frame()) {
+                    *target = from_rgb555(colour);
+                }
+                outcome
+            }
+        };
         self.after_frame();
-        result.map_err(crate::describe_fault)
+        result
     }
 
     /// One frame of a linked pair.
@@ -1434,10 +2281,19 @@ impl Session {
     /// what the other did on its last, so they cannot be advanced one after the
     /// other. [`link::run_frame`] interleaves them instruction by instruction.
     fn linked_frame(a: &mut Self, b: &mut Self) -> Result<(), String> {
+        // Both sides are Game Boys: the cable is theirs and the menu offers it
+        // for nothing else.
+        let (Some(_), Some(_)) = (a.gb(), b.gb()) else {
+            return Err("only a Game Boy has a link cable".to_string());
+        };
+        let [ga, gb_console] = [&mut a.console, &mut b.console];
+        let (Console::Gb(ga), Console::Gb(gbb)) = (ga, gb_console) else {
+            unreachable!("checked just above")
+        };
         let result = link::run_frame(
-            &mut a.gb,
+            ga,
             &mut FrameSink { pixels: &mut a.pixels },
-            &mut b.gb,
+            gbb,
             &mut FrameSink { pixels: &mut b.pixels },
         );
         a.after_frame();
@@ -1457,17 +2313,30 @@ impl Session {
     /// The housekeeping an emulated frame owes, however it was emulated: audio
     /// out, serial out, autosave and trace.
     fn after_frame(&mut self) {
-        crate::drain_audio(&mut self.gb, self.audio.as_ref());
-        crate::drain_serial(&mut self.gb, self.serial);
+        self.frames += 1;
+        // Both machines make sound, so this comes first and out of the console
+        // rather than out of a Game Boy. It has to happen whether or not there
+        // is a sound card: uncollected samples pile up for the whole session.
+        crate::drain_audio(&mut self.console, self.audio.as_ref());
+        // Both machines keep a saved game, so this comes out of the console too
+        // and not out of a Game Boy.
         if let Some(save) = self.save.as_mut() {
-            save.tick(&self.gb);
+            save.tick(&self.console);
         }
+
+        // The rest is the older machine's: the serial port and the debug
+        // capture. The Advance has neither here yet, and doing nothing is the
+        // honest answer.
+        let serial = self.serial;
+        let Some(gb) = self.console.gameboy_mut() else {
+            return;
+        };
+        crate::drain_serial(gb, serial);
         // It has to be drained every frame even if nothing is printed: otherwise
         // the core's capture would pile up 144 lines per frame without end.
         if let Some(trace) = self.trace.as_mut() {
-            trace.frame(self.gb.take_frame_trace());
+            trace.frame(gb.take_frame_trace());
         }
-        self.frames += 1;
     }
 
     /// Dumps the frame and the VRAM as images, with `--debug`.
@@ -1477,7 +2346,11 @@ impl Session {
         }
         self.captures += 1;
         // The captures go to the current directory, not next to the ROM.
-        match debug::snapshot(&self.gb, Path::new("."), self.captures) {
+        let Some(gb) = self.gb() else {
+            eprintln!("warning: captures are a Game Boy's, and this is not one");
+            return;
+        };
+        match debug::snapshot(gb, Path::new("."), self.captures) {
             Ok(path) => eprintln!("capture written to {}", path.display()),
             Err(e) => eprintln!("warning: {e}"),
         }
@@ -1487,8 +2360,28 @@ impl Session {
     /// window.
     pub fn close(&mut self) {
         if let Some(save) = self.save.as_mut() {
-            save.flush_final(&self.gb);
+            save.flush_final(&self.console);
         }
+    }
+
+    /// How long one of this machine's frames is owed to last.
+    ///
+    /// Asked of the console rather than assumed, because the two rates are not
+    /// the same. Running one machine at the other's rate is a game that is
+    /// slightly the wrong speed all the time — which is harder to notice, and
+    /// worse, than one that is obviously broken.
+    fn frame_period(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.console.frames_per_second())
+    }
+
+    /// How big this machine's screen is, as `egui` wants it.
+    ///
+    /// Asked rather than assumed: the two machines are 160×144 and 240×160, and
+    /// a texture built to the wrong one either crops the picture or pads it
+    /// with whatever was in memory.
+    pub fn screen_size(&self) -> [usize; 2] {
+        let (width, height) = self.console.screen_size();
+        [width, height]
     }
 
     /// The screen, centred and with integer scaling.
@@ -1505,14 +2398,7 @@ impl Session {
     fn paint(&self, ui: &mut egui::Ui, texture: &TextureHandle, area: egui::Rect) -> egui::Rect {
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
 
-        // The factor is rounded down so that a Game Boy pixel is an exact N×N
-        // square. With a fractional factor, some rows of pixels would come out
-        // one thickness and others another.
-        let scale = (area.width() / SCREEN_WIDTH as f32)
-            .min(area.height() / SCREEN_HEIGHT as f32)
-            .floor()
-            .max(1.0);
-        let size = Vec2::new(SCREEN_WIDTH as f32 * scale, SCREEN_HEIGHT as f32 * scale);
+        let size = picture_size(area.size(), self.screen_size(), ui.ctx().pixels_per_point());
         let picture = egui::Rect::from_center_size(area.center(), size);
 
         ui.painter().image(
@@ -1522,6 +2408,54 @@ impl Session {
             Color32::WHITE,
         );
         picture
+    }
+}
+
+/// How big the picture comes out, in points, inside an area that many points
+/// across.
+///
+/// The factor is rounded down so that a console pixel is an exact N×N square:
+/// with a fractional one, some rows would come out a thickness and the next
+/// another. But it is counted **in the screen's own pixels**, and that is the
+/// part that is easy to get wrong, because on a desktop a point *is* a pixel
+/// and the two readings agree — a telephone is where they part. There a point
+/// is about two and three quarter pixels, so a whole number of points is not a
+/// whole number of pixels at all, and rounding in points threw away most of the
+/// glass: on a screen 393 points wide an Advance was drawn 240 points across,
+/// one point to the pixel, while the 1080 real pixels underneath had room for
+/// four each.
+///
+/// `dense` is guarded rather than trusted: it is divided by, and it arrives
+/// from the window system.
+fn picture_size(area: Vec2, screen: [usize; 2], dense: f32) -> Vec2 {
+    let dense = dense.max(0.1);
+    let [width, height] = screen;
+    let (width, height) = (width as f32, height as f32);
+    let scale =
+        (area.x * dense / width).min(area.y * dense / height).floor().max(1.0);
+    Vec2::new(width * scale, height * scale) / dense
+}
+
+/// A console whose partner is on another machine.
+///
+/// It is the network's answer to [`Pair`], and it is deliberately much less:
+/// there is one screen, one keyboard and one saved game, because the other
+/// console belongs to somebody else and has its own. Everything that made a
+/// local pair awkward —whose sound, whose `.sav`, whose turn with the keys— is
+/// simply not a question here.
+pub struct Wired {
+    console: Session,
+    remote: Remote,
+}
+
+impl Wired {
+    /// Pulls the cable out and gives the console back on its own.
+    fn split(mut self) -> Session {
+        self.remote.close();
+        if let Some(gb) = self.console.gb_mut() {
+            gb.set_link_connected(false);
+        }
+        self.console
     }
 }
 
@@ -1549,7 +2483,12 @@ pub struct Pair {
 
 impl Pair {
     fn new(mut a: Session, mut b: Session, settings: &Settings) -> Self {
-        link::connect(&mut a.gb, &mut b.gb);
+        if let (Some(_), Some(_)) = (a.gb(), b.gb()) {
+            let [ca, cb] = [&mut a.console, &mut b.console];
+            if let (Console::Gb(ga), Console::Gb(gbb)) = (ca, cb) {
+                link::connect(ga, gbb);
+            }
+        }
         // Only one console is heard; see `Session::muted`.
         b.set_muted(true, settings);
         Self { consoles: [a, b], focus: 0, next: Instant::now() }
@@ -1571,7 +2510,7 @@ impl Pair {
     /// one— and the abandoned game would spend the rest of the session walking
     /// into a wall.
     fn swap_keyboard(&mut self, settings: &Settings) {
-        for (_, button) in KEYS {
+        for button in Pad::ALL {
             self.consoles[self.focus].press(button, false);
         }
         self.focus ^= 1;
@@ -1617,7 +2556,9 @@ impl Pair {
         left.close();
         // Without this the console kept would sit waiting for an answer from an
         // end that no longer exists the next time its game tried to transfer.
-        kept.gb.set_link_connected(false);
+        if let Some(gb) = kept.console.gameboy_mut() {
+            gb.set_link_connected(false);
+        }
         // On its own again there is nobody left to share the speakers with.
         kept.set_muted(false, settings);
         kept
@@ -1634,6 +2575,7 @@ impl Pair {
         let mut emulated = 0;
         let mut failure = None;
 
+        let started = Instant::now();
         while self.next <= now && emulated < MAX_CATCH_UP {
             let [a, b] = &mut self.consoles;
             if let Err(f) = Session::linked_frame(a, b) {
@@ -1643,6 +2585,10 @@ impl Pair {
             self.next += period;
             emulated += 1;
         }
+        // A pair is one loop producing two consoles' frames, so the cost of
+        // both is charged to the one that is being watched.
+        let spent = started.elapsed();
+        self.consoles[0].measure(emulated, spent);
         if emulated == MAX_CATCH_UP {
             self.next = Instant::now();
         }
@@ -1650,7 +2596,7 @@ impl Pair {
         if emulated > 0 {
             for (console, texture) in self.consoles.iter().zip(textures.iter_mut()) {
                 texture.set(
-                    ColorImage::new([SCREEN_WIDTH, SCREEN_HEIGHT], console.pixels.clone()),
+                    ColorImage::new(console.screen_size(), console.pixels.clone()),
                     TextureOptions::NEAREST,
                 );
             }
@@ -1699,6 +2645,19 @@ struct FrameSink<'a> {
     pixels: &'a mut Vec<Color32>,
 }
 
+/// One 15-bit colour, as the texture wants it.
+///
+/// Both machines draw in the same five-bits-a-channel format — the one thing
+/// they do share — so this is the whole of the difference between what a core
+/// produces and what the screen takes.
+fn from_rgb555(colour: u16) -> Color32 {
+    let (r, g, b) = (colour & 0x1F, (colour >> 5) & 0x1F, (colour >> 10) & 0x1F);
+    // Five bits to eight by repeating the top three, so that 0x1F comes out as
+    // 0xFF rather than 0xF8 and white is actually white.
+    let widen = |c: u16| ((c << 3) | (c >> 2)) as u8;
+    Color32::from_rgb(widen(r), widen(g), widen(b))
+}
+
 impl VideoOutput for FrameSink<'_> {
     fn present(&mut self, frame: &FrameBuffer) {
         for (target, &color) in self.pixels.iter_mut().zip(frame.as_slice()) {
@@ -1712,6 +2671,168 @@ impl VideoOutput for FrameSink<'_> {
 mod tests {
     use super::*;
 
+    /// An Advance cartridge that paints one red pixel and stops.
+    ///
+    /// Hand-assembled, because the point is to check that a picture drawn by
+    /// the Advance core arrives in the frontend's pixels, and any ROM that
+    /// draws something known will do. Mode 3 is the one where a pixel is a
+    /// colour at an address, with no tiles or palettes in between.
+    fn red_pixel_rom() -> Vec<u8> {
+        let program: [u32; 7] = [
+            0xE3A0_0301, // MOV r0, #0x04000000   - the registers
+            0xE3A0_1003, // MOV r1, #3            - video mode 3
+            0xE381_1B01, // ORR r1, r1, #0x400    - and background 2 switched on
+            0xE580_1000, // STR r1, [r0]          - into DISPCNT
+            0xE3A0_0406, // MOV r0, #0x06000000   - video memory
+            0xE3A0_101F, // MOV r1, #0x1F         - red, five bits a channel
+            0xE1C0_10B0, // STRH r1, [r0]         - the very first pixel
+        ];
+        let mut rom: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // `B .` — a branch to itself, so the beam sweeps on with the picture
+        // standing still.
+        rom.extend_from_slice(&0xEAFF_FFFEu32.to_le_bytes());
+        rom.resize(0x200, 0);
+        rom
+    }
+
+    fn advance_session() -> Session {
+        let gba = akebia_gba::Gba::with_rom(&red_pixel_rom());
+        let mut args = match Args::parse(["game.gba".to_owned()]).unwrap() {
+            crate::args::Parsed::Run(args) => *args,
+            crate::args::Parsed::Help => unreachable!("a path is not --help"),
+        };
+        // Opening a session reads the saved game, so it is pointed somewhere
+        // that is not the working directory: a test must not depend on what
+        // happens to be lying next to it, nor leave anything there.
+        args.save =
+            Some(std::env::temp_dir().join(format!("akebia-advance-{}.sav", std::process::id())));
+        Session::new(
+            Console::Gba(Box::new(gba)),
+            PathBuf::from("game.gba"),
+            &args,
+            &Settings::from_args(&args),
+        )
+    }
+
+    /// The whole point of the frontend change, in one test: an Advance session
+    /// holds a screenful of the Advance's size, and what the core drew arrives
+    /// in it.
+    #[test]
+    fn an_advance_session_draws_the_advances_picture() {
+        let mut session = advance_session();
+        assert_eq!(session.screen_size(), [240, 160], "the Advance's screen");
+        assert_eq!(session.pixels.len(), 240 * 160, "and a buffer to match");
+
+        // Two frames: the first is whatever was already partly swept when the
+        // machine started, the second is drawn with the picture in place.
+        for _ in 0..2 {
+            session.frame().expect("a cartridge that paints and stops");
+        }
+
+        assert_eq!(session.pixels[0], Color32::from_rgb(255, 0, 0), "the pixel it painted");
+        assert_eq!(session.pixels[1], Color32::BLACK, "and nothing beside it");
+    }
+
+    /// An Advance keeps its saved game, in whichever of three chips its
+    /// cartridge carries, and in the same `.sav` the older machine uses. This
+    /// test used to assert the opposite, which was the honest answer while the
+    /// chips did not exist — and the reason it was worth having is that a
+    /// machine that quietly keeps nothing loses a player's afternoon.
+    #[test]
+    fn an_advance_session_keeps_its_saved_game() {
+        let session = advance_session();
+        assert!(session.save.is_some());
+        assert!(session.gb().is_none(), "and there is still no Game Boy in it");
+    }
+
+    /// The two machines run at their own rates. One at the other's is a game
+    /// that is subtly the wrong speed the whole time.
+    #[test]
+    fn each_machine_is_paced_at_its_own_rate() {
+        let advance = advance_session().frame_period();
+        assert!(advance.as_secs_f64() > 0.0 && advance.as_secs_f64() < 0.02, "{advance:?}");
+    }
+
+    /// The two machines' screens, for the arithmetic that lays a picture out.
+    const GAME_BOY: [usize; 2] = [160, 144];
+    const ADVANCE: [usize; 2] = [240, 160];
+
+    /// The densities a picture is laid out at: a plain desktop, a desktop that
+    /// doubles, and a telephone, which is the one where a point stopped being a
+    /// pixel.
+    const DENSITIES: [f32; 4] = [1.0, 2.0, 2.75, 3.5];
+
+    /// The bug this arithmetic was pulled out for. On the telephone the whole
+    /// picture band is about 393×430 points, and rounding the factor there gave
+    /// an Advance one point per pixel — 240 points of a 393-point screen, with
+    /// black on both sides of it — because 393/240 is 1.6 and 1.6 rounds down to
+    /// one. Underneath those 393 points there are 1080 real ones, which is four
+    /// each and change.
+    #[test]
+    fn a_pixel_is_measured_on_the_glass_and_not_in_points() {
+        let band = Vec2::new(393.0, 430.0);
+        let size = picture_size(band, ADVANCE, 2.75);
+        assert!(size.x > 340.0, "the Advance was left {:.0} points across", size.x);
+        assert!(size.x <= band.x && size.y <= band.y, "and it does not overflow the band");
+    }
+
+    /// Which is what «an exact square» means, and the whole reason the factor is
+    /// rounded down at all. Counted in points it was a whole number of the wrong
+    /// unit: two points to a Game Boy pixel on a telephone is five and a half
+    /// real ones, which is not a square of anything.
+    #[test]
+    fn every_console_pixel_comes_out_a_whole_number_of_real_ones() {
+        for dense in DENSITIES {
+            for (name, screen) in [("Game Boy", GAME_BOY), ("Advance", ADVANCE)] {
+                let size = picture_size(Vec2::new(393.0, 430.0), screen, dense);
+                let across = size.x * dense / screen[0] as f32;
+                assert!(
+                    (across - across.round()).abs() < 1e-3,
+                    "{name} at {dense}×: {across} real pixels to a console one"
+                );
+                let down = size.y * dense / screen[1] as f32;
+                assert!((across - down).abs() < 1e-3, "{name} at {dense}×: not a square");
+            }
+        }
+    }
+
+    /// A picture bigger than the area it was given is one drawn over the
+    /// controls, and on a telephone that is the thumb's half of the glass.
+    #[test]
+    fn the_picture_stays_inside_what_it_was_offered() {
+        let areas = [Vec2::new(393.0, 430.0), Vec2::new(338.0, 365.0), Vec2::new(1920.0, 1080.0)];
+        for area in areas {
+            for dense in DENSITIES {
+                for screen in [GAME_BOY, ADVANCE] {
+                    let size = picture_size(area, screen, dense);
+                    assert!(
+                        size.x <= area.x + 1e-3 && size.y <= area.y + 1e-3,
+                        "{size:?} does not fit in {area:?} at {dense}×"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where a point is a pixel the reading is the one it always was, and this
+    /// says so: the desktop is the machine the old arithmetic was right on, and
+    /// it must not have moved underneath it.
+    #[test]
+    fn nothing_changes_where_a_point_is_already_a_pixel() {
+        let area = Vec2::new(1920.0, 1080.0);
+        assert_eq!(picture_size(area, GAME_BOY, 1.0), Vec2::new(160.0 * 7.0, 144.0 * 7.0));
+        assert_eq!(picture_size(area, ADVANCE, 1.0), Vec2::new(240.0 * 6.0, 160.0 * 6.0));
+    }
+
+    /// An area too small for even one pixel each still gets a picture. It comes
+    /// out too big and is clipped, which is a bad frame; a factor of zero is a
+    /// picture of nothing at all, which is a black screen with no explanation.
+    #[test]
+    fn a_picture_never_shrinks_away_to_nothing() {
+        let size = picture_size(Vec2::new(40.0, 30.0), ADVANCE, 1.0);
+        assert_eq!(size, Vec2::new(240.0, 160.0));
+    }
+
     fn list(names: &[&str]) -> List {
         List {
             dir: PathBuf::from("/roms"),
@@ -1722,13 +2843,64 @@ mod tests {
                     name: (*n).to_owned(),
                     mapper: "MBC1".to_owned(),
                     cgb: CgbSupport::None,
+                    kind: roms::Kind::GameBoy,
                 })
                 .collect(),
             filter: String::new(),
+            showing: [true; roms::Kind::ALL.len()],
             selection: 0,
             follow: false,
             warning: None,
         }
+    }
+
+    /// A list holding one game of each machine, for the toggles.
+    fn mixed() -> List {
+        let mut list = list(&["alfa", "beta", "gamma", "delta"]);
+        list.entries[1].kind = roms::Kind::Color;
+        list.entries[2].kind = roms::Kind::Advance;
+        list.entries[3].kind = roms::Kind::Advance;
+        list
+    }
+
+    #[test]
+    fn the_folder_is_counted_by_machine() {
+        assert_eq!(mixed().totals(), [1, 1, 2]);
+    }
+
+    /// The whole point of the toggles: one machine's games, out of a folder
+    /// that holds everybody's.
+    #[test]
+    fn switching_a_machine_off_takes_its_games_out_of_the_list() {
+        let mut list = mixed();
+        assert_eq!(list.visible().len(), 4, "everything, to begin with");
+
+        list.showing = [false, false, true];
+        let names: Vec<&str> =
+            list.visible().iter().map(|&i| list.entries[i].name.as_str()).collect();
+        assert_eq!(names, ["gamma", "delta"], "the two Advance games and nothing else");
+    }
+
+    /// And the counts do not move when a button is switched off. A zero beside
+    /// "GBA" has to mean the folder has none, or it answers a different
+    /// question from the one being asked.
+    #[test]
+    fn the_counts_are_of_the_folder_and_not_of_what_is_shown() {
+        let mut list = mixed();
+        list.showing = [true, false, false];
+        assert_eq!(list.totals(), [1, 1, 2]);
+    }
+
+    /// The two filters are one filter. Typing a name while a machine is off
+    /// must not bring that machine's games back.
+    #[test]
+    fn the_search_and_the_machines_narrow_together() {
+        let mut list = mixed();
+        list.showing = [true, false, false];
+        list.filter = "a".to_owned();
+        let names: Vec<&str> =
+            list.visible().iter().map(|&i| list.entries[i].name.as_str()).collect();
+        assert_eq!(names, ["alfa"], "gamma and delta match the search and are not shown");
     }
 
     #[test]

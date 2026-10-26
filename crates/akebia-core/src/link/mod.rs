@@ -18,8 +18,9 @@
 //!
 //! # Keeping the two clocks together
 //!
-//! [`step`] always advances **whichever console is behind** in T-cycles. That
-//! leaves them apart by at most one instruction —some twenty T-cycles— against
+//! [`step`] always advances **whichever console is behind** in 4 MiHz units,
+//! using [`GameBoy::link_cycles`] so CGB double speed does not change the rate.
+//! That leaves them apart by at most one instruction —some twenty T-cycles— against
 //! the 512 a single bit lasts, so neither can get so much as a bit ahead of the
 //! other. That is the whole synchronisation, and it is why nothing here has to
 //! stall anybody.
@@ -31,6 +32,9 @@
 //! [`GameBoy::link_clock_in`]. Over a socket the shape stays the same; what
 //! changes is that the answer no longer arrives in the same instant, and *that*
 //! is where a real cycle-count protocol becomes necessary.
+
+pub mod bgb;
+pub mod session;
 
 use crate::cpu::Fault;
 use crate::gameboy::T_CYCLES_PER_FRAME;
@@ -94,12 +98,37 @@ pub fn connect(a: &mut GameBoy, b: &mut GameBoy) {
     // Both are put on one clock, reading the same instant. Without this, joining
     // a console just switched on to one that has been played for an hour would
     // make the first linked frame emulate that whole hour to catch it up.
-    let now = a.t_cycles().max(b.t_cycles());
+    let now = a.link_cycles().max(b.link_cycles());
     // Which of the two is the late one is arbitrary —only the gap matters— and
     // it falls on `a` so that whoever ends up waiting as slave has been
     // listening for a while before the other takes the clock.
-    a.offset_clock(now - a.t_cycles() + SWITCH_ON_STAGGER);
-    b.offset_clock(now - b.t_cycles());
+    a.offset_clock(now - a.link_cycles() + SWITCH_ON_STAGGER);
+    b.offset_clock(now - b.link_cycles());
+}
+
+/// Runs a console on its own for [a fraction of a frame](SWITCH_ON_STAGGER),
+/// so that two which would otherwise be in perfect step are not.
+///
+/// It is the same tie-break [`connect`] arranges, for a cable that does not go
+/// between two consoles in one process. There, one clock can simply be declared
+/// to read later than the other and the stepping does the rest; over a network
+/// there is no shared clock to declare anything about, and the only way to move
+/// a console's `DIV`, its VBlank and every countdown a game derives from them is
+/// to actually live those cycles.
+///
+/// Exactly one of the two ends should call it — the one that dialled, say, since
+/// exactly one of them did. Both calling it puts them right back in step.
+///
+/// A fault here is not reported: the console is about to be run properly, and
+/// whatever it fell over on it will fall over on again, where the caller is
+/// looking.
+pub fn stagger(gb: &mut GameBoy) {
+    let until = gb.link_cycles() + SWITCH_ON_STAGGER;
+    while gb.link_cycles() < until {
+        if gb.step().is_err() {
+            return;
+        }
+    }
 }
 
 /// Pulls the cable out of both.
@@ -116,7 +145,7 @@ pub fn disconnect(a: &mut GameBoy, b: &mut GameBoy) {
 /// The instruction goes to whichever console is behind, which is what keeps the
 /// two clocks from drifting apart.
 pub fn step(a: &mut GameBoy, b: &mut GameBoy) -> Result<(), LinkFault> {
-    if a.t_cycles() <= b.t_cycles() {
+    if a.link_cycles() <= b.link_cycles() {
         a.step().map_err(|fault| LinkFault { side: Side::A, fault })?;
     } else {
         b.step().map_err(|fault| LinkFault { side: Side::B, fault })?;
@@ -139,11 +168,11 @@ pub fn run_frame(
 ) -> Result<(), LinkFault> {
     // The same safety bound as the single-console version: a game that turns the
     // LCD off produces no frames, and without this the loop would not end.
-    let limit = a.t_cycles().max(b.t_cycles()) + u64::from(T_CYCLES_PER_FRAME) * 2;
+    let limit = a.link_cycles().max(b.link_cycles()) + u64::from(T_CYCLES_PER_FRAME) * 2;
     let (mut done_a, mut done_b) = (false, false);
 
     while !(done_a && done_b) {
-        if a.t_cycles().min(b.t_cycles()) >= limit {
+        if a.link_cycles().min(b.link_cycles()) >= limit {
             break;
         }
         step(a, b)?;
@@ -176,12 +205,14 @@ pub fn exchange(a: &mut GameBoy, b: &mut GameBoy) {
         // the byte it means to send. Asking it early —which is what stepping the
         // one behind leaves you doing— reads the register one instruction before
         // the game filled it.
-        (Some(from_a), None) if b.t_cycles() >= a.t_cycles() => {
-            let from_b = b.link_clock_in(from_a);
+        (Some(from_a), None) if b.link_cycles() >= a.link_cycles() => {
+            // A console that armed nothing gives up no byte, and the line it
+            // leaves alone rests high.
+            let from_b = b.link_clock_in(from_a).unwrap_or(crate::serial::IDLE_LINE);
             a.link_complete(from_b);
         }
-        (None, Some(from_b)) if a.t_cycles() >= b.t_cycles() => {
-            let from_a = a.link_clock_in(from_b);
+        (None, Some(from_b)) if a.link_cycles() >= b.link_cycles() => {
+            let from_a = a.link_clock_in(from_b).unwrap_or(crate::serial::IDLE_LINE);
             b.link_complete(from_a);
         }
         // Either nothing is in flight, or the answering end has not caught up
@@ -203,7 +234,7 @@ mod tests {
         let program: &[u8] = &[
             0x3E, byte, // LD A,byte
             0xE0, 0x01, // LDH (SB),A
-            0x3E, sc,   // LD A,sc
+            0x3E, sc, // LD A,sc
             0xE0, 0x02, // LDH (SC),A
             0x18, 0xFE, // JR -2
         ];
@@ -215,7 +246,7 @@ mod tests {
     /// both clocks read the same instant and anything else can be measured
     /// against them.
     fn level(a: &mut GameBoy, b: &mut GameBoy) {
-        while a.t_cycles().abs_diff(b.t_cycles()) > 512 {
+        while a.link_cycles().abs_diff(b.link_cycles()) > 512 {
             step(a, b).unwrap();
         }
     }
@@ -302,7 +333,7 @@ mod tests {
 
         for _ in 0..4000 {
             step(&mut a, &mut b).unwrap();
-            let drift = a.t_cycles().abs_diff(b.t_cycles());
+            let drift = a.link_cycles().abs_diff(b.link_cycles());
             assert!(drift < 512, "the consoles drifted {drift} T-cycles apart");
         }
     }
@@ -320,7 +351,7 @@ mod tests {
     #[test]
     fn a_console_that_armed_nothing_never_echoes_the_byte_it_was_sent() {
         let mut a = GameBoy::new(sender(0x01, 0x81)).unwrap(); // drives the clock
-        // `SC` without the start bit: the game is not listening to the cable.
+                                                               // `SC` without the start bit: the game is not listening to the cable.
         let mut b = GameBoy::new(sender(0x99, 0x00)).unwrap();
         connect(&mut a, &mut b);
         run(&mut a, &mut b);
@@ -357,7 +388,37 @@ mod tests {
         run_frame(&mut a, &mut NullOutput, &mut b, &mut NullOutput).unwrap();
 
         let frame = u64::from(T_CYCLES_PER_FRAME);
-        assert!(a.t_cycles() >= frame / 2, "console A barely moved: {}", a.t_cycles());
-        assert!(b.t_cycles() >= frame / 2, "console B barely moved: {}", b.t_cycles());
+        assert!(a.link_cycles() >= frame / 2, "console A barely moved: {}", a.link_cycles());
+        assert!(b.link_cycles() >= frame / 2, "console B barely moved: {}", b.link_cycles());
+    }
+
+    #[test]
+    fn different_cpu_speeds_keep_the_same_video_and_cable_time() {
+        use crate::Model;
+
+        let mut fast_rom = sender(0x42, 0x81);
+        // Switch speed before entering an idle loop, with no serial activity.
+        let program = [0x3E, 0x01, 0xE0, 0x4D, 0x10, 0x00, 0x18, 0xFE];
+        fast_rom[0x100..0x108].copy_from_slice(&program);
+        let mut a = GameBoy::new_as(fast_rom, Model::Cgb).unwrap();
+        let mut b = GameBoy::new(sender(0, 0)).unwrap();
+        connect(&mut a, &mut b);
+        level(&mut a, &mut b);
+        // Run through the switch and the initial clock stagger.
+        for _ in 0..10_000 {
+            step(&mut a, &mut b).unwrap();
+        }
+        assert!(a.bus().double_speed());
+        let cpu_start = (a.t_cycles(), b.t_cycles());
+        let time_start = (a.link_cycles(), b.link_cycles());
+        for _ in 0..30_000 {
+            step(&mut a, &mut b).unwrap();
+            assert!(a.link_cycles().abs_diff(b.link_cycles()) <= 24);
+        }
+        let elapsed_a = a.link_cycles() - time_start.0;
+        let elapsed_b = b.link_cycles() - time_start.1;
+        assert!(elapsed_a.abs_diff(elapsed_b) <= 24);
+        assert_eq!(a.t_cycles() - cpu_start.0, 2 * elapsed_a);
+        assert_eq!(b.t_cycles() - cpu_start.1, elapsed_b);
     }
 }

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/akebia-android", "crates/akebia-core", "crates/akebia-frontend"]
+members = [
+    "crates/akebia-android",
+    "crates/akebia-core",
+    "crates/akebia-frontend",
+    "crates/akebia-gba",
+]
 
 [workspace.package]
 edition = "2024"
@@ -9,12 +14,40 @@ license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 akebia-core = { path = "crates/akebia-core" }
+akebia-gba = { path = "crates/akebia-gba" }
 
-# The core is built in release even during a debug `cargo run`:
+# The cores are built in release even during a debug `cargo run`:
 # an interpreted emulator is unusable without optimisations.
 [profile.dev.package.akebia-core]
+opt-level = 3
+
+[profile.dev.package.akebia-gba]
 opt-level = 3
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Release, plus the symbols a profiler needs to say which function the time went
+# into.
+#
+# It has to be a profile of its own and not a flag on `release`, because the
+# thing being measured has to be the thing that ships: an emulator profiled
+# without optimisations spends its time somewhere else entirely, and one
+# profiled with a different inliner answers a question about a binary nobody
+# runs. So this inherits release whole and adds only line tables — which cost
+# nothing at runtime, and are the difference between "62% in one address" and
+# "62% in `Cpu::step`".
+#
+# The stack is walked from the debug info rather than from frame pointers, so
+# `perf record` wants telling: without a call graph an optimised profile is a
+# list of leaf functions with no idea who called them, and for an emulator that
+# is the whole question — `read_bytes` being hot says nothing, and `read_bytes`
+# under the sprite renderer says everything.
+#
+#     cargo build --profile profiling
+#     perf record -g --call-graph dwarf ./target/profiling/akebia
+#     perf report --stdio --no-children --sort symbol
+[profile.profiling]
+inherits = "release"
+debug = 1

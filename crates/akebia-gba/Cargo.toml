@@ -1,0 +1,17 @@
+[package]
+name = "akebia-gba"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Game Boy Advance emulation core, free of I/O"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# 32-bit arithmetic wraps constantly on this machine and that is intentional:
+# wrapping_* is used explicitly everywhere.
+arithmetic_side_effects = "allow"

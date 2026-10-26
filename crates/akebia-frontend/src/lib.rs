@@ -16,11 +16,18 @@
 //! What stays behind in the binary is what a telephone has no use for: parsing
 //! arguments, drawing in the terminal and the diagnostic commands.
 
+pub mod console;
 pub mod app;
 pub mod args;
 pub mod audio;
+pub mod bios;
 pub mod debug;
+pub mod gamepad;
+pub mod net;
+pub mod remote;
 pub mod roms;
+pub mod rate;
+pub mod recent;
 pub mod save;
 
 use std::io::Write;
@@ -50,18 +57,68 @@ pub fn load(path: &Path, args: &Args) -> Result<GameBoy, String> {
     Ok(gb)
 }
 
-/// Notes which folder the ROM came from, so the list opens there next time.
+/// Loads whichever machine the file is for.
+///
+/// The extension decides, which is what a file manager and a person both go by.
+/// An Advance cartridge that is misnamed will be handed to the Game Boy and
+/// rejected there, and that is the right way round: a wrong name is a mistake
+/// worth reporting rather than quietly working around.
+pub fn load_console(path: &Path, args: &Args) -> Result<console::Console, String> {
+    if !console::is_advance(path) {
+        return load(path, args).map(|gb| console::Console::Gb(Box::new(gb)));
+    }
+
+    let rom = std::fs::read(path)
+        .map_err(|e| format!("could not read {}: {e}{}", path.display(), suggestions(path)))?;
+    let mut gba = akebia_gba::Gba::new();
+    gba.load_rom(&rom);
+
+    // The one that was named, or the one that can be found where they are kept.
+    // Games do not merely *call* BIOS routines: every interrupt they take goes
+    // through it, so a machine without one runs a game as far as its first
+    // interrupt and no further. Looking is what keeps that from being a black
+    // window nobody can explain — see [`bios`], and [`bios::ADVICE`] for what
+    // is said when the looking turns up nothing.
+    if let Some(image) = bios::image(args.bios.as_deref(), path)? {
+        gba.load_bios(&image);
+    }
+    gba.reset();
+    Ok(console::Console::Gba(Box::new(gba)))
+}
+
+/// Notes that a game was opened: the folder it came from, and the game itself.
 ///
 /// It is done even when the path came from the command line, and that is the
 /// useful part: opening a game with "Open with Akebia" from the file manager
-/// leaves the list pointing at the folder where the rest of them are.
+/// leaves the list pointing at the folder where the rest of them are, and puts
+/// the game at the top of the menu that offers it back.
+///
+/// The two are one call because they are one event. A caller that remembered
+/// the folder and forgot the game would be a fault nobody notices until they go
+/// looking in the menu and find it empty.
 pub fn remember_dir(rom: &Path) {
     let Ok(absolute) = std::fs::canonicalize(rom) else {
         return;
     };
-    if let Some(dir) = absolute.parent() {
-        remember_folder(dir);
+    let (Some(state), Some(list)) = (roms::state_path(), recent::path()) else {
+        return;
+    };
+    note_opened(&state, &list, &absolute);
+}
+
+/// Everything opening a game records, with both files named rather than looked
+/// up.
+///
+/// Split out so that it can be tested at all. The real paths come out of the
+/// user's environment, so a test of [`remember_dir`] would depend on whose
+/// machine it runs on and — far worse — would scribble on their own list of
+/// recent games. This is the same split [`bios::find_in`] has, for the same
+/// reason.
+fn note_opened(state: &Path, list: &Path, rom: &Path) {
+    if let Some(dir) = rom.parent() {
+        roms::remember(state, dir);
     }
+    recent::remember(list, rom);
 }
 
 /// Notes a folder chosen outright, without any ROM having been opened from it.
@@ -81,6 +138,7 @@ pub fn remember_folder(dir: &Path) {
     };
     roms::remember(&state, &absolute);
 }
+
 
 /// Looks for ROMs whose name starts like the path that was not found.
 ///
@@ -134,15 +192,15 @@ fn apply_palette(gb: &mut GameBoy, args: &Args) {
 /// Opens the audio, or warns on stderr and carries on in silence.
 ///
 /// Having no sound card is no reason to stop someone from playing.
-pub fn open_audio(gb: &mut GameBoy, enabled: bool) -> Option<audio::AudioOutput> {
+/// The rate it asks for is the caller's to pass on, because the two machines
+/// take it through different types and this has no reason to know which one is
+/// running.
+pub fn open_audio(enabled: bool) -> Option<audio::AudioOutput> {
     if !enabled {
         return None;
     }
     match audio::AudioOutput::new() {
-        Ok(output) => {
-            gb.set_sample_rate(output.sample_rate());
-            Some(output)
-        }
+        Ok(output) => Some(output),
         Err(message) => {
             eprintln!("warning: no sound ({message})");
             None
@@ -151,14 +209,14 @@ pub fn open_audio(gb: &mut GameBoy, enabled: bool) -> Option<audio::AudioOutput>
 }
 
 /// Hands the frame's audio to the device, or discards it if there is none.
-pub fn drain_audio(gb: &mut GameBoy, output: Option<&audio::AudioOutput>) {
+pub fn drain_audio(console: &mut console::Console, output: Option<&audio::AudioOutput>) {
     match output {
         Some(output) => {
-            let samples = gb.take_audio();
+            let samples = console.take_audio();
             output.push(&samples);
         }
-        // Uncollected, the APU's buffer would grow for the whole session.
-        None => gb.discard_audio(),
+        // Uncollected, the buffer would grow for the whole session.
+        None => console.discard_audio(),
     }
 }
 
@@ -195,5 +253,32 @@ pub fn describe_fault(fault: Fault) -> String {
                  the CPU went off the rails earlier."
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod opening_tests {
+    use super::*;
+
+    /// Opening a game records **both** things.
+    ///
+    /// This test exists because it did not, and the recent menu shipped empty:
+    /// the folder was remembered, the game was not, and nothing anywhere said
+    /// the two go together. Everything above the split is environment, so this
+    /// is the lowest point at which the pair can be pinned.
+    #[test]
+    fn opening_a_game_records_the_folder_and_the_game() {
+        let dir = std::env::temp_dir().join(format!("akebia-opened-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let games = dir.join("games");
+        std::fs::create_dir_all(&games).unwrap();
+        let rom = games.join("one.gb");
+        std::fs::write(&rom, [0u8; 4]).unwrap();
+        let (state, list) = (dir.join("last-folder"), dir.join("recent"));
+
+        note_opened(&state, &list, &rom);
+
+        assert_eq!(roms::remembered(&state).as_deref(), Some(games.as_path()), "the folder");
+        assert_eq!(recent::load(&list), vec![rom], "and the game");
     }
 }
