@@ -263,6 +263,13 @@ corner, next to the way back to the list. A telephone has no menu bar to put
 them in and needs no second screen either, which is the whole reason the network
 is the right shape for it and a second console in the same window is not.
 
+The address itself is asked for by a dialog belonging to the activity, and not
+by a text field in the interface. It has to be: the window is a
+`NativeActivity`, which has no editable view in it, so an input method has
+nowhere to put what is typed — the keyboard rises over an `egui` field and every
+character goes nowhere. Anything the emulator needs told in words is asked for
+from Java, where there is a real `EditText`, and the clipboard comes with it.
+
 Either end may be the one that waits. On a home network the machine that is
 easier to name should be the one waiting, which usually means the desktop.
 

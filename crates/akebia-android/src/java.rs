@@ -1,9 +1,10 @@
 //! The little that has to be asked of Java.
 //!
-//! Three calls to [`AkebiaActivity`], and every one of them is there because
-//! Android leaves no other way: a native application cannot open the system's
-//! file picker on its own, cannot hear its answer, and cannot ask where its own
-//! folder is without going through the framework.
+//! Every call to [`AkebiaActivity`] is here because Android leaves no other
+//! way: a native application cannot open the system's file picker on its own,
+//! cannot hear its answer, cannot ask where its own folder is without going
+//! through the framework — and cannot be typed into at all, because a native
+//! activity has no editable view for an input method to write in.
 //!
 //! [`AkebiaActivity`]: ../../../packaging/android/java/org/akebia/AkebiaActivity.java
 
@@ -52,6 +53,41 @@ impl Java {
     /// The folder the imported cartridges live in.
     pub fn roms_dir(&self) -> Option<PathBuf> {
         self.path(jni_str!("getRomsDir"))
+    }
+
+    /// Puts up a box to type the address of the other machine into.
+    ///
+    /// It is Java's and not the interface's for a reason that is not taste:
+    /// `egui` has a text field and on a telephone nothing can be typed into it.
+    /// The window is a `NativeActivity`, which has no editable view, so
+    /// `android-activity` has nothing to give an input method — its
+    /// `text_input_state` is a stub that answers with an empty string, and
+    /// `set_ime_editor_info` does nothing at all. The keyboard comes up and the
+    /// characters go nowhere.
+    ///
+    /// Like the file picker, the answer does not come back from here: it is
+    /// collected later, by [`Java::typed_address`].
+    pub fn ask_for_address(&self, current: &str) -> Result<(), String> {
+        self.attach(|env, activity| {
+            let current = env.new_string(current)?;
+            env.call_method(
+                activity,
+                jni_str!("askForAddress"),
+                jni_sig!("(Ljava/lang/String;)V"),
+                &[(&current).into()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// What the address box was closed with, once it has been closed.
+    ///
+    /// `None` while it is still open, or was never opened. An empty string when
+    /// it was closed without an address, which is a different thing and has to
+    /// stay different: it is how a cancelled box says so, and something has to
+    /// stop waiting on it.
+    pub fn typed_address(&self) -> Option<String> {
+        self.text(jni_str!("pollAddress"))
     }
 
     /// Whether the cartridges can be kept out of the application's own folder.
@@ -118,17 +154,25 @@ impl Java {
 
     /// Calls a method with no arguments that answers with a path, or with null.
     fn path(&self, method: &'static JNIStr) -> Option<PathBuf> {
+        self.text(method).map(PathBuf::from)
+    }
+
+    /// Calls a method with no arguments that answers with a string, or with
+    /// null.
+    ///
+    /// An empty string is not a null and does not become one: the address box
+    /// uses the difference to say it was closed without an answer.
+    fn text(&self, method: &'static JNIStr) -> Option<String> {
         let found = self.attach(|env, activity| {
             let value = env.call_method(activity, method, jni_sig!("()Ljava/lang/String;"), &[])?;
             let object = value.l()?;
             if object.is_null() {
                 return Ok(None);
             }
-            let text = env.as_cast::<JString>(&object)?.to_string();
-            Ok(Some(PathBuf::from(text)))
+            Ok(Some(env.as_cast::<JString>(&object)?.to_string()))
         });
         match found {
-            Ok(path) => path,
+            Ok(text) => text,
             Err(message) => {
                 log::error!("{method}: {message}");
                 None

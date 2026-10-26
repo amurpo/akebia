@@ -2398,16 +2398,7 @@ impl Session {
     fn paint(&self, ui: &mut egui::Ui, texture: &TextureHandle, area: egui::Rect) -> egui::Rect {
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
 
-        // The factor is rounded down so that a Game Boy pixel is an exact N×N
-        // square. With a fractional factor, some rows of pixels would come out
-        // one thickness and others another.
-        let [width, height] = self.screen_size();
-        let (width, height) = (width as f32, height as f32);
-        let scale = (area.width() / width)
-            .min(area.height() / height)
-            .floor()
-            .max(1.0);
-        let size = Vec2::new(width * scale, height * scale);
+        let size = picture_size(area.size(), self.screen_size(), ui.ctx().pixels_per_point());
         let picture = egui::Rect::from_center_size(area.center(), size);
 
         ui.painter().image(
@@ -2418,6 +2409,31 @@ impl Session {
         );
         picture
     }
+}
+
+/// How big the picture comes out, in points, inside an area that many points
+/// across.
+///
+/// The factor is rounded down so that a console pixel is an exact N×N square:
+/// with a fractional one, some rows would come out a thickness and the next
+/// another. But it is counted **in the screen's own pixels**, and that is the
+/// part that is easy to get wrong, because on a desktop a point *is* a pixel
+/// and the two readings agree — a telephone is where they part. There a point
+/// is about two and three quarter pixels, so a whole number of points is not a
+/// whole number of pixels at all, and rounding in points threw away most of the
+/// glass: on a screen 393 points wide an Advance was drawn 240 points across,
+/// one point to the pixel, while the 1080 real pixels underneath had room for
+/// four each.
+///
+/// `dense` is guarded rather than trusted: it is divided by, and it arrives
+/// from the window system.
+fn picture_size(area: Vec2, screen: [usize; 2], dense: f32) -> Vec2 {
+    let dense = dense.max(0.1);
+    let [width, height] = screen;
+    let (width, height) = (width as f32, height as f32);
+    let scale =
+        (area.x * dense / width).min(area.y * dense / height).floor().max(1.0);
+    Vec2::new(width * scale, height * scale) / dense
 }
 
 /// A console whose partner is on another machine.
@@ -2735,6 +2751,86 @@ mod tests {
     fn each_machine_is_paced_at_its_own_rate() {
         let advance = advance_session().frame_period();
         assert!(advance.as_secs_f64() > 0.0 && advance.as_secs_f64() < 0.02, "{advance:?}");
+    }
+
+    /// The two machines' screens, for the arithmetic that lays a picture out.
+    const GAME_BOY: [usize; 2] = [160, 144];
+    const ADVANCE: [usize; 2] = [240, 160];
+
+    /// The densities a picture is laid out at: a plain desktop, a desktop that
+    /// doubles, and a telephone, which is the one where a point stopped being a
+    /// pixel.
+    const DENSITIES: [f32; 4] = [1.0, 2.0, 2.75, 3.5];
+
+    /// The bug this arithmetic was pulled out for. On the telephone the whole
+    /// picture band is about 393×430 points, and rounding the factor there gave
+    /// an Advance one point per pixel — 240 points of a 393-point screen, with
+    /// black on both sides of it — because 393/240 is 1.6 and 1.6 rounds down to
+    /// one. Underneath those 393 points there are 1080 real ones, which is four
+    /// each and change.
+    #[test]
+    fn a_pixel_is_measured_on_the_glass_and_not_in_points() {
+        let band = Vec2::new(393.0, 430.0);
+        let size = picture_size(band, ADVANCE, 2.75);
+        assert!(size.x > 340.0, "the Advance was left {:.0} points across", size.x);
+        assert!(size.x <= band.x && size.y <= band.y, "and it does not overflow the band");
+    }
+
+    /// Which is what «an exact square» means, and the whole reason the factor is
+    /// rounded down at all. Counted in points it was a whole number of the wrong
+    /// unit: two points to a Game Boy pixel on a telephone is five and a half
+    /// real ones, which is not a square of anything.
+    #[test]
+    fn every_console_pixel_comes_out_a_whole_number_of_real_ones() {
+        for dense in DENSITIES {
+            for (name, screen) in [("Game Boy", GAME_BOY), ("Advance", ADVANCE)] {
+                let size = picture_size(Vec2::new(393.0, 430.0), screen, dense);
+                let across = size.x * dense / screen[0] as f32;
+                assert!(
+                    (across - across.round()).abs() < 1e-3,
+                    "{name} at {dense}×: {across} real pixels to a console one"
+                );
+                let down = size.y * dense / screen[1] as f32;
+                assert!((across - down).abs() < 1e-3, "{name} at {dense}×: not a square");
+            }
+        }
+    }
+
+    /// A picture bigger than the area it was given is one drawn over the
+    /// controls, and on a telephone that is the thumb's half of the glass.
+    #[test]
+    fn the_picture_stays_inside_what_it_was_offered() {
+        let areas = [Vec2::new(393.0, 430.0), Vec2::new(338.0, 365.0), Vec2::new(1920.0, 1080.0)];
+        for area in areas {
+            for dense in DENSITIES {
+                for screen in [GAME_BOY, ADVANCE] {
+                    let size = picture_size(area, screen, dense);
+                    assert!(
+                        size.x <= area.x + 1e-3 && size.y <= area.y + 1e-3,
+                        "{size:?} does not fit in {area:?} at {dense}×"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where a point is a pixel the reading is the one it always was, and this
+    /// says so: the desktop is the machine the old arithmetic was right on, and
+    /// it must not have moved underneath it.
+    #[test]
+    fn nothing_changes_where_a_point_is_already_a_pixel() {
+        let area = Vec2::new(1920.0, 1080.0);
+        assert_eq!(picture_size(area, GAME_BOY, 1.0), Vec2::new(160.0 * 7.0, 144.0 * 7.0));
+        assert_eq!(picture_size(area, ADVANCE, 1.0), Vec2::new(240.0 * 6.0, 160.0 * 6.0));
+    }
+
+    /// An area too small for even one pixel each still gets a picture. It comes
+    /// out too big and is clipped, which is a bad frame; a factor of zero is a
+    /// picture of nothing at all, which is a black screen with no explanation.
+    #[test]
+    fn a_picture_never_shrinks_away_to_nothing() {
+        let size = picture_size(Vec2::new(40.0, 30.0), ADVANCE, 1.0);
+        assert_eq!(size, Vec2::new(240.0, 160.0));
     }
 
     fn list(names: &[&str]) -> List {

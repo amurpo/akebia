@@ -12,12 +12,16 @@ use std::path::PathBuf;
 use akebia_core::{SCREEN_HEIGHT, SCREEN_WIDTH};
 use akebia_frontend::app::{Session, Settings, ACCENT, BACKGROUND};
 use akebia_frontend::args::Args;
+// Named for what it is rather than imported plainly: `Pad` in this file is
+// already the controls painted on the glass, and this is a button on the
+// console they press.
+use akebia_frontend::console::Pad as ConsoleButton;
 use akebia_frontend::remote::{Remote, Role, Trouble};
 use akebia_frontend::{net, roms};
 use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
 
 use crate::java::Java;
-use crate::pad::{Cable, Pad, Touches, BUTTONS};
+use crate::pad::{Button, Cable, Pad, Touches, BUTTONS};
 
 /// Height of a row in the list. A finger is not a mouse pointer: below about
 /// fifty points the misses start, and this list is touched with a thumb.
@@ -48,15 +52,22 @@ pub struct Phone {
     /// unseen. Before the first drawing there is no geometry at all, which is
     /// what the `None` is for.
     pad: Option<Pad>,
-    down: [bool; 8],
+    down: [bool; 10],
     /// What the clock, the navigation bar and the camera's hole cover, in
     /// pixels. Asked of Android every frame because turning the telephone
     /// changes it.
     insets: [f32; 4],
     /// A connection being made, while the game carries on.
     connecting: Option<net::Pending>,
-    /// The address box, open with whatever has been typed into it.
-    address: Option<String>,
+    /// Whether the cable's own dialog —wait here, or go somewhere— is up.
+    linking: bool,
+    /// Whether Java's address box is up and its answer still to be collected.
+    ///
+    /// The box is not this interface's; see [`Java::ask_for_address`]. What is
+    /// kept here is only the fact that one is out there to be asked about, so
+    /// that the crossing into Java happens on the few frames it can answer on
+    /// and not on every frame of every game.
+    asking_address: bool,
     /// Whether the way out has been pressed and is waiting to be meant.
     leaving: bool,
     /// What was typed there last. Retyping an address is a poor way to spend the
@@ -115,10 +126,11 @@ impl Phone {
             warning: None,
             touches: Touches::default(),
             pad: None,
-            down: [false; 8],
+            down: [false; 10],
             insets: [0.0; 4],
             connecting: None,
-            address: None,
+            linking: false,
+            asking_address: false,
             leaving: false,
             last_address: String::new(),
             notice: None,
@@ -126,10 +138,19 @@ impl Phone {
     }
 
     /// Loads a cartridge and starts it, or leaves the reason in the list.
+    ///
+    /// Whichever machine the file is for: the list has been offering `.gba`
+    /// cartridges since the scanner learnt to name them, and until this it
+    /// handed every one of them to the Game Boy, which rejected it.
     fn play(&mut self, path: PathBuf) {
-        match akebia_frontend::load(&path, &self.args) {
-            Ok(gb) => {
-                let session = Session::new(gb, path, &self.args, &self.settings);
+        match akebia_frontend::load_console(&path, &self.args) {
+            Ok(console) => {
+                let session = Session::new(console, path, &self.args, &self.settings);
+                // An Advance with no BIOS runs and draws nothing, and the
+                // session is the only thing that knows. Said here or not at
+                // all: a black screen on a telephone has no window title to
+                // explain itself in.
+                self.notice = session.warning();
                 self.screen = Screen::Playing(Box::new(session));
                 self.warning = None;
                 self.touches.clear();
@@ -150,7 +171,11 @@ impl Phone {
         // A connection half made has nobody left to hand a console to.
         self.connecting = None;
         self.notice = None;
-        self.address = None;
+        self.linking = false;
+        // The box may still be up over there; Java forgets whatever it is
+        // closed with the next time one is opened, so an answer nobody is
+        // waiting for goes nowhere.
+        self.asking_address = false;
         // Whether the question was answered or the game ended on its own, there
         // is no longer a game to be asked about leaving.
         self.leaving = false;
@@ -176,7 +201,12 @@ impl Phone {
         };
         remote.close();
         let mut console = console;
-        console.console_mut().set_link_connected(false);
+        // Only the older machine has a port to disconnect. Nothing should have
+        // plugged a cable into an Advance in the first place, and if something
+        // did, there is nothing here to undo.
+        if let Some(gb) = console.console_mut().gameboy_mut() {
+            gb.set_link_connected(false);
+        }
         self.screen = Screen::Playing(console);
         self.notice = None;
     }
@@ -245,7 +275,15 @@ impl Phone {
         };
         let mut console = session;
         let role = if dialled { Role::Dialled } else { Role::Waited };
-        let remote = Box::new(Remote::new(wire, console.console_mut(), role));
+        // The cable is the older machine's. An Advance has a port and nothing
+        // here drives it, so the game carries on alone rather than the
+        // connection taking it away — the same answer the desktop gives.
+        let Some(gb) = console.console_mut().gameboy_mut() else {
+            self.notice = Some("only a Game Boy has a link cable".to_owned());
+            self.screen = Screen::Playing(console);
+            return;
+        };
+        let remote = Box::new(Remote::new(wire, gb, role));
         self.screen = Screen::Linked { console, remote };
         self.warning = None;
         self.notice = None;
@@ -306,15 +344,22 @@ impl Phone {
         }
     }
 
-    /// The box the address is typed into, and the two ways to start a link.
+    /// The two ways to start a link, and neither of them is typed into.
     ///
     /// A dialog and not a screen of its own: the game stays where it is and
-    /// cancelling costs nothing. On glass it is also the only sensible place for
-    /// a text field, which is a thing this interface otherwise does not have.
+    /// cancelling costs nothing.
+    ///
+    /// The address used to be typed into an `egui` field right here, and on a
+    /// telephone it could not be: the window is a `NativeActivity`, which has
+    /// no editable view, so the keyboard came up over a field that never
+    /// received a character. Pressing Connect on an empty field did nothing and
+    /// said nothing, which from the outside was a button that did not work. So
+    /// the typing is Java's now —see [`Java::ask_for_address`]— and what is
+    /// left here is the choice of which end to be.
     fn link_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut typed) = self.address.take() else {
+        if !self.linking {
             return;
-        };
+        }
         let mut go = false;
         let mut wait = false;
         let mut cancelled = false;
@@ -337,15 +382,21 @@ impl Phone {
             );
 
             ui.add_space(14.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut typed)
-                    .hint_text("192.168.1.20")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(6.0);
+            let width = ui.available_width();
             go |= ui
-                .add_sized(Vec2::new(ui.available_width(), 52.0), egui::Button::new("Connect"))
+                .add_sized(Vec2::new(width, 52.0), egui::Button::new("Connect to..."))
                 .clicked();
+            ui.add_space(4.0);
+            // The ellipsis is doing work: the button asks for an address, it
+            // does not go to one. And the address it last went to is worth
+            // showing, because the second link of an evening is with the same
+            // machine as the first.
+            let said = if self.last_address.is_empty() {
+                "...a machine that is already waiting. It asks for its address.".to_owned()
+            } else {
+                format!("...a machine that is already waiting. Last time: {}", self.last_address)
+            };
+            ui.label(RichText::new(said).size(13.0).color(Color32::from_gray(0x8A)));
 
             ui.add_space(14.0);
             cancelled |= ui
@@ -357,13 +408,54 @@ impl Phone {
             cancelled = true;
         }
         if wait {
+            self.linking = false;
             self.connecting = Some(net::Pending::listen(akebia_core::link::bgb::DEFAULT_PORT));
-        } else if go && !typed.trim().is_empty() {
-            self.last_address = typed.clone();
-            self.connecting = Some(net::Pending::connect(typed));
-        } else if !cancelled {
-            self.address = Some(typed);
+        } else if go {
+            // This one comes down while Java's is up: two dialogs over the same
+            // game, one of them unreachable underneath the other, is not a thing
+            // to offer anybody. It goes back up if the box is closed without an
+            // address, so that cancelling one step undoes one step.
+            self.linking = false;
+            match self.java.ask_for_address(&self.last_address) {
+                Ok(()) => {
+                    self.asking_address = true;
+                    // Whatever finger opened it is about to stop being this
+                    // window's business: the box takes the touches, and the lift
+                    // event for that finger is never coming here.
+                    self.touches.clear();
+                }
+                Err(message) => {
+                    log::error!("askForAddress: {message}");
+                    self.notice = Some("the address box could not be opened".to_owned());
+                }
+            }
+        } else if cancelled {
+            self.linking = false;
         }
+    }
+
+    /// Picks up whatever the address box was closed with.
+    ///
+    /// Asked only while there is a box out there to answer, which is a handful
+    /// of frames and not every one of them: the crossing into Java is cheap but
+    /// it is not free, and there is nothing to collect the rest of the time.
+    fn collect_address(&mut self) {
+        if !self.asking_address {
+            return;
+        }
+        let Some(typed) = self.java.typed_address() else {
+            return;
+        };
+        self.asking_address = false;
+        self.touches.clear();
+        if typed.trim().is_empty() {
+            // Closed without one. Back to the dialog it was opened from rather
+            // than into the game: the way back out of that one is one more tap.
+            self.linking = true;
+            return;
+        }
+        self.last_address = typed.clone();
+        self.connecting = Some(net::Pending::connect(typed));
     }
 
     /// The window minus whatever the system draws on top of it.
@@ -528,10 +620,13 @@ impl eframe::App for Phone {
             }
         }
         self.insets = self.java.insets();
+        self.collect_address();
         self.collect_connection();
-        if self.connecting.is_some() {
+        if self.connecting.is_some() || self.asking_address {
             // Nothing else on this screen would ask for the repaint that looks
-            // at the connection again.
+            // at the connection again — nor for the one that looks at the
+            // address box, which is answered on a thread this one never hears
+            // from.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -541,10 +636,10 @@ impl eframe::App for Phone {
         // without this a finger reaching for a button in the middle of a dialog
         // would press whatever of the console's is underneath it — and both
         // dialogs are drawn right over the cross.
-        let asking = self.leaving || self.address.is_some();
+        let asking = self.leaving || self.linking || self.asking_address;
         self.down = match &self.pad {
             Some(pad) if !asking => pad.pressed(&self.touches),
-            _ => [false; 8],
+            _ => [false; 10],
         };
 
         let mut failure = None;
@@ -553,9 +648,9 @@ impl eframe::App for Phone {
         let mut cable_ended = None;
         // Before emulating, so the buttons are already set when the game reads
         // the joypad.
-        let pressed = |session: &mut Session, down: [bool; 8]| {
+        let pressed = |session: &mut Session, down: [bool; 10]| {
             for (button, held) in BUTTONS.into_iter().zip(down) {
-                session.press(button, held);
+                session.press(console_button(button), held);
             }
         };
         let outcome = match &mut self.screen {
@@ -649,7 +744,7 @@ impl eframe::App for Phone {
                 // Already joined, or joining: the button is the way out of it.
                 Screen::Linked { .. } => self.unplug(),
                 _ if self.connecting.is_some() => self.connecting = None,
-                _ => self.address = Some(self.last_address.clone()),
+                _ => self.linking = true,
             }
         }
         self.link_dialog(&ui.ctx().clone());
@@ -663,6 +758,33 @@ impl eframe::App for Phone {
             Screen::Linked { console, .. } => console.close(),
             Screen::List => {}
         }
+    }
+}
+
+/// What a button painted on the glass is to whichever console is running.
+///
+/// The two types exist for reasons that do not meet anywhere else. The pad is
+/// drawn and measured in `pad`, which is built on a desktop too so that its
+/// arithmetic can be tested away from a telephone — and on a desktop the
+/// frontend's own button type is not there to be named, because this crate only
+/// depends on the frontend when the target is Android. So the pad speaks the
+/// older machine's `Button`, and the translation happens here, in the one file
+/// that is never compiled for anything else.
+///
+/// The ten are the ten, and the two lists are written out against each other so
+/// that a button added to either has to be answered for here.
+fn console_button(button: Button) -> ConsoleButton {
+    match button {
+        Button::Up => ConsoleButton::Up,
+        Button::Down => ConsoleButton::Down,
+        Button::Left => ConsoleButton::Left,
+        Button::Right => ConsoleButton::Right,
+        Button::A => ConsoleButton::A,
+        Button::B => ConsoleButton::B,
+        Button::Start => ConsoleButton::Start,
+        Button::Select => ConsoleButton::Select,
+        Button::L => ConsoleButton::L,
+        Button::R => ConsoleButton::R,
     }
 }
 

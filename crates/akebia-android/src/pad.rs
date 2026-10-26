@@ -20,14 +20,35 @@
 
 use std::collections::HashMap;
 
-use akebia_core::Button;
 use egui::{
     Align2, Color32, Context, Event, FontId, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
     TouchPhase, Vec2,
 };
 
+/// Every button painted on the glass.
+///
+/// Its own type, for the same reason the frontend has one: neither core's
+/// covers both machines. The older machine's `Button` has no shoulders — a Game
+/// Boy has none to have — and this module is compiled on a desktop as well, so
+/// that its arithmetic can be tested away from a telephone, where the
+/// frontend's own ten-button type is not a dependency to be named. So the glass
+/// says what the glass paints, and `ui` translates the one into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Button {
+    Up,
+    Down,
+    Left,
+    Right,
+    A,
+    B,
+    Start,
+    Select,
+    L,
+    R,
+}
+
 /// The order everything in this module counts in.
-pub const BUTTONS: [Button; 8] = [
+pub const BUTTONS: [Button; 10] = [
     Button::Up,
     Button::Down,
     Button::Left,
@@ -36,6 +57,8 @@ pub const BUTTONS: [Button; 8] = [
     Button::B,
     Button::Start,
     Button::Select,
+    Button::L,
+    Button::R,
 ];
 
 /// How much further a finger already out along one arm has to lean before the
@@ -87,6 +110,13 @@ pub struct Pad {
     b: Rect,
     start: Rect,
     select: Rect,
+    /// The two shoulders, which only the Advance has. They are painted whatever
+    /// is running: a Game Boy handed one does nothing, which is what a Game Boy
+    /// does when a button it has not got is pressed, and controls that appear
+    /// and vanish with the cartridge would be worse than two that are sometimes
+    /// quiet.
+    l: Rect,
+    r: Rect,
     /// The way back to the list.
     pub menu: Rect,
     /// The cable: waiting for another machine, or going to one.
@@ -124,16 +154,35 @@ impl Pad {
         // The row of small buttons is taken off the bottom first: it is the one
         // thing that must not move when the rest grows.
         let pills_row = (band.height() * 0.16).clamp(40.0, 58.0);
+        // And the shoulders off the top, out at either edge. Not at the top of
+        // the telephone, which is where the hardware has them and where no
+        // thumb goes while a game is running: at the top of the controls, a
+        // reach above the cross and above the buttons. It is where RetroArch's
+        // own Advance overlay puts them, at a tenth of the width in from each
+        // side and a little past three fifths of the way down the glass, and
+        // where every emulator that paints a pair has settled.
+        //
+        // They take their strip out of the band and not out of the picture, and
+        // what is left over is what the cross and the buttons then divide.
+        let shoulder_row = shoulder_height(band.height());
         let play = Rect::from_min_max(
-            band.min,
+            Pos2::new(band.left(), band.top() + shoulder_row + band.height() * 0.03),
             Pos2::new(band.right(), band.bottom() - pills_row - band.height() * 0.06),
         );
+        let (l, r) = shoulders(band, band.top(), shoulder_row);
         // Both clusters hang off their own edge instead of being centred in half
         // the width each. Centred, they grow towards each other: on a telephone
         // 393 points wide the cross and the B button end up overlapping by a few
         // points, and a thumb landing in between presses both.
         let half = play.width() * 0.5;
-        let cross_side = (half * 0.80).min(play.height() * 0.80).clamp(120.0, 240.0);
+        // The floor of a hundred and twenty is what a cross needs to be steered
+        // with a thumb, and the last `min` is what happens when the telephone
+        // has not got it to give: on a short screen the cross takes the room
+        // there is rather than the room it wants, because a cross that
+        // overflowed its own share would reach up under the shoulder above it
+        // and press two things with one thumb.
+        let cross_side =
+            (half * 0.80).min(play.height() * 0.80).clamp(120.0, 240.0).min(play.height());
         let button = (half * 0.36).min(play.height() * 0.34).clamp(62.0, 104.0);
 
         let cross =
@@ -143,7 +192,18 @@ impl Pad {
             button,
         );
         let (start, select) = pills(band, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area, 0), link: menu_corner(area, 1) }
+        Self {
+            screen,
+            cross,
+            a,
+            b,
+            start,
+            select,
+            l,
+            r,
+            menu: menu_corner(area, 0),
+            link: menu_corner(area, 1),
+        }
     }
 
     fn turned(area: Rect) -> Self {
@@ -155,9 +215,25 @@ impl Pad {
         let (left, rest) = split_left(area, side);
         let (screen, right) = split_left(rest, rest.width() - side);
 
-        let cross_side = (side * 0.80).min(area.height() * 0.62).clamp(120.0, 250.0);
-        let button = (side * 0.36).min(area.height() * 0.30).clamp(62.0, 108.0);
-        let height = area.center().y - side * 0.06;
+        // Turned, the top of each column **is** the top corner of the glass,
+        // which is where the index fingers land when a telephone is held like a
+        // controller — and where the hardware keeps them. They are dropped by
+        // the height of the way out, which lives in that corner: a finger
+        // reaching for R and overshooting must not find the button that ends
+        // the game.
+        let quiet = menu_corner(area, 0);
+        let shoulder_row = shoulder_height(area.height());
+        let (l, r) = shoulders(area, quiet.bottom() + MARGIN * 0.5, shoulder_row);
+
+        // What is left once the shoulders have their strip, and it is what the
+        // hands then divide. Measuring the clusters against the whole window
+        // instead put a cross tall enough to reach up under L: on a landscape
+        // telephone the height is the scarce direction, and everything that
+        // takes some of it has to take it from the same total.
+        let hands = Rect::from_min_max(Pos2::new(area.left(), r.bottom()), area.max);
+        let cross_side = (side * 0.80).min(hands.height() * 0.80).clamp(120.0, 250.0);
+        let button = (side * 0.36).min(hands.height() * 0.38).clamp(62.0, 108.0);
+        let height = hands.center().y - side * 0.06;
 
         let cross = square(Pos2::new(left.left() + MARGIN + cross_side * 0.5, height), cross_side);
         let (a, b) = action_buttons(
@@ -168,7 +244,18 @@ impl Pad {
         // Underneath the picture, which is the only strip of nothing left.
         let pills_row = (area.height() * 0.12).clamp(38.0, 54.0);
         let (start, select) = pills(screen, pills_row);
-        Self { screen, cross, a, b, start, select, menu: menu_corner(area, 0), link: menu_corner(area, 1) }
+        Self {
+            screen,
+            cross,
+            a,
+            b,
+            start,
+            select,
+            l,
+            r,
+            menu: quiet,
+            link: menu_corner(area, 1),
+        }
     }
 
     /// Half the width of an arm of the cross, which is the one number both the
@@ -193,9 +280,9 @@ impl Pad {
         self.cross.width() / 6.0
     }
 
-    /// Which of the eight are held down by the fingers currently on the glass.
-    pub fn pressed(&self, touches: &Touches) -> [bool; 8] {
-        let mut down = [false; 8];
+    /// Which of the ten are held down by the fingers currently on the glass.
+    pub fn pressed(&self, touches: &Touches) -> [bool; 10] {
+        let mut down = [false; 10];
         let stem = self.stem();
         for finger in touches.fingers() {
             // Either it came down on the cross —and then it is the cross's until
@@ -220,12 +307,14 @@ impl Pad {
             down[5] |= inside_circle(self.b, finger.at);
             down[6] |= self.start.contains(finger.at);
             down[7] |= self.select.contains(finger.at);
+            down[8] |= self.l.contains(finger.at);
+            down[9] |= self.r.contains(finger.at);
         }
         down
     }
 
     /// Draws them, lit where a finger is.
-    pub fn paint(&self, painter: &Painter, down: &[bool; 8], accent: Color32, cable: Cable) {
+    pub fn paint(&self, painter: &Painter, down: &[bool; 10], accent: Color32, cable: Cable) {
         let arm = self.cross.width() / 3.0;
         let centre = self.cross.center();
         let lit = |on: bool| if on { accent } else { FACE };
@@ -262,6 +351,13 @@ impl Pad {
         circle(painter, self.b, "B", down[5], accent);
         pill(painter, self.start, "START", down[6], accent);
         pill(painter, self.select, "SELECT", down[7], accent);
+        // The same pill as Start and Select, which is what a shoulder looks
+        // like: a bar with a letter in it. Nothing says they do nothing on a
+        // Game Boy, and nothing needs to — a button that answers on one
+        // cartridge and not on the next is the cartridge's difference, not the
+        // interface's.
+        pill(painter, self.l, "L", down[8], accent);
+        pill(painter, self.r, "R", down[9], accent);
 
         // The way out and the cable, kept quiet: neither is something one reaches
         // for while playing, and bright buttons there would be pressed by
@@ -409,6 +505,37 @@ fn action_reach(diameter: f32) -> f32 {
     diameter * 0.62 + diameter * 0.5
 }
 
+/// How tall a shoulder is, given the strip it is being laid into.
+///
+/// A twelfth of it, and never less than a finger. The floor is what matters:
+/// RetroArch's overlay draws them at about a thirtieth of the screen's height,
+/// which on a telephone is some twenty-five points — under half a fingertip,
+/// and a control that cannot be hit is worse than one that is not there.
+fn shoulder_height(span: f32) -> f32 {
+    (span * 0.12).clamp(44.0, 62.0)
+}
+
+/// The two shoulders, hanging off either edge of `area` at the given height.
+///
+/// Wide and flat, because a shoulder **is** a bar: on the machine it runs along
+/// the top edge, and every emulator that paints a pair paints them long. The
+/// proportion is RetroArch's own — a little over three times as wide as tall —
+/// and out at the edge rather than in towards the middle, where the hand
+/// already is.
+fn shoulders(area: Rect, top: f32, height: f32) -> (Rect, Rect) {
+    // The floor is the one that does the work, and it is not about the width of
+    // the telephone but about the height of the bar: on a tall screen the strip
+    // is a comfortable fifty points deep, and a bar as wide as a quarter of a
+    // narrow window comes out very nearly square — which is a button, not a
+    // shoulder.
+    let width = (area.width() * 0.30).clamp(120.0, 220.0).min(area.width() * 0.5 - MARGIN * 2.0);
+    let size = Vec2::new(width, height);
+    (
+        Rect::from_min_size(Pos2::new(area.left() + MARGIN, top), size),
+        Rect::from_min_size(Pos2::new(area.right() - MARGIN - width, top), size),
+    )
+}
+
 /// START and SELECT, side by side along the bottom edge of whatever they are
 /// given: small, because they are pressed between games and not during them.
 fn pills(band: Rect, height: f32) -> (Rect, Rect) {
@@ -539,13 +666,15 @@ mod tests {
     }
 
     /// Every control, as a rectangle, with the name to complain about.
-    fn controls(pad: &Pad) -> [(&'static str, Rect); 7] {
+    fn controls(pad: &Pad) -> [(&'static str, Rect); 9] {
         [
             ("cross", pad.cross),
             ("A", pad.a),
             ("B", pad.b),
             ("start", pad.start),
             ("select", pad.select),
+            ("L", pad.l),
+            ("R", pad.r),
             ("menu", pad.menu),
             ("link", pad.link),
         ]
@@ -607,8 +736,34 @@ mod tests {
         }
     }
 
+    /// A shoulder is a bar and it is out at the edge. Both are what the
+    /// hardware looks like and what every emulator that paints a pair agrees
+    /// on, and neither survives a layout that quietly turns them into two more
+    /// square buttons somewhere in the middle.
+    #[test]
+    fn the_shoulders_are_bars_along_the_outer_edges() {
+        for (name, width, height) in SCREENS {
+            let area = area(width, height);
+            let pad = Pad::lay_out(area);
+            for (side, rect) in [("L", pad.l), ("R", pad.r)] {
+                assert!(
+                    rect.width() >= rect.height() * 2.0,
+                    "{name}: {side} is {:.0}×{:.0}, which is not a bar",
+                    rect.width(),
+                    rect.height()
+                );
+            }
+            assert!(pad.l.left() - area.left() <= MARGIN, "{name}: L has left the edge");
+            assert!(area.right() - pad.r.right() <= MARGIN, "{name}: R has left the edge");
+            // And above the hands, not below them: a shoulder reached for by
+            // letting go of the cross is a shoulder nobody uses.
+            assert!(pad.l.bottom() <= pad.cross.center().y, "{name}: L is not above the cross");
+            assert!(pad.r.bottom() <= pad.a.center().y, "{name}: R is not above the buttons");
+        }
+    }
+
     /// What one finger, come down at `at` and gone nowhere since, is holding.
-    fn press(pad: &Pad, at: Pos2) -> [bool; 8] {
+    fn press(pad: &Pad, at: Pos2) -> [bool; 10] {
         let mut touches = Touches::default();
         touches.land(1, at);
         pad.pressed(&touches)

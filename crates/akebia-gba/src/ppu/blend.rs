@@ -46,10 +46,9 @@
 //!
 //! # Where it does not happen
 //!
-//! Inside a window that says not to. Each region of the screen carries a bit
-//! for the colour effects, which is how a game fades the world to black and
-//! leaves its text box unfaded — so this is asked before anything else here is
-//! decided. See [`window`](super::window).
+//! Each window region can disable ordinary colour effects. Semi-transparent
+//! OBJ still alpha-blend with an eligible second target in that region.
+//! See [`window`](super::window).
 
 use super::Ppu;
 
@@ -146,13 +145,6 @@ impl Ppu {
     /// What a pixel finally is, once what is over it and what is under it are
     /// both known.
     pub(super) fn blended(&self, x: usize) -> u16 {
-        // A region can switch the effects off, which is how a game fades the
-        // world to black and leaves its text box unfaded. It covers the
-        // declared sprite as well: that one ignores the mode, not the window.
-        if !self.effects_at(x) {
-            return self.top[x].colour;
-        }
-
         let (top, below) = (self.top[x], self.below[x]);
         // The second set is the same six bits eight places up, so it has to
         // come down before a layer's bit means anything against it.
@@ -172,6 +164,12 @@ impl Ppu {
         // through to the ordinary rules below.
         if top.translucent && backed {
             return self.alpha(top.colour, below.colour);
+        }
+        // Window masks suppress ordinary effects, but not the forced alpha
+        // of semi-transparent OBJ. Check this after that exception; otherwise
+        // weather sprites become opaque over windows with effects disabled.
+        if !self.effects_at(x) {
+            return top.colour;
         }
         if self.bldcnt & FIRST_TARGET & top.layer == 0 {
             return top.colour;
@@ -234,7 +232,11 @@ impl Ppu {
 /// fade to black covers a screen with nothing behind it just as well.
 fn fade(colour: u16, evy: u16, towards: u16) -> u16 {
     channels(colour, colour, |a, _| {
-        if towards > a { a + (((towards - a) * evy) >> 4) } else { a - (((a - towards) * evy) >> 4) }
+        if towards > a {
+            a + (((towards - a) * evy) >> 4)
+        } else {
+            a - (((a - towards) * evy) >> 4)
+        }
     })
 }
 

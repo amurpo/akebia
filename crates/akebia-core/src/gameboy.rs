@@ -107,10 +107,15 @@ impl GameBoy {
         }
     }
 
-    /// T-cycles elapsed since boot. Two linked consoles are kept in step by
-    /// comparing these.
+    /// CPU T-cycles elapsed since boot, for instruction timing and diagnostics.
     pub fn t_cycles(&self) -> u64 {
         self.bus.t_cycles()
+    }
+
+    /// Time in 4 MiHz units for the cable. Unlike CPU cycles, this clock keeps
+    /// the same rate when a CGB switches to double speed.
+    pub fn link_cycles(&self) -> u64 {
+        self.bus.link_cycles()
     }
 
     /// Moves the clock forward without emulating anything.

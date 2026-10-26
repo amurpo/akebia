@@ -117,6 +117,8 @@ pub struct SystemBus {
 
     /// T-cycles elapsed since boot. For diagnostics only.
     t_cycles: u64,
+    /// Elapsed time in 4 MiHz units, independent of the CGB CPU speed.
+    link_cycles: u64,
 }
 
 impl SystemBus {
@@ -142,6 +144,7 @@ impl SystemBus {
             io_log: None,
             dma_source_high: 0,
             t_cycles: 0,
+            link_cycles: 0,
         }
     }
 
@@ -202,13 +205,17 @@ impl SystemBus {
         self.t_cycles
     }
 
-    /// See [`GameBoy::offset_clock`]. Only this counter moves: nothing that runs
-    /// off it —timer, PPU, APU— is told, which is precisely what keeps the
-    /// console's own rhythm intact while its place on the shared clock shifts.
+    pub fn link_cycles(&self) -> u64 {
+        self.link_cycles
+    }
+
+    /// See [`GameBoy::offset_clock`]. Only the time counters move: the timer,
+    /// PPU and APU keep their phase while the shared cable clock shifts.
     ///
     /// [`GameBoy::offset_clock`]: crate::GameBoy::offset_clock
     pub fn offset_clock(&mut self, t_cycles: u64) {
         self.t_cycles += t_cycles;
+        self.link_cycles += t_cycles;
     }
 
     pub fn model(&self) -> Model {
@@ -251,6 +258,7 @@ impl SystemBus {
         const T: u32 = crate::T_CYCLES_PER_M_CYCLE;
         let video_cycles = if self.double_speed { T / 2 } else { T };
         self.t_cycles += u64::from(T);
+        self.link_cycles += u64::from(video_cycles);
 
         self.step_dma();
         self.ppu.tick(video_cycles, &mut self.interrupts);

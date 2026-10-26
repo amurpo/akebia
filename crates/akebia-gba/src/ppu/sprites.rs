@@ -614,6 +614,36 @@ mod tests {
         ppu.frame()[y * SCREEN_WIDTH + x]
     }
 
+    #[test]
+    fn translucent_sprites_blend_even_when_window_effects_are_disabled() {
+        use crate::ppu::{blend, window};
+
+        let mut ppu = machine(0);
+        covering_background(&mut ppu, 1, BLUE);
+        fill_tile(&mut ppu, 0, 1);
+        set_colour(&mut ppu, 1, RED);
+        put(&mut ppu, 0, SEMI_TRANSPARENT, 0, 0);
+        ppu.dispcnt |= 1 << 13; // WIN0
+        ppu.write8(window::WIN0H, 4);
+        ppu.write8(0x0400_0044, 8); // WIN0V
+        ppu.write8(0x0400_0048, 0x1F); // WININ: visible layers, effects off
+        ppu.write8(window::WINOUT, 0x3F); // effects on outside
+        ppu.write8(blend::BLDCNT + 1, blend::BG0 as u8);
+        ppu.write8(blend::BLDALPHA, 8);
+        ppu.write8(blend::BLDALPHA + 1, 8);
+
+        ppu.draw_line(0);
+        assert_eq!(pixel(&ppu, 1, 0), 0x3C0F, "inside the window");
+        assert_eq!(pixel(&ppu, 5, 0), 0x3C0F, "outside the window");
+
+        // The exception belongs to semi-transparent OBJ, not normal OBJ.
+        put(&mut ppu, 0, 0, 0, 0);
+        ppu.write8(blend::BLDCNT, blend::OBJ as u8 | 0x40);
+        ppu.draw_line(0);
+        assert_eq!(pixel(&ppu, 1, 0), RED);
+        assert_eq!(pixel(&ppu, 5, 0), 0x3C0F);
+    }
+
     /// A sprite of one tile, put somewhere. Everything below is a departure
     /// from this.
     #[test]

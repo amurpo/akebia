@@ -103,7 +103,7 @@ impl Remote {
         if role == Role::Dialled {
             akebia_core::link::stagger(gb);
         }
-        Self { session: Session::new(gb.t_cycles()), wire }
+        Self { session: Session::new(gb.link_cycles()), wire }
     }
 
     /// Who is at the other end.
@@ -139,8 +139,11 @@ impl Remote {
         let deadline = Instant::now() + BUDGET;
 
         loop {
+            self.session.advance_to(gb.link_cycles());
             self.pump(gb)?;
-            self.session.advance_to(gb.t_cycles());
+            while let Some(incoming) = self.session.take_clocked() {
+                self.apply(incoming, gb)?;
+            }
             self.flush();
 
             if !self.wire.is_up() {
@@ -166,20 +169,28 @@ impl Remote {
             // How far the other end has vouched for. Running to there in one go
             // and not instruction by instruction is what keeps the cost of the
             // link off the emulation.
-            let target = gb.t_cycles() + self.session.allowance_t_cycles();
-            while gb.t_cycles() <= target {
+            let target = gb.link_cycles() + self.session.allowance_t_cycles();
+            loop {
                 gb.step().map_err(Trouble::Fault)?;
 
                 // Eight bits are out and the other console has to say what came
                 // back. Nothing else may happen until it does.
                 if let Some(byte) = gb.link_pending() {
-                    self.session.send(byte, gb.link_control());
+                    // Dated where the console is *now*, which is where the
+                    // eighth bit went out — not where the session was last told,
+                    // which is the top of this stretch and up to a frame behind.
+                    // That date is what the other end places the byte by, and
+                    // what it goes on running on.
+                    self.session.send(byte, gb.link_control(), gb.link_cycles());
                     break;
                 }
                 if gb.present_if_ready(video) {
-                    self.session.advance_to(gb.t_cycles());
+                    self.session.advance_to(gb.link_cycles());
                     self.flush();
                     return Ok(true);
+                }
+                if gb.link_cycles() >= target {
+                    break;
                 }
             }
 
@@ -198,8 +209,17 @@ impl Remote {
     }
 
     /// One packet, from the wire to the console.
-    fn deliver(&mut self, packet: akebia_core::link::bgb::Packet, gb: &mut GameBoy) -> Result<(), Trouble> {
-        match self.session.receive(packet) {
+    fn deliver(
+        &mut self,
+        packet: akebia_core::link::bgb::Packet,
+        gb: &mut GameBoy,
+    ) -> Result<(), Trouble> {
+        let incoming = self.session.receive(packet);
+        self.apply(incoming, gb)
+    }
+
+    fn apply(&mut self, incoming: Incoming, gb: &mut GameBoy) -> Result<(), Trouble> {
+        match incoming {
             Incoming::Nothing => {}
             Incoming::Clocked { data, .. } => {
                 // `None` is a console that had armed nothing, and that is a
@@ -235,7 +255,7 @@ mod tests {
         let program: &[u8] = &[
             0x3E, byte, // LD A,byte
             0xE0, 0x01, // LDH (SB),A
-            0x3E, sc,   // LD A,sc
+            0x3E, sc, // LD A,sc
             0xE0, 0x02, // LDH (SC),A
             0x18, 0xFE, // JR -2
         ];
@@ -312,9 +332,60 @@ mod tests {
         let mut remote = Remote::new(wire, &mut gb, Role::Waited);
 
         assert!(!remote.run_frame(&mut gb, &mut NullOutput).unwrap());
-        assert_eq!(gb.t_cycles(), 0, "not one instruction without a greeting");
+        assert_eq!(gb.link_cycles(), 0, "not one instruction without a greeting");
         assert!(!remote.is_ready());
         drop(mute);
+    }
+
+    #[test]
+    fn an_early_network_byte_reaches_the_serial_port_at_its_timestamp() {
+        use akebia_core::link::bgb::{Control, Packet, Stamp};
+        use akebia_core::serial::LinkEvent;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let wire = Wire::accept_from(&listener).unwrap();
+        let mut gb = GameBoy::new(sender(0x99, 0x80)).unwrap();
+        gb.set_link_log_enabled(true);
+        let mut remote = Remote::new(wire, &mut gb, Role::Waited);
+        remote.deliver(Packet::version(), &mut gb).unwrap();
+        remote.deliver(Packet::Reached(Stamp::from_t_cycles(0)), &mut gb).unwrap();
+        // The game has not even written SC yet. Sampling it on packet arrival
+        // would answer NotListening and lose this byte.
+        remote
+            .deliver(
+                Packet::Master {
+                    data: 0x42,
+                    control: Control::new(false, false),
+                    at: Stamp::from_t_cycles(4096),
+                },
+                &mut gb,
+            )
+            .unwrap();
+        assert!(gb.take_link_log().is_empty());
+        for _ in 0..10 {
+            remote.run_frame(&mut gb, &mut NullOutput).unwrap();
+            if gb.peek(0xFF01) == 0x42 {
+                break;
+            }
+        }
+        assert_eq!(gb.peek(0xFF01), 0x42);
+        let transfers: Vec<_> = gb
+            .take_link_log()
+            .into_iter()
+            .filter_map(|event| {
+                if let LinkEvent::Transferred { at, sent, received, armed, .. } = event {
+                    Some((at, sent, received, armed))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(transfers.len(), 1);
+        let (at, sent, received, armed) = transfers[0];
+        assert!((4096..=4120).contains(&at), "delivered at {at}");
+        assert_eq!((sent, received, armed), (0x99, 0x42, true));
+        drop(peer);
     }
 
     /// The one line a frontend cannot be trusted to remember, and both of them

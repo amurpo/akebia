@@ -1,7 +1,9 @@
 package org.akebia;
 
 import android.Manifest;
+import android.app.AlertDialog;
 import android.app.NativeActivity;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
@@ -12,8 +14,12 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.InputType;
 import android.view.View;
 import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -39,6 +45,12 @@ import java.io.OutputStream;
  * do, and the reason is the saved games: the application's own folder is erased
  * with the application, so the folder is asked for out in the shared storage,
  * which is not.
+ *
+ * <p>And typing is the third. A native activity has no editable view in it, so
+ * an input method has nowhere to put what is typed: the keyboard comes up and
+ * the characters go nowhere. Anything the emulator has to be told in words — so
+ * far, the address of the machine at the other end of the link cable — is
+ * therefore asked for in a dialog from here. See {@link #askForAddress}.
  */
 public class AkebiaActivity extends NativeActivity {
 
@@ -61,6 +73,15 @@ public class AkebiaActivity extends NativeActivity {
 
     /** Path of the ROM just imported, waiting to be collected. */
     private String imported;
+
+    /**
+     * What the address box was closed with, waiting to be collected.
+     *
+     * <p>Empty when it was closed without an address, which is not the same as
+     * null: a box that was cancelled has been answered, and the emulator has to
+     * stop waiting on it.
+     */
+    private String address;
 
     /**
      * Whether what was inside the application's folder has already been carried
@@ -191,6 +212,132 @@ public class AkebiaActivity extends NativeActivity {
         String path = imported;
         imported = null;
         return path;
+    }
+
+    /**
+     * Asks for the address of the machine to link to, with a real keyboard.
+     *
+     * <p>It is here for the same kind of reason the picker is: a {@code
+     * NativeActivity} has no editable view in it, so an input method has
+     * nothing to write into. Android will raise the keyboard over one happily
+     * enough — {@code showSoftInput} works — but there is no {@code
+     * InputConnection} behind it, and what the emulator gets back is nothing at
+     * all. From the outside that is a text box that cannot be typed in, and a
+     * Connect button that does nothing.
+     *
+     * <p>A dialog belongs to Java, has a real {@link EditText} in it, and comes
+     * with the clipboard as well as the keyboard — which matters, because an
+     * address is the kind of thing that arrives in a message.
+     *
+     * <p>The answer does not come back from here; it arrives later, through
+     * {@link #pollAddress}, exactly like the picker's.
+     *
+     * @param current what to start it off with, so a second attempt at the same
+     *     address is not typed twice. May be null.
+     */
+    public void askForAddress(final String current) {
+        // Whatever a previous box was closed with, before a new one can be
+        // closed with anything. Without this, a box opened and then abandoned —
+        // leaving the game for the list is one way— would have its answer
+        // handed back as the answer to the next one, and the emulator would
+        // dial an address nobody typed.
+        forget();
+        // Dialogs belong to the UI thread, and the emulator runs on another
+        // one: `android_main` is given a thread of its own.
+        runOnUiThread(
+                new Runnable() {
+                    @Override
+                    public void run() {
+                        show(current);
+                    }
+                });
+    }
+
+    /**
+     * The address the box was closed with, or null while it is still open.
+     *
+     * <p>Handed over once, like the imported ROM: reading it clears it.
+     */
+    public synchronized String pollAddress() {
+        String typed = address;
+        address = null;
+        return typed;
+    }
+
+    /** Records what the box was closed with. Null and blank both mean nothing. */
+    private synchronized void answered(String typed) {
+        address = typed == null ? "" : typed.trim();
+    }
+
+    /** Back to having no answer at all, which is not the same as an empty one. */
+    private synchronized void forget() {
+        address = null;
+    }
+
+    /** The box itself, on the thread that is allowed to put one up. */
+    private void show(String current) {
+        final EditText box = new EditText(this);
+        // A URI and not a number: an address may be a name, and the numeric
+        // keyboard has neither letters nor the colon that a port needs. What
+        // the variation is really for is the rest of it — no autocorrect, no
+        // capital at the start, and a dot on the main row.
+        box.setInputType(
+                InputType.TYPE_CLASS_TEXT
+                        | InputType.TYPE_TEXT_VARIATION_URI
+                        | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        box.setSingleLine(true);
+        box.setHint("192.168.1.20");
+        box.setText(current == null ? "" : current);
+        box.setSelection(box.getText().length());
+
+        // A bare EditText sits flush against the sides of a dialog. The padding
+        // is in points and the method wants pixels, which is what the density
+        // is for.
+        int margin = Math.round(24 * getResources().getDisplayMetrics().density);
+        FrameLayout frame = new FrameLayout(this);
+        frame.setPadding(margin, margin / 2, margin, 0);
+        frame.addView(box);
+
+        // Whether the box was closed by the Connect button or by anything else.
+        // The dismiss listener runs either way and would otherwise wipe out the
+        // address the button had just recorded.
+        final boolean[] taken = {false};
+        AlertDialog dialog =
+                new AlertDialog.Builder(this)
+                        .setTitle("Connect to")
+                        .setView(frame)
+                        .setPositiveButton(
+                                "Connect",
+                                new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface which, int button) {
+                                        taken[0] = true;
+                                        answered(box.getText().toString());
+                                    }
+                                })
+                        .setNegativeButton("Cancel", null)
+                        .setOnDismissListener(
+                                new DialogInterface.OnDismissListener() {
+                                    @Override
+                                    public void onDismiss(DialogInterface which) {
+                                        // Cancelled, dismissed with the back
+                                        // key, or tapped away. All three are an
+                                        // answer of «no address», and every one
+                                        // of them has to be one: an emulator
+                                        // still waiting on a box that is no
+                                        // longer there would wait for ever.
+                                        if (!taken[0]) {
+                                            answered(null);
+                                        }
+                                    }
+                                })
+                        .create();
+        // Asked for outright rather than left to the input method's judgement:
+        // the box is the only thing in the dialog, so there is nothing else the
+        // person opening it could have meant to do.
+        dialog.getWindow()
+                .setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE);
+        dialog.show();
     }
 
     /** The folder the imported cartridges live in. */

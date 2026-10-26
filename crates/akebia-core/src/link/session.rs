@@ -4,74 +4,28 @@
 //! with them. Between the two there are no sockets: a [`Session`] is fed packets
 //! and hands back packets, and whoever carries them is the frontend's business.
 //!
-//! # The rule the whole thing rests on
+//! Both clocks use 4 MiHz units, independent of CGB CPU speed. A console may
+//! run one frame beyond the peer's latest timestamp to avoid mutual waiting.
+//! An incoming byte dated in the future limits that allowance and is held
+//! until the console reaches it; callers must drain [`Session::take_clocked`]
+//! after advancing the clock. Instruction boundaries can overshoot slightly.
 //!
-//! *A console may run up to the last instant the other end said it had reached,
-//! and not one cycle further.*
-//!
-//! That is the entire synchronisation, and it is worth seeing why it is enough.
-//! Every packet carries a timestamp, and [`Packet::Reached`] carries nothing
-//! else — it is one end saying "I have lived this far with nothing to send". Any
-//! byte that end sends afterwards is therefore dated *after* that instant, so a
-//! console that stops there can never be handed a byte for a moment it has
-//! already emulated past. Nothing has to be undone, and nothing arrives late,
-//! because "late" is measured on the console's clock and not on the wall's.
-//!
-//! It also explains why this is not slow. The wait is not one round trip per
-//! byte —that would put a millisecond of cable behind fifty of Bluetooth— it is
-//! one wait per *how far ahead* an end gets, and how far ahead it gets is set by
-//! how often the other one announces itself. Announcing once a frame buys about
-//! sixteen milliseconds of tolerance; announcing every few frames buys more, at
-//! the cost of the other console's byte being that much staler. Neither costs
-//! anything per byte.
-//!
-//! # The two ends are not symmetrical while a byte is in flight
-//!
-//! When this console drives the clock it stops dead until the answer comes. It
-//! has to: the transfer is over eight bit periods and the game is entitled to its
-//! interrupt at the end of them, so running on while nobody has said what came
-//! back would be emulating a transfer that has not finished. That is the one
-//! place a round trip is really paid, and games pay it a few hundred times in a
-//! trade, not a few hundred thousand.
+//! A late byte is applied at the current instruction boundary. Subsequent
+//! incoming transfers retain that delay so network jitter cannot compress the
+//! time the game has to rearm SC between bytes. This is buffered byte timing,
+//! not cycle-exact rollback. The master stops until its reply arrives.
 
 use std::collections::VecDeque;
 
 use super::bgb::{Control, Packet, Stamp};
 
-/// How far this console runs past its last announcement before making another.
-///
-/// One frame. It is the natural unit —the frontend already thinks in frames— and
-/// it is what decides how much delay the link absorbs without either side
-/// waiting: the other end may always run to wherever we last said we were, so
-/// announcing every frame lets it run about sixteen milliseconds ahead. Below a
-/// frame the packets multiply for nothing; far above it the byte one console
-/// hands the other starts being visibly stale.
+/// Periodic clock announcements, in 4 MiHz units. Transfers also announce
+/// their completion time, so active exchanges need fewer separate packets.
 pub const ANNOUNCE_EVERY_T_CYCLES: u64 = crate::gameboy::T_CYCLES_PER_FRAME as u64;
 
-/// How far past the other end's last word a console is allowed to get.
-///
-/// # Why there is a lead at all
-///
-/// Because without one nothing moves. "Run up to what the other end vouched
-/// for" sounds like the safe rule and it is a deadlock: a console cannot run a
-/// frame until its partner says it has, and its partner is waiting on exactly
-/// the same thing. Both sit at the instant they met.
-///
-/// So a console is allowed a frame's head start over what it has been told, and
-/// that is what turns the two of them over: each runs a frame, says so, and the
-/// saying so is what buys the other its next frame. It also decides how much
-/// delay the link swallows without either console slowing down — a round trip
-/// shorter than a frame is free, which covers a local network and most of
-/// Bluetooth.
-///
-/// # What it costs
-///
-/// Honesty about a byte's placing. A byte the other end clocks may be dated up
-/// to this far before the instant this console has already reached, and there is
-/// nothing to be done about that but apply it where we are. It is the one
-/// approximation in the whole cable, it is the same one BGB makes, and a frame
-/// of it is nothing against protocols whose own bytes are a millisecond apart
-/// and padded besides.
+/// Maximum lead over the peer's last timestamp, in 4 MiHz units. A positive
+/// allowance lets both consoles make progress before the next announcement.
+/// Bytes older than this console's current time are applied without rollback.
 pub const LEAD_T_CYCLES: u64 = crate::gameboy::T_CYCLES_PER_FRAME as u64;
 
 /// What the caller has to do about a packet it just handed over.
@@ -141,6 +95,13 @@ pub struct Session {
     /// Whether the other emulator says it is running. A paused one is not
     /// broken, but it will not be announcing itself either.
     peer_running: bool,
+    /// Transfers already received whose emulated completion time is ahead of
+    /// this console. TCP arrival time must not decide when SC is sampled.
+    clocked: VecDeque<(Stamp, u8, Control)>,
+    /// Playback delay learned from late packets, in 4 MiHz units. Keep it for
+    /// subsequent bytes instead of making a late byte and its successor arrive
+    /// almost simultaneously at the serial port.
+    receive_delay: u64,
     outgoing: VecDeque<Packet>,
 }
 
@@ -163,6 +124,8 @@ impl Session {
             announced: Stamp::from_t_cycles(0),
             awaiting_answer: false,
             peer_running: false,
+            clocked: VecDeque::new(),
+            receive_delay: 0,
             outgoing,
         }
     }
@@ -196,7 +159,17 @@ impl Session {
         if !self.is_ready() || self.awaiting_answer || self.offset.is_none() {
             return false;
         }
-        !self.ours.is_after(self.theirs.plus_t_cycles(LEAD_T_CYCLES))
+        !self.ours.is_after(self.run_limit())
+    }
+
+    fn run_limit(&self) -> Stamp {
+        let limit = self.theirs.plus_t_cycles(LEAD_T_CYCLES);
+        // A known incoming byte must remain reachable even when an instruction
+        // overshoot made its playback delay slightly larger than the lead.
+        match self.clocked.front() {
+            Some((at, ..)) if at.is_after(limit) => *at,
+            _ => limit,
+        }
     }
 
     /// How many T-cycles the console may still run before it has to wait.
@@ -210,8 +183,35 @@ impl Session {
         if !self.may_run() {
             return 0;
         }
-        let limit = self.theirs.plus_t_cycles(LEAD_T_CYCLES);
-        limit.since(self.ours).max(0) as u64 * super::bgb::T_CYCLES_PER_UNIT
+        let limit = self.run_limit();
+        let mut units = limit.since(self.ours).max(0) as u64;
+        if let Some((at, ..)) = self.clocked.front() {
+            units = units.min(at.since(self.ours).max(0) as u64);
+        }
+        units * super::bgb::T_CYCLES_PER_UNIT
+    }
+
+    /// A transfer whose timestamp the console has reached. Call after updating
+    /// the clock and before running more instructions.
+    pub fn take_clocked(&mut self) -> Option<Incoming> {
+        let &(at, data, control) = self.clocked.front()?;
+        // Two masters must still answer each other while waiting for their own
+        // replies; neither CPU can advance until that collision is resolved.
+        if at.is_after(self.ours) && !self.awaiting_answer {
+            return None;
+        }
+        self.clocked.pop_front();
+        let late = self.ours.since(at).max(0) as u64 * super::bgb::T_CYCLES_PER_UNIT;
+        // Ordinary instruction-boundary rounding must not accumulate into a
+        // growing delay on every byte (the longest normal GB instruction is
+        // 24 CPU cycles). Only absorb a genuinely late delivery.
+        if late > 24 {
+            self.receive_delay += late;
+            for (queued_at, ..) in &mut self.clocked {
+                *queued_at = queued_at.plus_t_cycles(late);
+            }
+        }
+        Some(Incoming::Clocked { data, control })
     }
 
     /// This console has now lived to `t_cycles`.
@@ -241,11 +241,31 @@ impl Session {
         self.outgoing.push_back(Packet::Reached(self.ours));
     }
 
-    /// This console drove the clock and has eight bits out.
+    /// This console drove the clock and has eight bits out, at `t_cycles`.
     ///
     /// From here nothing advances until the answer arrives; see the note at the
     /// top about the one round trip that really is paid.
-    pub fn send(&mut self, data: u8, control: Control) {
+    ///
+    /// # Why the instant is asked for and not read off the last announcement
+    ///
+    /// Because the two are not the same, and the difference is a byte the other
+    /// console never receives.
+    ///
+    /// A caller runs its console in stretches —that is the whole point of
+    /// [`Session::allowance_t_cycles`]— and only says where it got to at the end
+    /// of one. The eighth bit goes out in the middle of a stretch, so the last
+    /// thing this session was told can be most of a frame older than the moment
+    /// the byte was really clocked at. Dating the byte with it does not just
+    /// misplace the byte: [`Packet::Master`] is also the freshest word the other
+    /// end has about where this console is, and one that reads a frame stale
+    /// leaves the other end out of leave to run. It stops wherever the shortfall
+    /// happens to catch it — and a game is not listening at every instant. After
+    /// each byte there is a moment, its handler putting `SC` back, in which the
+    /// register is unarmed; a console stopped there is answered "not listening",
+    /// the byte comes back as an empty line, and it is gone. One byte in a
+    /// hundred is a trade that runs to the end and is refused for bad data.
+    pub fn send(&mut self, data: u8, control: Control, t_cycles: u64) {
+        self.advance_to(t_cycles);
         self.awaiting_answer = true;
         self.announced = self.ours;
         self.outgoing.push_back(Packet::Master { data, control, at: self.ours });
@@ -300,7 +320,9 @@ impl Session {
                 // plainly lived to, so it moves the mark forward like any
                 // announcement would.
                 self.observe(at);
-                Incoming::Clocked { data, control }
+                let here = at.shifted(-self.offset.unwrap_or(0)).plus_t_cycles(self.receive_delay);
+                self.clocked.push_back((here, data, control));
+                self.take_clocked().unwrap_or(Incoming::Nothing)
             }
 
             // The two answers to our own byte. Both end the wait; only one of
@@ -515,7 +537,11 @@ mod tests {
         assert!(!session.may_run());
 
         let control = Control::new(false, false);
-        let incoming = session.receive(Packet::Master { data: 0x60, control, at: Stamp::from_t_cycles(60_000) });
+        let incoming = session.receive(Packet::Master {
+            data: 0x60,
+            control,
+            at: Stamp::from_t_cycles(60_000),
+        });
 
         assert_eq!(incoming, Incoming::Clocked { data: 0x60, control });
         assert!(session.may_run(), "it plainly lived to the moment it clocked us");
@@ -528,10 +554,117 @@ mod tests {
         session.advance_to(1_000);
         assert!(session.may_run());
 
-        session.send(0x01, Control::new(false, false));
+        session.send(0x01, Control::new(false, false), 1_000);
         assert!(!session.may_run(), "there is a byte out there");
 
         assert_eq!(session.receive(Packet::Slave { data: 0x02 }), Incoming::Answered(0x02));
+        assert!(session.may_run());
+    }
+
+    #[test]
+    fn an_early_packet_waits_for_its_emulated_timestamp() {
+        let mut session = greeted();
+        let control = Control::new(true, true);
+        let incoming =
+            session.receive(Packet::Master { data: 0x42, control, at: Stamp::from_t_cycles(4096) });
+        assert_eq!(incoming, Incoming::Nothing);
+        assert_eq!(session.take_clocked(), None);
+        assert_eq!(session.allowance_t_cycles(), 4096);
+        session.advance_to(4094);
+        assert_eq!(session.take_clocked(), None);
+        session.advance_to(4096);
+        assert_eq!(session.take_clocked(), Some(Incoming::Clocked { data: 0x42, control }));
+        assert_eq!(session.take_clocked(), None);
+    }
+
+    #[test]
+    fn scheduled_bytes_use_the_peer_offset_and_handle_timestamp_wrap() {
+        let origin = 123_456;
+        let mut session = Session::new(origin);
+        session.receive(Packet::version());
+        // The peer is about to wrap its 31-bit protocol counter.
+        let peer_start = Stamp::from_wire(0x7FFF_FFF0);
+        session.receive(Packet::Reached(peer_start));
+        let control = Control::new(false, false);
+        assert_eq!(
+            session.receive(Packet::Master {
+                data: 0x99,
+                control,
+                at: peer_start.plus_t_cycles(128),
+            }),
+            Incoming::Nothing
+        );
+        assert_eq!(session.allowance_t_cycles(), 128);
+        session.advance_to(origin + 128);
+        assert_eq!(session.take_clocked(), Some(Incoming::Clocked { data: 0x99, control }));
+    }
+
+    #[test]
+    fn a_late_byte_does_not_compress_the_gap_before_the_next_byte() {
+        let mut session = greeted();
+        let control = Control::new(false, false);
+        session.advance_to(30_000);
+        assert_eq!(
+            session.receive(Packet::Master { data: 0x42, control, at: Stamp::from_t_cycles(4096) }),
+            Incoming::Clocked { data: 0x42, control }
+        );
+        session.answer(Some(0x99));
+
+        // The source waited 4096 cycles. The receiver must get that same
+        // processing time even though both packets arrived while it was ahead.
+        assert_eq!(
+            session.receive(Packet::Master { data: 0x43, control, at: Stamp::from_t_cycles(8192) }),
+            Incoming::Nothing
+        );
+        assert_eq!(session.allowance_t_cycles(), 4096);
+        session.advance_to(34_094);
+        assert_eq!(session.take_clocked(), None);
+        session.advance_to(34_096);
+        assert_eq!(session.take_clocked(), Some(Incoming::Clocked { data: 0x43, control }));
+    }
+
+    #[test]
+    fn instruction_overshoot_does_not_leave_a_buffered_byte_unreachable() {
+        let mut session = greeted();
+        let control = Control::new(false, false);
+        session.advance_to(LEAD_T_CYCLES + 24);
+        session.receive(Packet::Master { data: 1, control, at: Stamp::from_t_cycles(0) });
+        session.answer(Some(0));
+        session.receive(Packet::Master { data: 2, control, at: Stamp::from_t_cycles(4096) });
+        assert_eq!(session.allowance_t_cycles(), 4096);
+        session.advance_to(LEAD_T_CYCLES + 4096 + 22);
+        assert!(session.may_run());
+        session.advance_to(LEAD_T_CYCLES + 4096 + 24);
+        assert_eq!(session.take_clocked(), Some(Incoming::Clocked { data: 2, control }));
+    }
+
+    #[test]
+    fn instruction_rounding_does_not_accumulate_playback_delay() {
+        let mut session = greeted();
+        let control = Control::new(false, false);
+        for byte in 1..=1000u64 {
+            let at = byte * 4096;
+            session.receive(Packet::Master { data: byte as u8, control, at: Stamp::from_t_cycles(at) });
+            // An idle JR loop reaches only multiples of 12 CPU cycles.
+            session.advance_to(at.div_ceil(12) * 12);
+            assert!(session.take_clocked().is_some());
+            session.answer(Some(0));
+            session.take_outgoing();
+        }
+        assert_eq!(session.receive_delay, 0);
+    }
+
+    #[test]
+    fn simultaneous_masters_can_answer_without_advancing() {
+        let mut session = greeted();
+        let control = Control::new(false, false);
+        session.send(0x42, control, 4096);
+        assert_eq!(
+            session.receive(Packet::Master { data: 0x99, control, at: Stamp::from_t_cycles(4100) }),
+            Incoming::Clocked { data: 0x99, control }
+        );
+        assert!(!session.may_run());
+        assert_eq!(session.receive(Packet::Slave { data: 0x99 }), Incoming::Answered(0x99));
         assert!(session.may_run());
     }
 
@@ -541,7 +674,7 @@ mod tests {
     fn an_end_that_was_not_listening_still_ends_the_wait() {
         let mut session = greeted();
         session.receive(Packet::Reached(Stamp::from_t_cycles(1_000_000)));
-        session.send(0x01, Control::new(false, false));
+        session.send(0x01, Control::new(false, false), 1_000);
 
         assert_eq!(session.receive(Packet::NotListening), Incoming::Answered(0xFF));
         assert!(session.may_run());
@@ -554,7 +687,10 @@ mod tests {
 
         session.answer(Some(0x02));
         session.answer(None);
-        assert_eq!(session.take_outgoing(), vec![Packet::Slave { data: 0x02 }, Packet::NotListening]);
+        assert_eq!(
+            session.take_outgoing(),
+            vec![Packet::Slave { data: 0x02 }, Packet::NotListening]
+        );
     }
 
     /// Without this both ends run to each other's last word and stop there for
@@ -581,7 +717,7 @@ mod tests {
         session.advance_to(50_000);
         session.take_outgoing();
 
-        session.send(0x60, Control::new(false, false));
+        session.send(0x60, Control::new(false, false), 50_000);
         session.receive(Packet::Slave { data: 0x60 });
         session.take_outgoing();
 
